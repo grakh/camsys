@@ -62,6 +62,21 @@ class PackageExporter:
         # Временно убираем их из project.operations, восстановим в конце.
         from ..core.project import OperationKind
         _all_ops = list(self.project.operations)
+        
+        # СОХРАНЯЕМ юзерские lead_override с corner-ops в проекте ДО их 
+        # удаления. _build_corner_operations() построит фрагменты заново, 
+        # но по (parent_geom_id, corner_index) достанем сохранённый override
+        # и перенесём на новые.
+        self._corner_overrides = {
+            (op.attributes.get('parent_geom_id'), 
+             op.attributes.get('corner_index'),
+             op.attributes.get('corner_is_3d', False)): 
+             dict(op.attributes['lead_override'])
+            for op in _all_ops
+            if op.kind == OperationKind.CORNER_REWORK
+            and 'lead_override' in op.attributes
+        }
+        
         # Полное число ножей ДО фильтра (для порога режима доработки _dop)
         self._total_blade_count = sum(
             1 for op in _all_ops if op.kind == OperationKind.BLADE_FORMING)
@@ -194,6 +209,18 @@ class PackageExporter:
         # ── 6. Самые острые углы 3D-фрезой (_corner3D.anc) ──
         if self.params.generate_corner or self.params.generate_corner_3d:
             corner_ops_2d, corner_ops_3d = self._build_corner_operations()
+            
+            # Перенос lead_override с уже добавленных corner-ops в проекте 
+            # (там юзер редактирует их через режим «Выделенные») на свежие 
+            # ops. Переносим по (parent_geom_id, corner_index) из 
+            # self._corner_overrides — снапшот сделан до strip'а corner-ops.
+            for new_op in corner_ops_2d + corner_ops_3d:
+                key = (new_op.attributes.get('parent_geom_id'),
+                       new_op.attributes.get('corner_index'),
+                       new_op.attributes.get('corner_is_3d', False))
+                ov = self._corner_overrides.get(key)
+                if ov is not None:
+                    new_op.attributes['lead_override'] = dict(ov)
             
             if self.params.generate_corner:
                 name = f"{prefix}_{angle}_corner.anc"
@@ -601,7 +628,7 @@ class PackageExporter:
                 
                 tp = ToolPath(
                     geometry_id=geom_id,
-                    side=ContourSide.INSIDE,
+                    side=ContourSide.OUTSIDE,  # внутренний рез (CW) — corner rework часть внутр. реза
                     entry=EntryExitConfig(
                         enabled=True,
                         style=LeadStyle.LINE_ARC_TANGENTIAL,
@@ -671,7 +698,7 @@ class PackageExporter:
                 
                 tp = ToolPath(
                     geometry_id=geom_id,
-                    side=ContourSide.INSIDE,
+                    side=ContourSide.OUTSIDE,  # внутренний рез (CW) — corner rework часть внутр. реза
                     entry=EntryExitConfig(
                         enabled=True,
                         style=LeadStyle.LINE_ARC_TANGENTIAL,

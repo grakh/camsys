@@ -393,9 +393,13 @@ class MtxAndersonGVM(PostProcessor):
             if not polypath.segments:
                 return line_no
             
-            # Разворот фрагмента под CCW для INSIDE: центр должен быть слева
-            # от касательной, тогда G41 (комп. влево) даёт фрезу со стороны 
-            # центра ножа = ВНУТРЬ контура.
+            # ── НАПРАВЛЕНИЕ ФРАГМЕНТА (3D corner) ──
+            # CORNER_REWORK 3D идут с side=OUTSIDE → G42 (комп. вправо), 
+            # т.к. corner rework — часть внутреннего реза blade'а. По 
+            # конвенции (normalize_for_side): OUTSIDE = внутренний рез = CW.
+            # Разворот под CW: центр должен быть СПРАВА от касательной. 
+            # Тогда G42 (комп. вправо) даёт фрезу с той же стороны = со 
+            # стороны центра ножа = ВНУТРЬ контура (крючок).
             from ..geometry.path_offset import polypath_bbox
             full_bb = polypath_bbox(geom.polypath)
             knife_cx = (full_bb[0] + full_bb[2]) / 2.0
@@ -403,7 +407,7 @@ class MtxAndersonGVM(PostProcessor):
             sp = polypath.segments[0].a
             tan = polypath.segments[0].tangent_at_start()
             cross = tan[0]*(knife_cy - sp[1]) - tan[1]*(knife_cx - sp[0])
-            if cross < 0:  # центр справа = CW → разворачиваем под CCW
+            if cross > 0:  # центр слева = CCW → разворачиваем под CW
                 from ..geometry.direction import reverse_polypath
                 polypath = reverse_polypath(polypath)
         
@@ -421,10 +425,12 @@ class MtxAndersonGVM(PostProcessor):
                 return line_no
             
             # ── НАПРАВЛЕНИЕ ФРАГМЕНТА ──
-            # CORNER операции теперь INSIDE → G41 (компенсация ВЛЕВО).
-            # Чтобы крючок шёл ВНУТРЬ ножа: центр должен быть СЛЕВА от 
-            # касательной (CCW обход) — тогда фреза слева от движения = 
-            # со стороны центра ножа = внутрь контура.
+            # CORNER операции идут с side=OUTSIDE → G42 (комп. вправо), 
+            # т.к. corner rework — часть внутреннего реза blade'а. По 
+            # конвенции (normalize_for_side): OUTSIDE = внутренний рез = CW.
+            # Внутренний рез blade'ов идёт CW, corners должны продолжать 
+            # это направление: центр ножа СПРАВА от касательной, фреза с 
+            # G42 идёт в ту же сторону = ВНУТРЬ ножа = крючок в угол.
             from ..geometry.path_offset import polypath_bbox
             full_bb = polypath_bbox(geom.polypath)
             knife_cx = (full_bb[0] + full_bb[2]) / 2.0
@@ -433,10 +439,10 @@ class MtxAndersonGVM(PostProcessor):
             sp = polypath.segments[0].a
             tan = polypath.segments[0].tangent_at_start()
             cross = tan[0]*(knife_cy - sp[1]) - tan[1]*(knife_cx - sp[0])
-            center_is_left = cross > 0
+            center_is_right = cross < 0
             
-            # Нужно CCW (центр слева). Если центр справа (CW) — развернуть.
-            if not center_is_left:
+            # Нужно CW (центр справа). Если центр слева (CCW) — развернуть.
+            if not center_is_right:
                 from ..geometry.direction import reverse_polypath
                 polypath = reverse_polypath(polypath)
         else:
@@ -494,9 +500,26 @@ class MtxAndersonGVM(PostProcessor):
         # (влево по верху), для INSIDE инвертируем знак.
         # 
         # Для CORNER_REWORK не применяем — там точка старта = начало фрагмента.
+        # ── Per-op lead_override: offset и overlap ──
+        # Юзер мог отредактировать отдельный нож в режиме «Выделенные». 
+        # Читаем override и подменяем tp.entry.start_offset / tp.exit.overlap.
+        # (angle/length подменяются позже при построении req_in/req_out.)
+        _lead_ov_early = op.attributes.get('lead_override', {})
+        _override_offset = tp.entry.start_offset
+        _override_overlap = tp.exit.overlap
+        if _lead_ov_early:
+            if tp.side == ContourSide.OUTSIDE:
+                _ov = _lead_ov_early.get('lead_inside', {})
+            elif tp.side == ContourSide.INSIDE:
+                _ov = _lead_ov_early.get('lead_outside', {})
+            else:
+                _ov = _lead_ov_early.get('lead_inside', {})
+            _override_offset = _ov.get('offset', _override_offset)
+            _override_overlap = _ov.get('overlap', _override_overlap)
+        
         if (not is_corner_rework and geom.is_closed and tp.entry.enabled 
-                and abs(tp.entry.start_offset) > 1e-9):
-            effective_offset = tp.entry.start_offset
+                and abs(_override_offset) > 1e-9):
+            effective_offset = _override_offset
             if tp.side == ContourSide.INSIDE:
                 effective_offset = -effective_offset
             polypath = shift_start_along_contour(polypath, effective_offset)
@@ -508,8 +531,8 @@ class MtxAndersonGVM(PostProcessor):
         # Сохраним значение, применим в конце (после best_polypath).
         pending_overlap = 0.0
         if (not is_corner_rework and geom.is_closed 
-                and tp.exit.enabled and tp.exit.overlap > 1e-9):
-            pending_overlap = tp.exit.overlap
+                and tp.exit.enabled and _override_overlap > 1e-9):
+            pending_overlap = _override_overlap
         
         # ── Сглаживание под фрезу (по флагу) ──
         # АДАПТИВНЫЙ режим:
@@ -862,13 +885,47 @@ class MtxAndersonGVM(PostProcessor):
             from ..core.project import ContourSide
             forced_side = None if tp.side in (ContourSide.INSIDE, ContourSide.OUTSIDE) else lead_side
             
+            # ── Применение per-op lead_override (режим «Выделенные» из viewer'а) ──
+            # Юзер мог отредактировать параметры отдельных ножей — сохранены 
+            # в op.attributes['lead_override']. Читаем их и подменяем 
+            # соответствующие поля tp.entry/tp.exit до построения request'ов.
+            # 
+            # Маппинг:
+            #   CORNER — entry из lead_inside, exit из lead_outside (разные)
+            #   OUTSIDE (внутренний рез) → lead_inside (внутренний столбец)
+            #   INSIDE (внешний рез) → lead_outside (внешний столбец)
+            _lead_ov = op.attributes.get('lead_override', {})
+            if _lead_ov:
+                # Проверяем is_corner_rework СНАЧАЛА — corner ops теперь тоже 
+                # имеют side=OUTSIDE (внутренний рез), но у них entry/exit из 
+                # РАЗНЫХ столбцов полей (Внутренний/Внешний), не из одного.
+                if is_corner_rework:
+                    _ov_in = _lead_ov.get('lead_inside', {})
+                    _ov_out = _lead_ov.get('lead_outside', {})
+                elif tp.side == ContourSide.OUTSIDE:
+                    _ov_in = _lead_ov.get('lead_inside', {})
+                    _ov_out = _lead_ov.get('lead_inside', {})
+                elif tp.side == ContourSide.INSIDE:
+                    _ov_in = _lead_ov.get('lead_outside', {})
+                    _ov_out = _lead_ov.get('lead_outside', {})
+                else:
+                    _ov_in = _ov_out = {}
+            else:
+                _ov_in = _ov_out = {}
+            
+            _entry_angle = _ov_in.get('angle', tp.entry.approach_angle)
+            _entry_length = _ov_in.get('length', tp.entry.line_length_x_tool_rad)
+            _entry_radius = _ov_in.get('length', tp.entry.arc_radius_x_tool_rad)
+            _exit_angle = _ov_out.get('angle', tp.exit.approach_angle)
+            _exit_length = _ov_out.get('length', tp.exit.line_length_x_tool_rad)
+            _exit_radius = _ov_out.get('length', tp.exit.arc_radius_x_tool_rad)
+            
             req_in = LeadGeometryRequest(
                 is_entry=True,
                 pass_side=tp.side.name,
-                angle_deg=tp.entry.approach_angle,
-                line_length=_line_len_alpha(
-                    tp.entry.line_length_x_tool_rad, tp.entry.approach_angle),
-                arc_radius=tp.entry.arc_radius_x_tool_rad * tool_offset,
+                angle_deg=_entry_angle,
+                line_length=_line_len_alpha(_entry_length, _entry_angle),
+                arc_radius=_entry_radius * tool_offset,
                 style=('line' if tp.entry.style == LeadStyle.LINE else 'line_arc'),
                 forced_side=forced_side,
             )
@@ -881,10 +938,9 @@ class MtxAndersonGVM(PostProcessor):
                 exit_req = LeadGeometryRequest(
                     is_entry=False,
                     pass_side=tp.side.name,
-                    angle_deg=tp.exit.approach_angle,
-                    line_length=_line_len_alpha(
-                        tp.exit.line_length_x_tool_rad, tp.exit.approach_angle),
-                    arc_radius=tp.exit.arc_radius_x_tool_rad * tool_offset,
+                    angle_deg=_exit_angle,
+                    line_length=_line_len_alpha(_exit_length, _exit_angle),
+                    arc_radius=_exit_radius * tool_offset,
                     style=('line' if tp.exit.style == LeadStyle.LINE else 'line_arc'),
                     forced_side=forced_out_side,
                 )
@@ -926,10 +982,9 @@ class MtxAndersonGVM(PostProcessor):
             req_out = LeadGeometryRequest(
                 is_entry=False,
                 pass_side=tp.side.name,
-                angle_deg=tp.exit.approach_angle,
-                line_length=_line_len_alpha(
-                    tp.exit.line_length_x_tool_rad, tp.exit.approach_angle),
-                arc_radius=tp.exit.arc_radius_x_tool_rad * tool_offset,
+                angle_deg=_exit_angle,
+                line_length=_line_len_alpha(_exit_length, _exit_angle),
+                arc_radius=_exit_radius * tool_offset,
                 style=('line' if tp.exit.style == LeadStyle.LINE else 'line_arc'),
                 forced_side=forced_out,
             )

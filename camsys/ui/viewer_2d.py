@@ -96,7 +96,9 @@ class GeometryItem(QtWidgets.QGraphicsPathItem):
         pen.setWidthF(1.5)
         self.setPen(pen)
         
-        self.setFlag(QtWidgets.QGraphicsItem.ItemIsSelectable, True)
+        # GeometryItem никогда не выделяется — visualization-only. Юзерская 
+        # логика селекта работает через ToolpathItem в режиме «Выделенные».
+        self.setFlag(QtWidgets.QGraphicsItem.ItemIsSelectable, False)
         
         # Считаем РЕАЛЬНЫЙ bbox по точкам сегментов (не доверяем path.boundingRect,
         # который для arcTo учитывает всю окружность). Это даёт корректный 
@@ -124,15 +126,15 @@ class GeometryItem(QtWidgets.QGraphicsPathItem):
         return self.path()
     
     def paint(self, painter, option, widget=None):
-        """Подсветка выделенных: ярче и толще."""
-        if self.isSelected():
-            sel_pen = QtGui.QPen(QtGui.QColor("#ffff00"))  # жёлтый
-            sel_pen.setCosmetic(True)
-            sel_pen.setWidthF(2.5)
-            painter.setPen(sel_pen)
-            painter.drawPath(self.path())
-        else:
-            super().paint(painter, option, widget)
+        """Рендер исходной геометрии — БЕЗ подсветки выделения.
+        
+        Юзерская подсветка (жёлтая) работает ТОЛЬКО через ToolpathItem 
+        в режиме «Выделенные». GeometryItem — visualization-only слой, 
+        никогда не подсвечивается.
+        """
+        # Убираем Qt-дефолтную рамку выделения (если она сработала)
+        option.state &= ~QtWidgets.QStyle.State_Selected
+        super().paint(painter, option, widget)
 
 
 class FiducialItem(QtWidgets.QGraphicsItem):
@@ -174,6 +176,15 @@ class FiducialItem(QtWidgets.QGraphicsItem):
 class CamScene(QtWidgets.QGraphicsScene):
     """Сцена со всей геометрией проекта."""
     
+    # Сигнал: юзер кликнул на toolpath-элемент. Аргумент — id операции.
+    # Используется в main_window для показа полей переопределения lead'а.
+    # Пустая строка = клик мимо → снятие выделения.
+    toolpath_clicked = QtCore.Signal(str)
+    
+    # Сигнал: правый клик на toolpath — юзер хочет переключить excluded 
+    # (включить/исключить нож из экспорта). Аргумент — id операции.
+    toolpath_right_clicked = QtCore.Signal(str)
+    
     def __init__(self):
         super().__init__()
         self.setBackgroundBrush(QtGui.QColor("#0d0d0d"))  # тёмный как Альфакам
@@ -182,6 +193,119 @@ class CamScene(QtWidgets.QGraphicsScene):
         self._geom_items: Dict[str, GeometryItem] = {}
         # Layer.name → список GeometryItem (для управления видимостью)
         self._layer_items: Dict[str, List[QtWidgets.QGraphicsItem]] = {}
+        # id выделенного toolpath (для переопределения lead'а)
+        self._selected_op_id: str = ""
+        # Флаг: разрешено ли выделение toolpath'ов кликом. Ставится главным 
+        # окном по состоянию галки «Авто-подбор для всех элементов» — если 
+        # ВЫКЛ, юзер может кликать по элементам и переопределять lead'ы.
+        # По умолчанию ВЫКЛ — селект работает только когда явно включено.
+        self._toolpath_selection_enabled: bool = False
+    
+    def set_toolpath_selection_enabled(self, enabled: bool):
+        """Включить/выключить возможность выделения ножей по клику.
+        
+        Работает через собственную логику scene.mousePressEvent — ищет 
+        ToolpathItem под курсором и подсвечивает его жёлтым (не через Qt-
+        селект). GeometryItem'ы не выделяются НИКАК — они visualization-only.
+        
+        enabled=True (режим «Выделенные») → клик по ножу подсвечивает его.
+        enabled=False → селект выключен, старое выделение снимается.
+        """
+        self._toolpath_selection_enabled = enabled
+        if not enabled:
+            # Снимаем наше toolpath-выделение
+            self._selected_op_id = ""
+            self._refresh_selection_highlight()
+    
+    def mousePressEvent(self, event):
+        """Определяем клик по ToolpathItem — эмитим сигнал.
+        
+        ToolpathItem создаётся ТОЛЬКО для операций слоя Knife (по построению
+        в add_toolpaths_to_scene). GeometryItem'ы не-Knife слоёв имеют 
+        ItemIsSelectable=False (устанавливается в load_project), поэтому Qt 
+        не выделяет их кликом. Дополнительной фильтрации по layer не нужно.
+        
+        Наш toolpath-select работает только когда `_toolpath_selection_enabled`
+        (галка «Авто-подбор» ВЫКЛ). Иначе всё идёт через super() — Qt-логика 
+        выделения GeometryItem'ов слоя Knife работает как обычно.
+        """
+        if event.button() == QtCore.Qt.LeftButton and self._toolpath_selection_enabled:
+            pos = event.scenePos()
+            hit_op_id = ""
+            
+            # ── ФАЗА 1: Приоритетный поиск УГЛА ──
+            # Углы имеют z=8, blade z=5 → в items(pos) углы уже сверху. Но 
+            # если click вне узкой shape() угла и попадает только в широкую 
+            # blade — угол пропустим. Поэтому ищем в РАСШИРЕННОЙ 5мм зоне 
+            # вокруг клика: любой найденный угол побеждает.
+            search_rect = QtCore.QRectF(pos.x()-2.5, pos.y()-2.5, 5.0, 5.0)
+            for it in self.items(search_rect):
+                if (isinstance(it, ToolpathItem) and it.op_id and it.selectable 
+                        and it.zValue() >= 7):  # z>=7 → угол
+                    hit_op_id = it.op_id
+                    break
+            
+            # ── ФАЗА 2: Fallback на blade (точное попадание) ──
+            # Если угол не нашли — обычный поиск по точке (найдёт blade).
+            if not hit_op_id:
+                for it in self.items(pos):
+                    if isinstance(it, ToolpathItem) and it.op_id and it.selectable:
+                        hit_op_id = it.op_id
+                        break
+            
+            if hit_op_id and hit_op_id != self._selected_op_id:
+                self._selected_op_id = hit_op_id
+                self._refresh_selection_highlight()
+                self.toolpath_clicked.emit(hit_op_id)
+                event.accept()
+                return
+        
+        elif event.button() == QtCore.Qt.RightButton:
+            # Правый клик на toolpath — переключить excluded (быстрая 
+            # альтернатива галочке в operations-таблице). Логика поиска 
+            # такая же как для левой кнопки (сначала угол, потом blade).
+            pos = event.scenePos()
+            hit_op_id = ""
+            
+            search_rect = QtCore.QRectF(pos.x()-2.5, pos.y()-2.5, 5.0, 5.0)
+            for it in self.items(search_rect):
+                if (isinstance(it, ToolpathItem) and it.op_id and it.selectable 
+                        and it.zValue() >= 7):
+                    hit_op_id = it.op_id
+                    break
+            
+            if not hit_op_id:
+                for it in self.items(pos):
+                    if isinstance(it, ToolpathItem) and it.op_id and it.selectable:
+                        hit_op_id = it.op_id
+                        break
+            
+            if hit_op_id:
+                self.toolpath_right_clicked.emit(hit_op_id)
+                event.accept()
+                return
+        
+        super().mousePressEvent(event)
+    
+    def keyPressEvent(self, event):
+        """Escape — снять выделение toolpath'а."""
+        if event.key() == QtCore.Qt.Key_Escape and self._selected_op_id:
+            self.clear_selection()
+            self.toolpath_clicked.emit("")
+        else:
+            super().keyPressEvent(event)
+    
+    def _refresh_selection_highlight(self):
+        """Помечает выделенный ToolpathItem жирной обводкой."""
+        for item in self.items():
+            if isinstance(item, ToolpathItem):
+                item.set_selected_highlight(item.op_id == self._selected_op_id
+                                              and self._selected_op_id != "")
+    
+    def clear_selection(self):
+        """Снять выделение (все ToolpathItem'ы возвращаются к обычному виду)."""
+        self._selected_op_id = ""
+        self._refresh_selection_highlight()
     
     def clear_all(self):
         self.clear()
@@ -195,10 +319,16 @@ class CamScene(QtWidgets.QGraphicsScene):
         for layer in project.layers.values():
             color = QtGui.QColor(layer.color or "#00ff00")
             items = []
+            # Только слой Knife может быть выделяемым. На остальных 
+            # (Reg-марки, Trim-линии, лист-бордер) ItemIsSelectable=False 
+            # всегда — их вообще не выделяем никогда.
+            is_knife = (layer.name == "Knife")
             for geom in layer.geometries:
                 if geom.polypath is None:
                     continue
                 item = GeometryItem(geom, color)
+                # ItemIsSelectable=False всегда (задано в __init__). Юзерский 
+                # селект работает через ToolpathItem — не через геометрии.
                 item.setVisible(layer.visible and geom.is_visible)
                 self.addItem(item)
                 self._geom_items[geom.id] = item
@@ -331,11 +461,19 @@ class ToolpathItem(QtWidgets.QGraphicsPathItem):
     ]
     
     def __init__(self, polypath, kind: str = 'CONTOUR', op_index: int = 0,
-                 collision: bool = False):
+                 collision: bool = False, op_id: str = "",
+                 selectable: bool = False):
         super().__init__()
         self.kind = kind
         self.op_index = op_index
         self.collision = collision
+        self.op_id = op_id  # id операции для клика/переопределения
+        # Флаг: реагирует ли этот item на клик для селекта. По умолчанию 
+        # False — селект работает только на определённых toolpath'ах 
+        # (внутренний контур blade — задаётся в add_toolpaths_to_scene).
+        self.selectable = selectable
+        # Флаг подсветки выделения (устанавливается CamScene при клике)
+        self._highlighted = False
         # Сохраняем polypath для отрисовки стрелок направления
         self._polypath = polypath
         path = polypath_to_qpainter(polypath)
@@ -361,13 +499,65 @@ class ToolpathItem(QtWidgets.QGraphicsPathItem):
             pen.setWidthF(1.5)
         
         pen.setCosmetic(True)
+        self._base_pen = pen  # запоминаем оригинал для восстановления
         self.setPen(pen)
         
         self.setZValue(6 if collision else 5)  # коллизии поверх
         self.setFlag(QtWidgets.QGraphicsItem.ItemIsSelectable, False)
     
+    def set_selected_highlight(self, highlighted: bool):
+        """Показать/убрать подсветку выделенного элемента.
+        
+        Выделенный элемент рисуется жирной жёлтой обводкой поверх обычного 
+        цвета. Z-value НЕ меняем — иначе выделенный blade блокировал бы 
+        клик по углам через свою широкую shape() зону.
+        """
+        if self._highlighted == highlighted:
+            return
+        self._highlighted = highlighted
+        if highlighted:
+            pen = QtGui.QPen(QtGui.QColor('#ffff00'))  # ярко-жёлтый
+            pen.setWidthF(3.0)
+            pen.setCosmetic(True)
+            self.setPen(pen)
+        else:
+            self.setPen(self._base_pen)
+        self.update()
+    
     def boundingRect(self):
         return self.path().controlPointRect().adjusted(-5, -5, 5, 5)
+    
+    def shape(self):
+        """Область захвата клика.
+        
+        Для selectable=True — расширяем чтобы юзеру было легче попасть:
+        - Для CORNER — 2мм (углы маленькие; шире мешало бы селекту соседних 
+          углов, но 1мм было тонковато)
+        - Для BLADE — 3мм (крупные, редко близко)
+        Для остальных toolpath'ов — дефолтная тонкая.
+        """
+        if not self.selectable:
+            return super().shape()
+        # Эвристика по длине path: короткие = углы, длинные = blade
+        path_len = self._estimate_path_length()
+        width = 2.0 if path_len < 15.0 else 3.0
+        stroker = QtGui.QPainterPathStroker()
+        stroker.setWidth(width)
+        stroker.setCapStyle(QtCore.Qt.RoundCap)
+        stroker.setJoinStyle(QtCore.Qt.RoundJoin)
+        return stroker.createStroke(self.path())
+    
+    def _estimate_path_length(self) -> float:
+        """Быстрая оценка длины полипаса (сумма длин Line + Arc)."""
+        if not self._polypath or not self._polypath.segments:
+            return 0.0
+        total = 0.0
+        for seg in self._polypath.segments:
+            try:
+                total += seg.length()
+            except Exception:
+                pass
+        return total
     
     def paint(self, painter, option, widget=None):
         # Сначала линия пути
@@ -500,30 +690,59 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         # внешний → lead_outside; OUTSIDE (CCW) режет внутренний → lead_inside.
         if tp.side == ContourSide.OUTSIDE:
             src = cutting_params.lead_inside    # внутренний рез
+            src_key = 'lead_inside'
         elif tp.side == ContourSide.INSIDE:
             src = cutting_params.lead_outside   # внешний рез
+            src_key = 'lead_outside'
         else:
             src = None
+            src_key = None
         if src is not None:
-            user_offset = src.offset
-            lead_in_angle = src.angle
-            lead_in_length_mult = src.length
-            lead_in_radius_mult = src.length
-            lead_out_angle = src.angle
-            lead_out_length_mult = src.length
-            lead_out_radius_mult = src.length
+            # Per-op override (режим «Выделенные»): если у op'а есть 
+            # lead_override, берём параметры оттуда — это позволяет 
+            # каждому ножу иметь СВОИ параметры lead'а, не привязанные к 
+            # текущим глобальным полям.
+            ov = op.attributes.get('lead_override', {}).get(src_key, {})
+            user_offset = ov.get('offset', src.offset)
+            lead_in_angle = ov.get('angle', src.angle)
+            lead_in_length_mult = ov.get('length', src.length)
+            lead_in_radius_mult = ov.get('length', src.length)
+            lead_out_angle = ov.get('angle', src.angle)
+            lead_out_length_mult = ov.get('length', src.length)
+            lead_out_radius_mult = ov.get('length', src.length)
+    elif is_3d_corner or is_2d_corner:
+        # Для углов override применяется: entry (заход) → lead_inside,
+        # exit (выход) → lead_outside. Разные значения, как для обычных 
+        # ножей. Юзер редактирует поля «Внутренний» — влияют на заход, 
+        # поля «Внешний» — на выход. offset берётся из lead_inside 
+        # (единая точка старта).
+        ov_in = op.attributes.get('lead_override', {}).get('lead_inside', {})
+        ov_out = op.attributes.get('lead_override', {}).get('lead_outside', {})
+        if ov_in:
+            user_offset = ov_in.get('offset', user_offset)
+            lead_in_angle = ov_in.get('angle', lead_in_angle)
+            lead_in_length_mult = ov_in.get('length', lead_in_length_mult)
+            lead_in_radius_mult = ov_in.get('length', lead_in_radius_mult)
+        if ov_out:
+            lead_out_angle = ov_out.get('angle', lead_out_angle)
+            lead_out_length_mult = ov_out.get('length', lead_out_length_mult)
+            lead_out_radius_mult = ov_out.get('length', lead_out_radius_mult)
     
     # ── Нормализация направления и точка старта ──
     is_corner = is_3d_corner or is_2d_corner
     if is_corner:
-        # Развернуть фрагмент под CCW (центр слева) для INSIDE/G41
+        # Развернуть фрагмент под CW (центр справа).
+        # CORNER_REWORK ноги имеют side=OUTSIDE (внутренний рез = CW). 
+        # G-code emitter выдаст G42 (комп. вправо). Внутренний рез blade 
+        # тоже идёт CW, углы должны продолжать это направление — тогда 
+        # фреза с G42 уходит в ту же сторону = ВНУТРЬ ножа = крючок в угол.
         bb = polypath_bbox(geom.polypath)
         cx = (bb[0] + bb[2]) / 2.0
         cy = (bb[1] + bb[3]) / 2.0
         sp = polypath.segments[0].a
         tan = polypath.segments[0].tangent_at_start()
         cross = tan[0]*(cy - sp[1]) - tan[1]*(cx - sp[0])
-        if cross < 0:  # центр справа = CW → разворачиваем под CCW
+        if cross > 0:  # центр слева = CCW → разворачиваем под CW
             polypath = reverse_polypath(polypath)
     elif geom.is_closed and tp.side in (ContourSide.OUTSIDE, ContourSide.INSIDE):
         side_name = "OUTSIDE" if tp.side == ContourSide.OUTSIDE else "INSIDE"
@@ -731,6 +950,27 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
     
     auto_avoid_all = bool(options_extras.get('auto_avoid_all', True))
     
+    # Режим применения lead'а: 0=Авто, 1=Все, 2=Выделенные.
+    # Selected режим означает: юзерские поля применяются ТОЛЬКО к 
+    # выделенному ножу, остальные строятся автоалгоритмом.
+    lead_mode = int(options_extras.get('lead_mode', 0))
+    selected_op_id = str(options_extras.get('selected_op_id', ''))
+    
+    # Для конкретного op определяем: использовать юзерские поля точно 
+    # (auto_avoid=False) или автосдвиг (auto_avoid=True):
+    #   mode=0 Auto     → все → auto_avoid=True
+    #   mode=1 All      → все → auto_avoid=False (юзерские поля точно)
+    #   mode=2 Selected → выделенный op → False (поля к нему), остальные → True
+    if lead_mode == 2:
+        this_op_auto_avoid = (op.id != selected_op_id)
+    elif lead_mode == 1:
+        this_op_auto_avoid = False
+    else:
+        this_op_auto_avoid = True
+    # (Legacy: если auto_avoid_all задан из старого кода — respect его)
+    if not auto_avoid_all and lead_mode == 0:
+        this_op_auto_avoid = False
+    
     # Кеш контуров для коллизий — строится ОДИН раз, переиспользуется для 
     # lead-in и lead-out.
     contours_lines_cache = []
@@ -776,7 +1016,7 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
             polypath_offset, req_in,
             contours_lines_cache, contours_bboxes_cache,
             geom.id, effective_tool_offset,
-            auto_avoid=auto_avoid_all and project is not None,
+            auto_avoid=this_op_auto_avoid and project is not None,
             exit_request=exit_req,
             overlap=pending_overlap)
     
@@ -938,19 +1178,36 @@ def add_toolpaths_to_scene(scene: 'CamScene', project, options_extras: dict = No
                 continue
             
             if geo['contour'] and geo['contour'].segments:
-                item = ToolpathItem(geo['contour'], kind='CONTOUR', op_index=op_idx)
+                # Селект работает через контур ВНУТРЕННЕГО реза (внутренний 
+                # рез = ContourSide.OUTSIDE в терминах кода: toolpath ИНСАЙД 
+                # контура ножа). Углы (CORNER_REWORK) тоже селектимые.
+                is_selectable = (
+                    (op.kind == OperationKind.BLADE_FORMING
+                        and tp.side == ContourSide.OUTSIDE)
+                    or op.kind == OperationKind.CORNER_REWORK
+                )
+                item = ToolpathItem(geo['contour'], kind='CONTOUR', op_index=op_idx,
+                                    op_id=op.id, selectable=is_selectable)
+                # Углы поднимаем в z-порядке НАД контурами blade, чтобы 
+                # itemAt()/items(pos) отдавали приоритет углу когда клик 
+                # попадает в область где путь blade широкий 3мм захвата.
+                # Без этого угол лежит под blade и селектится blade.
+                if op.kind == OperationKind.CORNER_REWORK:
+                    item.setZValue(8)
                 scene.addItem(item)
                 items.append(item)
             
             if geo['lead_in'] and geo['lead_in'].segments:
                 item = ToolpathItem(geo['lead_in'], kind='LEAD_IN', op_index=op_idx,
-                                    collision=geo.get('lead_in_collision', False))
+                                    collision=geo.get('lead_in_collision', False),
+                                    op_id=op.id)
                 scene.addItem(item)
                 items.append(item)
             
             if geo['lead_out'] and geo['lead_out'].segments:
                 item = ToolpathItem(geo['lead_out'], kind='LEAD_OUT', op_index=op_idx,
-                                    collision=geo.get('lead_out_collision', False))
+                                    collision=geo.get('lead_out_collision', False),
+                                    op_id=op.id)
                 scene.addItem(item)
                 items.append(item)
         
@@ -960,5 +1217,11 @@ def add_toolpaths_to_scene(scene: 'CamScene', project, options_extras: dict = No
             if progress_callback(processed, total_ops) is False:
                 # Юзер нажал Cancel — прерываем
                 break
+    
+    # После пересоздания toolpath-items сбрасываем выделение — юзер начинает
+    # с чистого листа: подсветка нигде не горит, override у выделенного 
+    # op'а уже применён и остался.
+    if hasattr(scene, '_selected_op_id'):
+        scene._selected_op_id = ""
     
     return items

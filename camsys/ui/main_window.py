@@ -261,6 +261,64 @@ class OperationsPanel(QtWidgets.QWidget):
 #  ПАРАМЕТРЫ CUTTING — повторяет диалог Cutting v-5.1 из Альфакама
 # ─────────────────────────────────────────────────────────────────────────
 
+class _AutoAvoidCompat:
+    """Совместимость со старым интерфейсом `auto_avoid_all` (QCheckBox).
+    
+    Раньше был чекбокс с методами `isChecked()` и сигналом `toggled`. 
+    Теперь на его месте 3 радио-кнопки (rb_lead_auto/all/selected). 
+    Этот shim транслирует старые вызовы: `isChecked()` возвращает True 
+    когда выбран режим «Авто-подбор», `toggled` эмитируется когда радио 
+    переключается между «Авто» и другими режимами.
+    """
+    
+    def __init__(self, panel):
+        self._panel = panel
+        # Прокидываем через buttonGroup.idToggled
+        self._panel._lead_mode_bg.idToggled.connect(self._on_id_toggled)
+        # ВАЖНО: сохраняем _SignalHost как атрибут — иначе Python GC 
+        # уничтожит объект и Qt-сигнал упадёт с "Signal source has been 
+        # deleted" при попытке эмитить.
+        self._signal_host = _SignalHost()
+        self.toggled = self._signal_host.sig
+    
+    def _on_id_toggled(self, mode_id: int, checked: bool):
+        # Эмитим когда режим-Авто получает изменение (или теряет)
+        if mode_id == 0 and checked:
+            self.toggled.emit(True)
+        elif mode_id == 0 and not checked:
+            self.toggled.emit(False)
+    
+    def isChecked(self) -> bool:
+        return self._panel.rb_lead_auto.isChecked()
+    
+    def setChecked(self, value: bool):
+        # Ставим Авто при True, иначе оставляем текущий не-Авто режим 
+        # (по умолчанию «Все элементы» если нужно снять с Авто).
+        if value:
+            self._panel.rb_lead_auto.setChecked(True)
+        elif self._panel.rb_lead_auto.isChecked():
+            self._panel.rb_lead_all.setChecked(True)
+    
+    def blockSignals(self, block: bool) -> bool:
+        """Проксирование blockSignals — блокирует все радио-кнопки группы.
+        
+        Используется в set_defaults() чтобы не эмитить paramsChanged пока 
+        сбрасываются значения.
+        """
+        prev = False
+        for rb in (self._panel.rb_lead_auto, 
+                   self._panel.rb_lead_all,
+                   self._panel.rb_lead_selected):
+            prev = rb.blockSignals(block) or prev
+        return prev
+
+
+class _SignalHost(QtCore.QObject):
+    """Пустой QObject-контейнер только для эмиссии сигнала."""
+    sig = QtCore.Signal(bool)
+
+
+
 class CuttingParamsPanel(QtWidgets.QWidget):
     """Параметры макроса Cutting (правая панель).
     
@@ -360,7 +418,10 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         layout.addWidget(group_group)
         
         # ── ВХОД/ВЫХОД ──
-        lead_group = QtWidgets.QGroupBox("Точка входа/выхода")
+        # Сохраняем в атрибуте — main_window будет менять enabled состояние 
+        # в зависимости от режима (Авто → disabled, Все/Выделенные → enabled).
+        self._lead_group = QtWidgets.QGroupBox("Точка входа/выхода")
+        lead_group = self._lead_group
         lead_grid = QtWidgets.QGridLayout(lead_group)
         
         # Колонки заходов привязаны к ФИЗИЧЕСКОМУ резу (см. routing в
@@ -467,25 +528,57 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         )
         lead_grid.addWidget(self.lead_out_overlap, 4, 3)
         
-        # ── Автоподбор lead для всех элементов ──
-        # Раньше был в разделе «Генерировать файлы», но логически ближе к 
-        # настройкам lead-in/out → перенесён сюда.
-        # ВКЛ: применяется ко всем ножам где обнаружена коллизия захода/выхода
-        # ВЫКЛ: только для выделенного элемента (логика выделения пока 
-        #       в разработке, поведение — pass-через)
-        self.auto_avoid_all = QtWidgets.QCheckBox(
-            "Авто-подбор для всех элементов")
-        self.auto_avoid_all.setChecked(True)
-        self.auto_avoid_all.setToolTip(
-            "Если ВКЛ — автоподбор позиции/угла/длины захода применяется ко "
-            "всем ножам где обнаружена коллизия.\n"
-            "Если ВЫКЛ — только к выделенному (в разработке).")
-        lead_grid.addWidget(self.auto_avoid_all, 5, 0, 1, 4)
+        # ── Режим применения параметров lead-in/out ──
+        # 3 режима:
+        #   1) Авто-подбор: алгоритм автосдвигает позицию/угол/длину если 
+        #      обнаружена коллизия с соседями. Юзерский offset — стартовый.
+        #   2) Все элементы: НЕ сдвигать, применить точно юзерские значения 
+        #      ко ВСЕМ ножам. Если возникает коллизия — показать RED.
+        #   3) Выделенные: юзер кликом выделяет нож, меняет поля → 
+        #      применяются только к нему. Остальные ножи — как раньше.
+        lead_mode_group = QtWidgets.QGroupBox("Режим применения")
+        lead_mode_layout = QtWidgets.QHBoxLayout(lead_mode_group)
+        lead_mode_layout.setContentsMargins(6, 4, 6, 4)
+        lead_mode_layout.setSpacing(8)
+        
+        self.rb_lead_auto = QtWidgets.QRadioButton("Авто-подбор")
+        self.rb_lead_auto.setToolTip(
+            "Алгоритм автоматически подбирает позицию/угол/длину чтобы "
+            "избежать коллизий. Юзерские значения — стартовые.")
+        self.rb_lead_all = QtWidgets.QRadioButton("Все элементы")
+        self.rb_lead_all.setToolTip(
+            "Применить юзерские значения (angle/length/offset/overlap) "
+            "ТОЧНО ко всем ножам без автосдвига. При коллизии — RED.")
+        self.rb_lead_selected = QtWidgets.QRadioButton("Выделенные")
+        self.rb_lead_selected.setToolTip(
+            "Кликом выделите нож на канвасе — изменения полей применятся "
+            "только к нему. Остальные ножи не трогаются.")
+        # По умолчанию — авто-подбор (как сейчас)
+        self.rb_lead_auto.setChecked(True)
+        
+        # Группируем чтобы работали как радио
+        self._lead_mode_bg = QtWidgets.QButtonGroup(self)
+        self._lead_mode_bg.addButton(self.rb_lead_auto, 0)
+        self._lead_mode_bg.addButton(self.rb_lead_all, 1)
+        self._lead_mode_bg.addButton(self.rb_lead_selected, 2)
+        
+        lead_mode_layout.addWidget(self.rb_lead_auto)
+        lead_mode_layout.addWidget(self.rb_lead_all)
+        lead_mode_layout.addWidget(self.rb_lead_selected)
+        
+        # СОВМЕСТИМОСТЬ: старый атрибут auto_avoid_all оставляем как 
+        # свойство — возвращает True когда выбран режим «Авто-подбор». 
+        # Много кода уже смотрит на него через get_params_dict/etc.
+        self.auto_avoid_all = _AutoAvoidCompat(self)
         
         # Подсветка изменённых полей автоподбором — снимается при экспорте.
         # Кнопка автоподбора удалена: вызывается автоматически при показе путей.
         
+        # Добавляем группы В ОТДЕЛЬНОСТИ (не вкладываем режим в lead_group), 
+        # чтобы можно было `lead_group.setEnabled(False)` в Auto-режиме — 
+        # блокировать все поля разом, не трогая радио.
         layout.addWidget(lead_group)
+        layout.addWidget(lead_mode_group)
         
         # ── ЧТО ГЕНЕРИРОВАТЬ ──
         gen_group = QtWidgets.QGroupBox("Генерировать файлы")
@@ -884,6 +977,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.params_panel.btn_preview.clicked.connect(self.action_preview_files)
         self.params_panel.btn_show_paths.toggled.connect(self.action_toggle_paths)
         self.params_panel.btn_refresh_paths.clicked.connect(self.action_refresh_paths)
+        
+        # Связка радио-режимов «Авто/Все/Выделенные» с возможностью 
+        # выделения ножей на канвасе. Селект работает только в режиме 
+        # «Выделенные».
+        self.params_panel._lead_mode_bg.idToggled.connect(
+            self._on_lead_mode_changed)
+        # Начальное состояние — по текущему выбранному радио
+        current_id = self.params_panel._lead_mode_bg.checkedId()
+        self.scene.set_toolpath_selection_enabled(current_id == 2)
+        # В режиме Авто (id=0) вся группа lead-in/out блокируется
+        self.params_panel._lead_group.setEnabled(current_id != 0)
+        
+        # ── ВЫДЕЛЕНИЕ НОЖА (для режима «Выделенные») ──
+        # Отслеживаем id выделенного ножа. Используется в extras для 
+        # _build_toolpath_geometry чтобы применить юзерские поля ТОЛЬКО 
+        # к этому ножу; остальные строятся автоалгоритмом.
+        self._selected_op_id: str = ""
+        self.scene.toolpath_clicked.connect(self._on_toolpath_clicked)
+        # Правый клик на toolpath — переключить excluded (быстрая замена 
+        # галочки в operations-таблице).
+        self.scene.toolpath_right_clicked.connect(self._on_toolpath_right_clicked)
         # Прокручиваемая обёртка
         scroll = QtWidgets.QScrollArea()
         scroll.setWidget(self.params_panel)
@@ -1106,6 +1220,153 @@ class MainWindow(QtWidgets.QMainWindow):
             self, "Будут созданы файлы",
             "\n".join(f"  {n}" for n in names))
     
+    def _on_toolpath_clicked(self, op_id: str):
+        """Юзер кликнул на toolpath на канвасе. Сохраняем id для 
+        использования в extras (только в режиме «Выделенные»).
+        
+        Пустой op_id (клик мимо, Escape) → выделение снято.
+        
+        Автообновление НЕ вызываем — юзер сам жмёт «Обновить» когда 
+        хочет применить текущие значения полей. Иначе неожиданно 
+        сдвигается позиция ножа при простом клике-выделении.
+        """
+        self._selected_op_id = op_id
+    
+    def _on_toolpath_right_clicked(self, op_id: str):
+        """Правый клик на toolpath — показать контекстное меню.
+        
+        Меню содержит:
+        - Отключить/Включить нож (тоггл excluded)
+        - Сбросить переопределение (убрать lead_override если есть)
+        
+        Меню предотвращает случайные срабатывания при промахах ПКМ.
+        """
+        if not op_id or self.session.project is None:
+            return
+        # Находим op
+        op = next((o for o in self.session.project.operations if o.id == op_id), None)
+        if op is None:
+            return
+        
+        # Строим меню
+        menu = QtWidgets.QMenu(self)
+        is_excluded = op.attributes.get('excluded', False)
+        has_override = 'lead_override' in op.attributes
+        
+        # Название ножа для заголовка
+        op_name = f"{op.kind.value} {op.id[:6]}"
+        header = menu.addAction(op_name)
+        header.setEnabled(False)  # только заголовок
+        menu.addSeparator()
+        
+        act_toggle = menu.addAction(
+            "Включить нож" if is_excluded else "Отключить нож")
+        act_reset = menu.addAction("Сбросить переопределение")
+        act_reset.setEnabled(has_override)
+        
+        # Показываем меню у курсора
+        chosen = menu.exec(QtGui.QCursor.pos())
+        
+        if chosen is act_toggle:
+            new_excluded = not is_excluded
+            op.attributes['excluded'] = new_excluded
+            new_state = "исключён" if new_excluded else "активен"
+            self.statusBar().showMessage(f"{op_name} → {new_state}", 3000)
+            
+            # Если отключаем/включаем BLADE — синхронизируем его CORNER'ы. 
+            # Иначе галка у угла остаётся стоять, а визуально он всё равно 
+            # скрыт (add_toolpaths_to_scene скрывает corner'ы для excluded 
+            # blade через excluded_geom_ids). Синхронизация делает состояние 
+            # понятным юзеру.
+            from ..core.project import OperationKind
+            if op.kind == OperationKind.BLADE_FORMING:
+                blade_geom_ids = set(op.geometry_ids)
+                for other in self.session.project.operations:
+                    if (other.kind == OperationKind.CORNER_REWORK
+                            and other.attributes.get('parent_geom_id') in blade_geom_ids):
+                        other.attributes['excluded'] = new_excluded
+            
+            self._refresh_operations()
+            if self.params_panel.btn_show_paths.isChecked():
+                self.action_toggle_paths(True)
+        elif chosen is act_reset:
+            op.attributes.pop('lead_override', None)
+            self.statusBar().showMessage(
+                f"{op_name} → override сброшен", 3000)
+            if self.params_panel.btn_show_paths.isChecked():
+                self.action_toggle_paths(True)
+    
+    def _on_lead_mode_changed(self, mode_id: int, checked: bool):
+        """Обработчик переключения радио-режима lead'а.
+        
+        mode_id: 0=Авто, 1=Все элементы, 2=Выделенные.
+        - Селект на канвасе работает ТОЛЬКО в режиме «Выделенные».
+        - В режиме «Авто» вся группа «Точка входа/выхода» блокируется 
+          (значения ставит алгоритм).
+        - В режимах «Все/Выделенные» группа разрешена.
+        - При смене режима автоматически перестраиваются пути (если показаны).
+        """
+        if not checked:
+            return  # игнорируем «toggle off» события (парный к «toggle on»)
+        
+        # Селект по клику включён только в режиме «Выделенные»
+        self.scene.set_toolpath_selection_enabled(mode_id == 2)
+        
+        # Вся группа «Точка входа/выхода» блокируется в Авто
+        self.params_panel._lead_group.setEnabled(mode_id != 0)
+        
+        # Управление per-op override'ами при смене режима:
+        # - При входе в «Выделенные»: снапшотим текущие ГЛОБАЛЬНЫЕ поля в 
+        #   op.attributes['lead_override'] для всех ножей (если ещё нет). 
+        #   Тогда изменения полей будут «прилипать» только к выделенному 
+        #   элементу, остальные останутся с этим снапшотом.
+        # - При выходе (Авто/Все): удаляем все override'ы — глобальные поля 
+        #   применяются ко всем.
+        if self.session.project is not None:
+            if mode_id == 2:  # Вход в «Выделенные»
+                self._snapshot_lead_params_to_ops()
+            else:  # Выход
+                self._clear_lead_overrides()
+        
+        # Автообновление если пути уже показаны — юзер сразу видит эффект
+        if self.params_panel.btn_show_paths.isChecked():
+            self.action_toggle_paths(True)
+    
+    def _snapshot_lead_params_to_ops(self):
+        """Сохраняет текущие глобальные lead-параметры в атрибуты каждой 
+        операции ножа. Вызывается при переходе в режим «Выделенные» — 
+        тогда изменения полей будут применяться ТОЛЬКО к выделенному op'у,
+        остальные будут использовать сохранённые снапшоты.
+        """
+        p = self.params_panel
+        snapshot = {
+            'lead_inside': {
+                'angle': p.lead_in_angle.value(),
+                'length': p.lead_in_length.value(),
+                'offset': p.lead_in_offset.value(),
+                'overlap': p.lead_in_overlap.value(),
+            },
+            'lead_outside': {
+                'angle': p.lead_out_angle.value(),
+                'length': p.lead_out_length.value(),
+                'offset': p.lead_out_offset.value(),
+                'overlap': p.lead_out_overlap.value(),
+            },
+        }
+        for op in self.session.project.operations:
+            if 'lead_override' not in op.attributes:
+                op.attributes['lead_override'] = {
+                    'lead_inside': dict(snapshot['lead_inside']),
+                    'lead_outside': dict(snapshot['lead_outside']),
+                }
+    
+    def _clear_lead_overrides(self):
+        """Удаляет per-op lead-override'ы у всех операций."""
+        if self.session.project is None:
+            return
+        for op in self.session.project.operations:
+            op.attributes.pop('lead_override', None)
+    
     def action_refresh_paths(self):
         """Принудительная перерисовка путей. Если они скрыты — включает.
         Если уже показаны — снимает старые и рисует новые с актуальными 
@@ -1147,6 +1408,31 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         
+        # В режиме «Выделенные» — обновляем override у выделенного op'а 
+        # ТЕКУЩИМИ значениями полей. Тогда только он получит изменения.
+        # Остальные ноги остаются со своим снапшот-override'ом.
+        lead_mode_id = self.params_panel._lead_mode_bg.checkedId() \
+            if hasattr(self.params_panel, '_lead_mode_bg') else 0
+        if lead_mode_id == 2 and self._selected_op_id:
+            sel_op = next((o for o in self.session.project.operations
+                            if o.id == self._selected_op_id), None)
+            if sel_op is not None:
+                p = self.params_panel
+                sel_op.attributes['lead_override'] = {
+                    'lead_inside': {
+                        'angle': p.lead_in_angle.value(),
+                        'length': p.lead_in_length.value(),
+                        'offset': p.lead_in_offset.value(),
+                        'overlap': p.lead_in_overlap.value(),
+                    },
+                    'lead_outside': {
+                        'angle': p.lead_out_angle.value(),
+                        'length': p.lead_out_length.value(),
+                        'offset': p.lead_out_offset.value(),
+                        'overlap': p.lead_out_overlap.value(),
+                    },
+                }
+        
         try:
             # Применим текущие параметры к session
             params = self.params_panel.get_params_dict()
@@ -1166,6 +1452,11 @@ class MainWindow(QtWidgets.QMainWindow):
             corner_tool_radius = corner_tip / 2.0
             corner_tool_eq = corner_tip + 2 * bottom * math.tan(math.radians(angle/2))
             
+            # Режим применения lead'а: 0=Авто, 1=Все, 2=Выделенные.
+            # В viewer передаём вместе с id выделенного ножа (для режима 2).
+            lead_mode_id = self.params_panel._lead_mode_bg.checkedId() \
+                if hasattr(self.params_panel, '_lead_mode_bg') else 0
+            
             extras = {
                 'tool_radius': tool_radius,
                 'tool_equidistant': tool_eq,
@@ -1175,6 +1466,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     if hasattr(self, 'gen_smooth') else False,
                 'auto_avoid_all': self.params_panel.auto_avoid_all.isChecked()
                     if hasattr(self.params_panel, 'auto_avoid_all') else True,
+                'lead_mode': lead_mode_id,  # 0=Авто, 1=Все, 2=Выделенные
+                'selected_op_id': self._selected_op_id,
             }
             
             # Вызываем визуализатор
@@ -1307,6 +1600,10 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             progress.setValue(100)
             progress.close()
+            
+            # Сбрасываем выделение — юзер видит: изменения применились, 
+            # подсветка нигде не горит. Готов кликать следующий нож.
+            self._selected_op_id = ""
             
             n = len(self._toolpath_items)
             self.params_panel.btn_show_paths.setText(f"Скрыть пути ({n})")
