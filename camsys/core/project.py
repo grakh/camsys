@@ -564,15 +564,31 @@ class Project:
         той же фрезой — для последующего сведения координат на другом 
         оборудовании.
         
+        Учитывает состояние excluded на per-fiducial операциях (создаются 
+        через create_fiducial_operations). Если юзер снял галку с репера 
+        в operations-таблице → эта точка не попадёт в DRILL.
+        
         Операция НЕ добавляется в self.operations автоматически — её 
         добавляет PackageExporter только в нужные программы (_all_R/_revers_R).
         
         Returns:
-            Operation с kind=FIDUCIAL_DRILL, или None если реперов меньше 2.
+            Operation с kind=FIDUCIAL_DRILL, или None если активных реперов < 2.
             Точки сверления хранятся в attributes['drill_points'] как список
             (x, y) кортежей. drill_depth — в attributes['drill_depth'].
         """
-        if len(self.fiducials) < 2:
+        # Собираем set fid_id которые ОТКЛЮЧЕНЫ юзером в operations-таблице
+        excluded_fid_ids = {
+            op.attributes.get('fiducial_id')
+            for op in self.operations
+            if op.kind == OperationKind.FIDUCIAL_DRILL
+            and op.attributes.get('excluded', False)
+            and op.attributes.get('fiducial_id')
+        }
+        # Активные реперы = все кроме отключенных
+        active_fids = [f for f in self.fiducials 
+                       if f.id not in excluded_fid_ids]
+        
+        if len(active_fids) < 2:
             return None
         
         settings = CutSettings(
@@ -585,9 +601,39 @@ class Project:
             geometry_ids=[],
             settings=settings,
         )
-        # Точки сверления = позиции реперов
-        op.attributes['drill_points'] = [(f.x, f.y) for f in self.fiducials[:2]]
+        # Точки сверления = позиции АКТИВНЫХ реперов
+        op.attributes['drill_points'] = [(f.x, f.y) for f in active_fids[:2]]
         op.attributes['drill_depth'] = drill_depth
         # У DRILL-операции нет toolpath'ов в обычном смысле — постпроцессор
         # обрабатывает её по attributes['drill_points'].
         return op
+    
+    def create_fiducial_operations(self, drill_depth: float = 0.5,
+                                    tool_number: int = 1) -> List[Operation]:
+        """Создаёт по одной FIDUCIAL_DRILL операции на КАЖДЫЙ репер.
+        
+        В отличие от create_fiducial_drill_operation() (которая делает одну 
+        операцию с массивом точек), эта — по одной операции на репер. 
+        Позволяет юзеру независимо выделять и отключать реперы через 
+        operations-таблицу или ПКМ на канвасе.
+        
+        Каждая операция имеет один drill_point и хранит id репера в 
+        attributes['fiducial_id'] для обратной привязки.
+        """
+        ops = []
+        for fid in self.fiducials:
+            settings = CutSettings(
+                tool_number=tool_number,
+                pass_type=PassType.SINGLE,
+            )
+            op = Operation(
+                name=f"Fid {fid.name or fid.id[:4]}",
+                kind=OperationKind.FIDUCIAL_DRILL,
+                geometry_ids=[],
+                settings=settings,
+            )
+            op.attributes['drill_points'] = [(fid.x, fid.y)]
+            op.attributes['drill_depth'] = drill_depth
+            op.attributes['fiducial_id'] = fid.id
+            ops.append(op)
+        return ops

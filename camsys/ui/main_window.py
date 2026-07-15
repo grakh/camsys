@@ -172,6 +172,11 @@ class OperationsPanel(QtWidgets.QWidget):
         self._session = sess
         state = sess.get_state()
         ops = state['project']['operations']
+        # Фильтр «Выбран заказ сшивки» — отсеиваем ops не из активного 
+        # региона. Для одиночных заказов attribute отсутствует → все 
+        # проходят.
+        ops = [op for op in ops 
+               if not op.get('attributes', {}).get('stitch_filtered_out', False)]
         self.table.setRowCount(len(ops))
         for row, op in enumerate(ops):
             # Колонка 0: чекбокс «включена ли операция в экспорт»
@@ -335,6 +340,21 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         super().__init__(parent)
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
+        
+        # ── СШИВКА (только для многозаказных макетов) ──
+        # Скрыто по умолчанию, показывается только если файл — сшивка.
+        # Позволяет переключаться между «Вся сшивка» (default) и 
+        # конкретными заказами. При переключении:
+        #   - сцена фильтруется по региону заказа  
+        #   - подгружается specification_<номер>.xml
+        #   - экспорт идёт по этому заказу
+        self.stitch_group = QtWidgets.QGroupBox("Сшивка")
+        stitch_layout = QtWidgets.QFormLayout(self.stitch_group)
+        self.stitch_combo = QtWidgets.QComboBox()
+        self.stitch_combo.addItem("Вся сшивка", "")
+        stitch_layout.addRow("Заказ:", self.stitch_combo)
+        self.stitch_group.setVisible(False)  # только если сшивка
+        layout.addWidget(self.stitch_group)
         
         # ── ПАРАМЕТРЫ НОЖА ──
         knife_group = QtWidgets.QGroupBox("Параметры ножа")
@@ -894,7 +914,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         # Базовый заголовок без файла. Меняется при загрузке .ai.
-        self._base_title = "camsys — CAM для флексографических ножей"
+        from camsys import __version_info__
+        self._base_title = f"camsys {__version_info__} — CAM для флексографических ножей"
         self.setWindowTitle(self._base_title)
         self.resize(1600, 950)
         
@@ -1076,15 +1097,328 @@ class MainWindow(QtWidgets.QMainWindow):
             self.session.load_ai(path)
             self._auto_detect_corner_programs()
             self._auto_set_fiducial_x()
+            
+            # Автоматически создаём операции сразу после загрузки — чтобы 
+            # юзер видел все ножи+реперы в таблице без необходимости жать 
+            # «Создать». Раньше «Создать» было ручной кнопкой, но по факту 
+            # его надо жать ВСЕГДА перед любой работой — автоматизируем.
+            try:
+                self.session.create_blade_operations()
+                self.session.sort_by_grid()
+            except Exception:
+                pass  # если что-то не так с .ai — юзер увидит через btn_create
+            
             self._refresh_all()
             self.label_file.setText(f"Проект: {self.session.project.name}")
             # Имя файла в заголовке окна — видно во вкладках таскбара/Alt+Tab.
             self.setWindowTitle(f"{Path(path).name} — {self._base_title}")
+            
+            # ── Анализ сшивки ──
+            # Если файл — сшивка (`<стичка>_<заказ1>_<заказ2>_..._.ai`),
+            # автоматически определяем регионы + распределяем ножи по 
+            # заказам. Результат сохраняем в session.stitch_info.
+            self._analyze_and_setup_stitch(path)
+            
+            # ── Чтение specification_*.xml из папки заказа ──
+            # Ищет ../XML/specification_*.xml, парсит УголЗаточкиКромки и 
+            # ВысотаНожа. Найденные значения подставляются в поля панели и 
+            # подсвечиваются розовым — юзер видит откуда взято.
+            self._apply_spec_xml_values(path)
+            
             self.statusBar().showMessage("Загружено", 3000)
             self.viewer.fit_all()
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Ошибка импорта", str(e))
             self.statusBar().showMessage("Ошибка", 3000)
+    
+    def _analyze_and_setup_stitch(self, ai_path):
+        """Анализирует .ai на предмет сшивки и настраивает UI.
+        
+        Если файл — сшивка (`<стичка>_<заказ1>_<заказ2>_..._.ai`):
+        1. Детектит регионы из слоя `namber`
+        2. Сопоставляет номера заказов с регионами через PDF-текст
+        3. Заполняет stitch_combo списком заказов
+        4. Показывает stitch_group на панели
+        
+        Если файл — одиночный: скрывает stitch_group.
+        """
+        from pathlib import Path
+        from ..io_.stitch import analyze_stitch
+        
+        self.params_panel.stitch_combo.blockSignals(True)
+        self.params_panel.stitch_combo.clear()
+        self.params_panel.stitch_combo.addItem("Вся сшивка", "")
+        
+        try:
+            stitch_info = analyze_stitch(Path(ai_path), self.session.project)
+        except Exception:
+            stitch_info = None
+        
+        self.session._stitch_info = stitch_info
+        
+        if stitch_info is None or len(stitch_info.regions) < 2:
+            self.params_panel.stitch_group.setVisible(False)
+            self.params_panel.stitch_combo.blockSignals(False)
+            return
+        
+        for r in stitch_info.regions:
+            label = r.order_number or f"регион {stitch_info.regions.index(r) + 1}"
+            n_knives = len(r.knife_ids)
+            display = f"{label} ({n_knives} ножей)"
+            self.params_panel.stitch_combo.addItem(display, label)
+        
+        self.params_panel.stitch_group.setVisible(True)
+        self.params_panel.stitch_combo.blockSignals(False)
+        
+        if not hasattr(self, '_stitch_signal_connected'):
+            self.params_panel.stitch_combo.currentIndexChanged.connect(
+                self._on_stitch_order_changed)
+            self._stitch_signal_connected = True
+        
+        self.statusBar().showMessage(
+            f"Сшивка {stitch_info.stitch_number}: "
+            f"{len(stitch_info.regions)} заказов", 5000)
+    
+    def _on_stitch_order_changed(self, idx):
+        """Юзер выбрал заказ в dropdown сшивки.
+        
+        При каждом переключении заказа:
+        1. Сохраняем ТЕКУЩИЕ настройки UI в attributes предыдущего 
+           выбранного заказа (у сшивки/session есть dict _order_settings)
+        2. Загружаем настройки НОВОГО заказа (если есть) в UI 
+           (угол/пятка/высота/направление/лимит/2-я реперная)
+        3. Отфильтровываем сцену только на его ножи
+        4. Автозагружаем specification_<order>.xml (если не сохранено 
+           явно юзером)
+        
+        При выборе «Вся сшивка» — сохраняем текущие, но НЕ загружаем 
+        новые. UI остаётся с последними значениями. Фильтр снимается.
+        """
+        order = self.params_panel.stitch_combo.itemData(idx) or ""
+        stitch = getattr(self.session, '_stitch_info', None)
+        if not stitch:
+            return
+        
+        # 1. Сохранить настройки предыдущего заказа
+        prev_order = getattr(self, '_current_stitch_order', None)
+        if prev_order:  # непустой = не "Вся сшивка"
+            self._save_order_settings(prev_order)
+        
+        # Запоминаем новый выбранный
+        self._current_stitch_order = order if order else None
+        
+        if not order:
+            # Вся сшивка — снять фильтр, UI не трогаем
+            self._apply_stitch_filter(None)
+            self.statusBar().showMessage("Показана вся сшивка", 3000)
+            return
+        
+        # Конкретный заказ
+        region = stitch.get_region_by_order(order)
+        if region is None:
+            return
+        
+        # 2. Загрузить настройки заказа (если сохранены раньше)
+        loaded = self._load_order_settings(order)
+        
+        # 3. Фильтр сцены
+        self._apply_stitch_filter(region)
+        self.session.cutting_params.output_prefix = order
+        
+        # 4. Если настройки НЕ были ранее сохранены — грузим из XML  
+        # (первое переключение на заказ)
+        if not loaded:
+            self._apply_spec_xml_for_order(order)
+        
+        self.statusBar().showMessage(
+            f"Заказ {order}: {len(region.knife_ids)} ножей, "
+            f"{len(region.fiducial_ids)} реперов", 5000)
+    
+    def _save_order_settings(self, order):
+        """Снимает текущие значения UI + attributes ops → в session dict."""
+        if not hasattr(self.session, '_order_settings'):
+            self.session._order_settings = {}
+        p = self.params_panel
+        # UI values
+        ui = {
+            'angle': p.angle.currentText(),
+            'tip': p.tip.currentText(),
+            'top': p.top.value(),
+            'bottom': p.bottom.value(),
+            'direction_horiz': p.dir_horiz.isChecked(),
+            'use_reverse': p.use_reverse.isChecked(),
+            'max_geom_len': p.max_geom_len.value(),
+            'fiducial_x': p.fiducial_x.value(),
+        }
+        # Attributes всех операций этого заказа (excluded + lead_override)
+        from ..core.project import OperationKind
+        stitch = getattr(self.session, '_stitch_info', None)
+        region = stitch.get_region_by_order(order) if stitch else None
+        op_attrs = {}
+        if region:
+            allowed_knives = set(region.knife_ids)
+            allowed_fids = set(region.fiducial_ids)
+            for op in self.session.project.operations:
+                # Определяем принадлежит ли op этому заказу
+                belongs = False
+                if op.kind == OperationKind.BLADE_FORMING:
+                    belongs = any(g in allowed_knives for g in op.geometry_ids)
+                elif op.kind == OperationKind.CORNER_REWORK:
+                    belongs = op.attributes.get('parent_geom_id') in allowed_knives
+                elif op.kind == OperationKind.FIDUCIAL_DRILL:
+                    belongs = op.attributes.get('fiducial_id') in allowed_fids
+                if belongs:
+                    op_attrs[op.id] = {
+                        'excluded': op.attributes.get('excluded', False),
+                        'lead_override': dict(op.attributes.get('lead_override', {})),
+                    }
+        self.session._order_settings[order] = {
+            'ui': ui,
+            'op_attrs': op_attrs,
+        }
+    
+    def _load_order_settings(self, order):
+        """Загружает сохранённые настройки заказа в UI. Возвращает True 
+        если данные были найдены (значит XML грузить не нужно).
+        """
+        settings = getattr(self.session, '_order_settings', {}).get(order)
+        if not settings:
+            return False
+        p = self.params_panel
+        # Заблокировать сигналы во время массовой установки
+        widgets = [p.angle, p.tip, p.top, p.bottom, p.dir_horiz, p.dir_vert,
+                   p.use_reverse, p.max_geom_len, p.fiducial_x]
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            ui = settings.get('ui', {})
+            if 'angle' in ui: p.angle.setCurrentText(ui['angle'])
+            if 'tip' in ui: p.tip.setCurrentText(ui['tip'])
+            if 'top' in ui: p.top.setValue(ui['top'])
+            if 'bottom' in ui: p.bottom.setValue(ui['bottom'])
+            if 'direction_horiz' in ui:
+                p.dir_horiz.setChecked(ui['direction_horiz'])
+                p.dir_vert.setChecked(not ui['direction_horiz'])
+            if 'use_reverse' in ui: p.use_reverse.setChecked(ui['use_reverse'])
+            if 'max_geom_len' in ui: p.max_geom_len.setValue(ui['max_geom_len'])
+            if 'fiducial_x' in ui: p.fiducial_x.setValue(ui['fiducial_x'])
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+        # Восстановить op.attributes для этого заказа
+        op_attrs = settings.get('op_attrs', {})
+        for op in self.session.project.operations:
+            if op.id in op_attrs:
+                stored = op_attrs[op.id]
+                op.attributes['excluded'] = stored.get('excluded', False)
+                lo = stored.get('lead_override')
+                if lo:
+                    op.attributes['lead_override'] = dict(lo)
+                else:
+                    op.attributes.pop('lead_override', None)
+        return True
+    
+    def _apply_stitch_filter(self, region):
+        """Фильтрует сцену: только ножи и реперы указанного региона.
+        None → показать всё. Использует attribute 'stitch_filtered_out'."""
+        from ..core.project import OperationKind
+        
+        if region is None:
+            for op in self.session.project.operations:
+                op.attributes.pop('stitch_filtered_out', None)
+        else:
+            allowed_knife_geoms = set(region.knife_ids)
+            allowed_fid_ids = set(region.fiducial_ids)
+            for op in self.session.project.operations:
+                if op.kind == OperationKind.BLADE_FORMING:
+                    keep = any(g in allowed_knife_geoms for g in op.geometry_ids)
+                    op.attributes['stitch_filtered_out'] = not keep
+                elif op.kind == OperationKind.FIDUCIAL_DRILL:
+                    fid_id = op.attributes.get('fiducial_id', '')
+                    op.attributes['stitch_filtered_out'] = fid_id not in allowed_fid_ids
+                elif op.kind == OperationKind.CORNER_REWORK:
+                    parent = op.attributes.get('parent_geom_id', '')
+                    op.attributes['stitch_filtered_out'] = parent not in allowed_knife_geoms
+        
+        self._refresh_operations()
+        if self.params_panel.btn_show_paths.isChecked():
+            self.action_toggle_paths(True)
+    
+    def _apply_spec_xml_for_order(self, order_number):
+        """Ищет specification_<order>.xml в папке XML/ сшивки."""
+        try:
+            ai_path = Path(self.session._stitch_info.ai_path)
+        except Exception:
+            return
+        order_folder = ai_path.parent.parent
+        xml_dir = order_folder / "XML"
+        if not xml_dir.is_dir():
+            return
+        candidates = list(xml_dir.glob(f"specification_{order_number}*.xml"))
+        if not candidates:
+            candidates = list(xml_dir.glob(f"*{order_number}*.xml"))
+        if candidates:
+            self._apply_spec_xml_values(candidates[0])
+    
+    def _apply_spec_xml_values(self, ai_path: str):
+        """Читает specification_*.xml (если есть) и заполняет поля.
+        
+        Логика подсветки:
+        - Значения из XML успешно применены → поля БЕЗ подсветки (юзер знает 
+          что они пришли из спецификации, доверять можно).
+        - XML не найден или не распарсен → соответствующие поля 
+          подсвечиваются РОЗОВЫМ, юзер должен проверить и ввести вручную.
+        """
+        p = self.params_panel
+        pink_style = "background-color: #ffd6ec;"
+        target_widgets = {'angle': p.angle, 'top': p.top}
+        # Ключи из XML для каждого поля
+        xml_key_of = {'angle': 'knife_angle', 'top': 'knife_height'}
+        
+        # Пытаемся читать XML
+        spec = {}
+        try:
+            from ..io_.spec_xml import read_spec_for_ai
+            spec = read_spec_for_ai(ai_path)
+        except Exception:
+            pass  # молча — XML необязателен
+        
+        applied = []
+        
+        for widget_key, widget in target_widgets.items():
+            xml_key = xml_key_of[widget_key]
+            if xml_key in spec:
+                # Значение есть — применяем, снимаем подсветку
+                value = spec[xml_key]
+                widget.blockSignals(True)
+                if isinstance(widget, QtWidgets.QComboBox):
+                    # Проверяем что такой пункт есть
+                    items = [widget.itemText(i) for i in range(widget.count())]
+                    if str(value) in items:
+                        widget.setCurrentText(str(value))
+                    else:
+                        # Не смогли применить — подсвечиваем
+                        widget.setStyleSheet(pink_style)
+                        widget.blockSignals(False)
+                        continue
+                else:
+                    widget.setValue(value)
+                widget.blockSignals(False)
+                widget.setStyleSheet("")  # снимаем розовое, значение из XML
+                applied.append(f"{widget_key}={value}")
+            else:
+                # Значения из XML нет — подсвечиваем, чтобы юзер обратил внимание
+                widget.setStyleSheet(pink_style)
+        
+        # Сообщение в статус-бар
+        if spec.get('order_number') and applied:
+            order = spec['order_number']
+            self.statusBar().showMessage(
+                f"Из specification_{order}.xml: {', '.join(applied)}", 5000)
+        elif not spec:
+            self.statusBar().showMessage(
+                "XML спецификации не найден — проверьте розовые поля вручную", 
+                5000)
     
     def _auto_detect_corner_programs(self):
         """Анализирует загруженный проект и АВТОМАТИЧЕСКИ ставит чекбоксы
@@ -1287,6 +1621,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         other.attributes['excluded'] = new_excluded
             
             self._refresh_operations()
+            # Синхронизируем визуал реперов (серый если отключены)
+            self.scene.refresh_fiducial_state(self.session.project)
             if self.params_panel.btn_show_paths.isChecked():
                 self.action_toggle_paths(True)
         elif chosen is act_reset:
@@ -1442,15 +1778,22 @@ class MainWindow(QtWidgets.QMainWindow):
             import math
             tip = params.get('tip_diameter', 0.8)
             bottom = params.get('bottom', 0.2)
+            top = params.get('top', 0.5)
             angle = params.get('knife_angle', 80)
             tool_radius = tip / 2.0
-            tool_eq = tip + 2 * bottom * math.tan(math.radians(angle/2))
+            # Эквидистанта = диаметр_кончика + 2 * h * tan(угол/2)
+            # где h = (top - bottom) — эффективная высота реза (высота ножа 
+            # минус глубина врезания). Это соответствует эталонному .anc:
+            # для tip=0.8, top=0.443, bottom=0.19, angle=70:
+            # eq = 0.8 + 2*0.253*tan(35°) = 1.154 (в эталоне 1.1501/2)
+            cut_h = max(0.0, top - bottom)
+            tool_eq = tip + 2 * cut_h * math.tan(math.radians(angle/2))
             
             # Для CORNER операций используется тонкая фреза T3 (пятка 0.6мм)
             # с пропорционально меньшей эквидистантой.
             corner_tip = 0.6  # фреза T3 для углов 2D
             corner_tool_radius = corner_tip / 2.0
-            corner_tool_eq = corner_tip + 2 * bottom * math.tan(math.radians(angle/2))
+            corner_tool_eq = corner_tip + 2 * cut_h * math.tan(math.radians(angle/2))
             
             # Режим применения lead'а: 0=Авто, 1=Все, 2=Выделенные.
             # В viewer передаём вместе с id выделенного ножа (для режима 2).
@@ -1679,7 +2022,8 @@ class MainWindow(QtWidgets.QMainWindow):
         from ..core.cutting_macro import CuttingMacroParams
         
         cp = self.session.cutting_params
-        tool_eq = cp.tip_diameter + 2.0 * cp.bottom * math.tan(
+        cut_h = max(0.0, cp.top - cp.bottom)
+        tool_eq = cp.tip_diameter + 2.0 * cut_h * math.tan(
             math.radians(cp.knife_angle / 2.0))
         tool_offset = tool_eq / 2.0
         
@@ -1788,21 +2132,59 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("Экспорт...")
             QtWidgets.QApplication.processEvents()
             
-            if nc_dir is not None:
-                result = self.session.export_package_auto()
-                written = result['written']
-                out_dir = result['dir']
-                archived = result['archived']
-            else:
-                out_dir = QtWidgets.QFileDialog.getExistingDirectory(
-                    self, "Папка для пакета (.anc)", self._last_dir)
-                if not out_dir:
-                    self.statusBar().showMessage(
-                        "Экспорт отменён — папка не выбрана", 4000)
-                    return
-                self._last_dir = out_dir
-                written = self.session.export_package(out_dir)
-                archived = None
+            # ── Прогресс-диалог показывается ТОЛЬКО когда началась 
+            # реальная генерация (после выбора папки). Иначе он 
+            # выскакивал поверх диалога выбора папки и мешал юзеру.
+            def _make_progress():
+                d = QtWidgets.QProgressDialog(
+                    "Генерация файлов...", "Отмена", 0, 100, self)
+                d.setWindowTitle("Экспорт")
+                d.setWindowModality(QtCore.Qt.WindowModal)
+                d.setMinimumDuration(500)
+                d.setValue(0)
+                return d
+            
+            def _make_callback(dlg):
+                def _cb(current, total, stage_name):
+                    if dlg.wasCanceled():
+                        return False
+                    pct = int(current * 100 / max(1, total))
+                    dlg.setValue(pct)
+                    dlg.setLabelText(
+                        f"Генерация: {stage_name}...  ({current+1}/{total})")
+                    QtWidgets.QApplication.processEvents()
+                    return True
+                return _cb
+            
+            progress = None
+            try:
+                if nc_dir is not None:
+                    # Папка известна — прогресс сразу
+                    progress = _make_progress()
+                    self.session._progress_callback = _make_callback(progress)
+                    result = self.session.export_package_auto()
+                    written = result['written']
+                    out_dir = result['dir']
+                    archived = result['archived']
+                else:
+                    # Ждём выбора папки
+                    out_dir = QtWidgets.QFileDialog.getExistingDirectory(
+                        self, "Папка для пакета (.anc)", self._last_dir)
+                    if not out_dir:
+                        self.statusBar().showMessage(
+                            "Экспорт отменён — папка не выбрана", 4000)
+                        return
+                    self._last_dir = out_dir
+                    # Папку выбрали — теперь показываем прогресс
+                    progress = _make_progress()
+                    self.session._progress_callback = _make_callback(progress)
+                    written = self.session.export_package(out_dir)
+                    archived = None
+            finally:
+                self.session._progress_callback = None
+                if progress is not None:
+                    progress.setValue(100)
+                    progress.close()
             
             loglines.append(f"записано файлов: {len(written)}")
             for f in written:
@@ -1870,9 +2252,11 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Ошибка", str(e))
     
     def action_about(self):
+        from camsys import __version__, __version_date__
         QtWidgets.QMessageBox.about(
             self, "О camsys",
-            "<h3>camsys</h3>"
+            f"<h3>camsys v{__version__}</h3>"
+            f"<p><small>Сборка: {__version_date__}</small></p>"
             "<p>CAM-система для прецизионной обточки "
             "флексографических ножей</p>"
             "<p>Поддержка: Anderson Europe GVM (MTX V2.13)</p>"
@@ -1892,7 +2276,12 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def _on_operation_toggled(self):
         """Обработчик изменения галочки в таблице операций.
-        Перерисовываем визуализацию путей если она активна."""
+        Перерисовываем визуализацию путей если она активна.
+        Также синхронизируем визуал реперов (серый если отключены).
+        """
+        # Синхронизируем FiducialItem с новым excluded flag
+        self.scene.refresh_fiducial_state(self.session.project)
+        # Пути перестраиваются только если показаны
         if self.params_panel.btn_show_paths.isChecked():
             self.action_refresh_paths()
     

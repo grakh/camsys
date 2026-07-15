@@ -282,14 +282,39 @@ class MtxAndersonGVM(PostProcessor):
             
             # Для каждой операции в shape
             part_num = 0
+            # DRILL реперов: собираем drill_points со ВСЕХ активных 
+            # (не-excluded) FIDUCIAL_DRILL операций. Каждая per-fiducial 
+            # op хранит 1 точку в drill_points — объединяем в единый 
+            # список чтобы эмитить как в эталоне (2 репера в одном блоке).
+            fid_ops = [o for o in ops 
+                       if o.enabled and o.kind == OperationKind.FIDUCIAL_DRILL
+                       and not o.attributes.get('excluded', False)]
+            if fid_ops:
+                combined_points = []
+                combined_depth = 0.1
+                for fop in fid_ops:
+                    combined_points.extend(fop.attributes.get('drill_points', []))
+                    combined_depth = fop.attributes.get('drill_depth', combined_depth)
+                if len(combined_points) >= 2:
+                    # Создаём временную "виртуальную" op с накопленными точками
+                    # (не меняя оригиналы). У _emit_fiducial_drill сигнатура 
+                    # принимает op, читает attributes — прокинем через 
+                    # временный SimpleNamespace.
+                    from types import SimpleNamespace
+                    virt = SimpleNamespace()
+                    virt.attributes = {
+                        'drill_points': combined_points,
+                        'drill_depth': combined_depth,
+                    }
+                    line_no = self._emit_fiducial_drill(
+                        out, virt, line_no, options)
+            
             for op in ops:
                 if not op.enabled:
                     continue
-                # DRILL-операция реперов обрабатывается отдельно — у неё нет
-                # обычных toolpath'ов, точки лежат в attributes['drill_points']
+                # Отдельные FIDUCIAL_DRILL операции уже обработаны выше 
+                # общим блоком — пропускаем в основном цикле.
                 if op.kind == OperationKind.FIDUCIAL_DRILL:
-                    line_no = self._emit_fiducial_drill(
-                        out, op, line_no, options)
                     continue
                 for tp in op.toolpaths:
                     if not tp.visible:
@@ -546,7 +571,8 @@ class MtxAndersonGVM(PostProcessor):
         if (smooth_on and not is_corner_rework and geom.is_closed
                 and tp.side in (ContourSide.OUTSIDE, ContourSide.INSIDE)):
             from ..geometry.path_offset import (smooth_for_offset, 
-                simplify_geometry_via_shapely, has_real_3d_corners)
+                simplify_geometry_via_shapely, has_real_3d_corners,
+                merge_segments_to_arcs)
             _tool_eq = options.extras.get('tool_equidistant', None)
             if _tool_eq is None:
                 _tool_eq = options.extras.get('tool_radius', 0.6) * 2
@@ -558,6 +584,10 @@ class MtxAndersonGVM(PostProcessor):
                 # Безопасно сглаживать
                 polypath = simplify_geometry_via_shapely(polypath, tol_mm=0.1)
                 polypath = smooth_for_offset(polypath, tool_r, _side)
+                # После сглаживания получаем полилинию из мелких Line — 
+                # собираем обратно в дуги где возможно, чтобы NC-файл был 
+                # компактным (одна G3/G2 команда на дугу вместо десятков G1).
+                polypath = merge_segments_to_arcs(polypath, tol=0.02)
             # else: пропускаем сглаживание — сохраняем 3D углы как есть
         
         # ── ВНУТРЕННЕЕ СГЛАЖИВАНИЕ для NC-эмиссии ──
@@ -1088,9 +1118,12 @@ class MtxAndersonGVM(PostProcessor):
             if arc is not None:
                 # LINE_ARC_TANGENTIAL: дуга G12 (активация компенсации)
                 # См. эталон .amp $50/$60: блоки с "+ IN" эмиттят G12.
+                # Комментарий ;50,10 — маркер из эталонного POST AlphaCAM
+                # (номер строки шаблона Lead-in arc), полезен оператору при
+                # трассировке. Парный ;50,15 идёт на G13 (lead-out arc).
                 g_arc = "G12"
                 w(f"N{line_no} {g_arc} X{self.format_coord(arc.b[0])} "
-                  f"Y{self.format_coord(arc.b[1])} SCLN(2)")
+                  f"Y{self.format_coord(arc.b[1])} SCLN(2) ;50,10")
                 line_no += 1
             # LINE (Альфакам-стиль): дуги нет, прямая уже доходит до 
             # contour_start_point — больше ничего не нужно.

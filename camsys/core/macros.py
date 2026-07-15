@@ -373,19 +373,36 @@ def assign_program_numbers(project: Project,
                 for k, ops in detail_groups.items()
             }
             
-            # Проходим детали в порядке (сохраняющем X-сортировку) и 
-            # присваиваем part_idx по центру каждой ДЕТАЛИ, не отдельных ops.
-            acc = 0.0
-            for key in detail_order:
-                dops = detail_groups[key]
-                dlen = detail_lengths[key]
-                center_pos = acc + dlen / 2.0
-                part_idx = int(center_pos / clen * n_parts)
-                part_idx = max(0, min(part_idx, n_parts - 1))
-                # Все ops этой детали в одну программу
-                for op in dops:
-                    op.attributes['program_number'] = base_prog + 1 + part_idx
-                acc += dlen
+            # РАВНОМЕРНОЕ РАСПРЕДЕЛЕНИЕ:
+            # N частей = ceil(clen / max_path_len)
+            # Детали делим ~поровну: первые (count % N) частей получают 
+            # на 1 деталь больше, остальные — по count // N.
+            # 
+            # Пример: 3 детали на 2 части → 2+1 (превышение допустимо, 
+            # деталь атомарна). 4 детали на 3 части → 2+1+1.
+            # Юзер видит равномерное заполнение, а не «первая недогружена,
+            # вторая перегружена».
+            import math
+            n_details = len(detail_order)
+            n_parts = min(math.ceil(clen / max_path_len), n_details)
+            n_parts = max(1, n_parts)
+            base_per = n_details // n_parts
+            rem = n_details % n_parts
+            # Размеры частей: первые `rem` частей на 1 больше
+            part_sizes = [base_per + 1 if i < rem else base_per 
+                          for i in range(n_parts)]
+            
+            # Распределяем детали в порядке detail_order согласно part_sizes
+            di = 0  # index in detail_order
+            for part_idx, size in enumerate(part_sizes):
+                for _ in range(size):
+                    if di >= n_details:
+                        break
+                    key = detail_order[di]
+                    dops = detail_groups[key]
+                    for op in dops:
+                        op.attributes['program_number'] = base_prog + 1 + part_idx
+                    di += 1
             
             prog_no = base_prog + n_parts
             cur_normal_prog = 0

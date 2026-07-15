@@ -221,9 +221,13 @@ class CamSession:
                 if geom.polypath and geom.polypath.segments:
                     geom.polypath = merge_segments_to_arcs(
                         geom.polypath, tol=0.02, min_chain=3)
-        # Сразу пропишем prefix в cutting_params если он ещё пуст
-        if not self.cutting_params.output_prefix:
-            self.cutting_params.output_prefix = self.project.name
+        # ВСЕГДА обновляем prefix при загрузке нового файла — раньше 
+        # проверка `if not self.cutting_params.output_prefix` пропускала 
+        # обновление если пред. файл уже установил prefix, из-за чего 
+        # экспорт нового файла шёл со СТАРЫМ именем (было: открываешь 
+        # 121600.ai → prefix="121600"; открываешь 121676.ai → prefix 
+        # остаётся "121600" → все .anc пишутся с номером старого файла).
+        self.cutting_params.output_prefix = self.project.name
         return self.get_state()
     
     # ─────────────────────────────────────────────────────────────────────
@@ -269,6 +273,25 @@ class CamSession:
                 continue
             op = self.project.add_blade_operation(geom.id)
             created.append({'id': op.id, 'name': op.name})
+        
+        # Создаём отдельную FIDUCIAL_DRILL операцию на каждый репер.
+        # Юзер сможет выделять/отключать реперы через operations-таблицу 
+        # или ПКМ на канвасе (как ножи).
+        # Пропускаем если уже созданы (по fiducial_id в attributes).
+        from ..core.project import OperationKind
+        existing_fid_ids = {
+            op.attributes.get('fiducial_id')
+            for op in self.project.operations
+            if op.kind == OperationKind.FIDUCIAL_DRILL
+        }
+        fid_ops = self.project.create_fiducial_operations(
+            drill_depth=self.cutting_params.bottom)
+        for op in fid_ops:
+            if op.attributes.get('fiducial_id') in existing_fid_ids:
+                continue
+            self.project.operations.append(op)
+            created.append({'id': op.id, 'name': op.name})
+        
         return created
     
     def sort_by_grid(self, direction: str = "LB", grouping: str = "columns",
@@ -483,7 +506,10 @@ class CamSession:
         # 1. Генерация В ПАМЯТЬ (до любых изменений на диске)
         exporter = PackageExporter(
             self.project, self.cutting_params, post_name=self.post_name)
-        files = exporter.generate()
+        # Прокидываем progress-callback если он был установлен
+        # (main_window ставит перед вызовом для показа прогресс-диалога)
+        cb = getattr(self, '_progress_callback', None)
+        files = exporter.generate(progress_callback=cb)
         if not files:
             raise RuntimeError(
                 "Генератор не вернул ни одного файла. Проверьте, что есть "
@@ -557,7 +583,14 @@ class CamSession:
         exporter = PackageExporter(
             self.project, self.cutting_params, post_name=self.post_name
         )
-        written = exporter.write_all(output_dir)
+        # Прокидываем progress-callback если установлен
+        cb = getattr(self, '_progress_callback', None)
+        files = exporter.generate(progress_callback=cb)
+        if not files:
+            raise RuntimeError(
+                "Генератор не вернул ни одного файла. Проверьте, что есть "
+                "активные ножи (галки) и включены типы программ.")
+        written = exporter.write_files(output_dir, files)
         return [
             {'path': str(p), 'name': p.name, 'size': p.stat().st_size}
             for p in written
@@ -574,7 +607,8 @@ class CamSession:
         exporter = PackageExporter(
             self.project, self.cutting_params, post_name=self.post_name
         )
-        return exporter.generate()
+        cb = getattr(self, '_progress_callback', None)
+        return exporter.generate(progress_callback=cb)
     
     # ─────────────────────────────────────────────────────────────────────
     #  СОХРАНЕНИЕ / ЗАГРУЗКА СОСТОЯНИЯ СЕССИИ (JSON)

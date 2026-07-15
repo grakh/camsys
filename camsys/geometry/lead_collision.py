@@ -268,13 +268,14 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
                 if _segments_intersect_2d(la, lb, ca, cb):
                     return True
                 # 2. Distance-check (внутри зоны эквидистанты соседа) — 
-                # ТОЛЬКО для ЧУЖИХ контуров. На СВОЕМ контуре lead-arc по 
-                # определению тангенциально близок к контуру (туда же 
-                # стыкуется), distance-check дал бы ложные срабатывания.
-                if not is_own:
-                    for p in (la, lb, ((la[0]+lb[0])/2, (la[1]+lb[1])/2)):
-                        if _point_to_segment_distance(p, ca, cb) < safe_offset:
-                            return True
+                # для ЧУЖИХ контуров + для СВОЕГО контура на далёких 
+                # сегментах (>= own_skip_radius от точки стыковки).
+                # На своём это ловит случай когда lead-line проходит близко 
+                # к своей же offset-toolpath на противоположной стороне 
+                # выпуклого изгиба (тангенс срезает материал).
+                for p in (la, lb, ((la[0]+lb[0])/2, (la[1]+lb[1])/2)):
+                    if _point_to_segment_distance(p, ca, cb) < safe_offset:
+                        return True
     return False
 
 
@@ -595,8 +596,8 @@ def plan_lead_in(polypath: Polypath,
                   own_geom_id: str,
                   tool_offset: float,
                   auto_avoid: bool = True,
-                  safety_factor: float = 1.2,
-                  fallback_safety_factor: float = 1.0,
+                  safety_factor: float = 3.0,
+                  fallback_safety_factor: float = 1.2,
                   exit_request: Optional[LeadGeometryRequest] = None,
                   overlap: float = 0.0,
                   ) -> Tuple[Polypath, Optional[Polypath], bool, object]:
@@ -702,22 +703,9 @@ def plan_lead_in(polypath: Polypath,
         geom = _polypath_to_lead_geometry(lead, request.is_entry) if lead else None
         return polypath, lead, coll, geom
     
-    # ФАЗА 0 (СОХРАНЕНИЕ ПОЗИЦИИ ЮЗЕРА): 
-    # Сначала проверяем есть ли на исходной позиции РЕАЛЬНОЕ пересечение 
-    # (safety=0.01, только фактический crossing lead-контур). Если нет — 
-    # оставляем позицию юзера как есть, даже если distance-check с запасом
-    # даст «микро-нарушение» типа 0.01мм.
-    # 
-    # Это уважает пользовательский выбор -5мм от угла. Иначе алгоритм 
-    # сдвигал бы на несколько мм чтобы «оптимизировать» на 0.01мм лучше.
-    # Реальное производство допускает касание в пределах kerf — не критично.
-    check_real_only = _make_combined_check(0.01)
-    lead_orig = _build(polypath, request.angle_deg, 1.0)
-    if lead_orig and not check_real_only(lead_orig, polypath):
-        # На исходной позиции нет реальных пересечений — оставляем её
-        # (с флагом коллизии=False, т.к. по интерсекции чисто)
-        geom = _polypath_to_lead_geometry(lead_orig, request.is_entry)
-        return polypath, lead_orig, False, geom
+    # ФАЗЫ 1-3 ниже сами разберутся: если позиция юзера уже чиста по строгой 
+    # мере — Phase 1 вернёт её первой. Если нет — попробуют сдвиги. Если 
+    # и Phase 1 не смог — Phase 2 с мягкой мерой. Если ничего — Phase 3 (RED).
     
     # Реальное пересечение есть — начинаем автоподбор через фазы
     # ФАЗА 1: строгая

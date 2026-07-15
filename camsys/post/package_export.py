@@ -50,8 +50,14 @@ class PackageExporter:
     #  ОСНОВНОЙ МЕТОД
     # ─────────────────────────────────────────────────────────────────────
     
-    def generate(self) -> Dict[str, str]:
-        """Возвращает словарь {имя_файла: содержимое}."""
+    def generate(self, progress_callback=None) -> Dict[str, str]:
+        """Возвращает словарь {имя_файла: содержимое}.
+        
+        Args:
+            progress_callback: опциональный callable(current, total, stage_name) -> bool.
+                Вызывается перед началом каждого этапа генерации. current=N-1, 
+                total=число включённых этапов. Возвращает False → отмена.
+        """
         files: Dict[str, str] = {}
         
         prefix = self.params.output_prefix or self.project.name or "OUTPUT"
@@ -77,6 +83,30 @@ class PackageExporter:
             and 'lead_override' in op.attributes
         }
         
+        # Также сохраняем KEY отключенных corner'ов — при пересборке 
+        # фильтруем их из ANC. Иначе corner возвращается т.к. экспортер 
+        # строит фрагменты заново из активных blade'ов, не зная какие 
+        # corner'ы юзер снял в UI.
+        self._corner_excluded = {
+            (op.attributes.get('parent_geom_id'), 
+             op.attributes.get('corner_index'),
+             op.attributes.get('corner_is_3d', False))
+            for op in _all_ops
+            if op.kind == OperationKind.CORNER_REWORK
+            and op.attributes.get('excluded', False)
+        }
+        
+        # Аналогично для FIDUCIAL — сохраняем set fiducial_id снятых юзером 
+        # реперов. make_fiducial_drill_operation() читает это через 
+        # self._fiducial_excluded_ids (см. ниже filter в _generate_rough_all).
+        self._fiducial_excluded_ids = {
+            op.attributes.get('fiducial_id')
+            for op in _all_ops
+            if op.kind == OperationKind.FIDUCIAL_DRILL
+            and op.attributes.get('excluded', False)
+            and op.attributes.get('fiducial_id')
+        }
+        
         # Полное число ножей ДО фильтра (для порога режима доработки _dop)
         self._total_blade_count = sum(
             1 for op in _all_ops if op.kind == OperationKind.BLADE_FORMING)
@@ -89,6 +119,7 @@ class PackageExporter:
         self.project.operations = [
             op for op in _all_ops 
             if not op.attributes.get('excluded', False)
+            and not op.attributes.get('stitch_filtered_out', False)
             and op.kind != OperationKind.CORNER_REWORK
         ]
         excluded_count = len(_all_ops) - len(self.project.operations)
@@ -102,19 +133,23 @@ class PackageExporter:
                     pass
         
         try:
-            return self._generate_impl(files, prefix, angle)
+            return self._generate_impl(files, prefix, angle, progress_callback)
         finally:
             # Восстанавливаем исходный список операций
             self.project.operations = _all_ops
     
-    def _generate_impl(self, files: dict, prefix: str, angle: int) -> Dict[str, str]:
+    def _generate_impl(self, files: dict, prefix: str, angle: int,
+                       progress_callback=None) -> Dict[str, str]:
         from ..core.project import OperationKind
         # ── ПРОВЕРКА СОВМЕСТИМОСТИ ФРЕЗЫ С МАКЕТОМ ──
         # Если зазор между ножами меньше суммы эквидистант (2*tool_offset),
         # фреза физически не может пройти — выводим предупреждение.
+        # Формула эквидистанты: tip + 2 * (top - bottom) * tan(angle/2)
+        # где (top - bottom) = эффективная глубина реза (высота ножа - врезание)
         import math
         half_angle_rad = math.radians(self.params.knife_angle / 2.0)
-        tool_eq = self.params.tip_diameter + 2.0 * self.params.bottom * math.tan(half_angle_rad)
+        cut_h = max(0.0, self.params.top - self.params.bottom)
+        tool_eq = self.params.tip_diameter + 2.0 * cut_h * math.tan(half_angle_rad)
         tool_offset = tool_eq / 2.0
         
         problem = self.check_tool_fits_layout(tool_offset)
@@ -141,14 +176,34 @@ class PackageExporter:
             if op.kind == OperationKind.BLADE_FORMING:
                 op.attributes['preferred_lead_side'] = preferred_side
         
+        # ── Прогресс: считаем этапы ──
+        p = self.params
+        stages = []
+        if p.generate_rough_all:  stages.append('rough_all')
+        if p.generate_reverse:    stages.append('rough_revers')
+        if p.generate_finish_per_op: stages.append('finish_group')
+        if p.generate_sv:         stages.append('sv')
+        if p.generate_corner:     stages.append('corner')
+        if p.generate_corner_3d:  stages.append('corner3d')
+        total_stages = len(stages)
+        current_stage = [0]  # mutable для closure
+        
+        def _report(name):
+            if progress_callback is None: return True
+            result = progress_callback(current_stage[0], total_stages, name)
+            current_stage[0] += 1
+            return result if result is not None else True
+        
         # ── 1. Черновая всех элементов (_all_R.anc) ──
         if self.params.generate_rough_all:
+            if not _report("Черновая всех"): return files
             name = f"{prefix}_{angle}_all_R.anc"
             content = self._generate_rough_all()
             files[name] = content
         
         # ── 2. Черновая в реверсе (_revers_R.anc) ──
         if self.params.generate_reverse:
+            if not _report("Реверс черновая"): return files
             name = f"{prefix}_{angle}_revers_R.anc"
             content = self._generate_rough_all(reverse=True)
             files[name] = content
@@ -174,6 +229,7 @@ class PackageExporter:
         # Порядок обхода задаётся направлением (горизонталь=строки,
         # вертикаль=столбцы). Длинная строка делится, короткие объединяются.
         if self.params.generate_finish_per_op and not use_dop:
+            if not _report("Чистовые"): return files
             from ..core.macros import assign_program_numbers
             
             dir_str = self.params.direction.value
@@ -201,6 +257,7 @@ class PackageExporter:
         
         # ── 4. 4 угловых элемента для контроля сведения (_SV.anc) ──
         if self.params.generate_sv:
+            if not _report("4 угловых"): return files
             name = f"{prefix}_{angle}_SV.anc"
             content = self._generate_sv()
             files[name] = content
@@ -222,7 +279,19 @@ class PackageExporter:
                 if ov is not None:
                     new_op.attributes['lead_override'] = dict(ov)
             
+            # Фильтруем отключенные corner'ы — юзер снял с них галки в 
+            # operations-таблице или через ПКМ на канвасе.
+            def _corner_not_excluded(new_op):
+                key = (new_op.attributes.get('parent_geom_id'),
+                       new_op.attributes.get('corner_index'),
+                       new_op.attributes.get('corner_is_3d', False))
+                return key not in self._corner_excluded
+            
+            corner_ops_2d = [op for op in corner_ops_2d if _corner_not_excluded(op)]
+            corner_ops_3d = [op for op in corner_ops_3d if _corner_not_excluded(op)]
+            
             if self.params.generate_corner:
+                if not _report("Углы 2D"): return files
                 name = f"{prefix}_{angle}_corner.anc"
                 if corner_ops_2d:
                     content = self._generate_with_operations(corner_ops_2d)
@@ -234,6 +303,7 @@ class PackageExporter:
                 files[name] = content
             
             if self.params.generate_corner_3d:
+                if not _report("Углы 3D"): return files
                 name = f"{prefix}_{angle}_corner3D.anc"
                 if corner_ops_3d:
                     content = self._generate_with_operations(corner_ops_3d)
@@ -315,14 +385,15 @@ class PackageExporter:
         opts.extras['tool_radius'] = self.params.tip_diameter / 2.0
         # Угол инструмента — для SD.WZRec.UD.Ed[1].Geo.Ang
         opts.extras['tool_angle'] = self.params.knife_angle
-        # Эквидистанта = d_tip + 2·h·tan(угол/2), где h — глубина врезания
-        # (= bottom = ProgZDepth), а НЕ толщина листа. Проверено на эталоне:
-        # V80°, d=0.8, h=0.19: 0.8 + 2·0.19·tan(40°) = 0.8 + 0.319 = 1.119 ✓
-        # (эталон даёт 1.11886)
+        # Эквидистанта = d_tip + 2·(top - bottom)·tan(угол/2)
+        # (top - bottom) = эффективная высота реза (высота ножа - врезание)
+        # Проверено на эталонном .anc 120795_70_2_R.anc:
+        # V70°, d=0.8, top=0.443, bottom=0.19: 
+        # h = 0.253, eq = 0.8 + 2*0.253*tan(35°) = 1.154 (эталон 1.1501)
         import math
         half_angle_rad = math.radians(self.params.knife_angle / 2.0)
-        h = self.params.bottom  # глубина врезания (ProgZDepth)
-        tool_eq = self.params.tip_diameter + 2.0 * h * math.tan(half_angle_rad)
+        cut_h = max(0.0, self.params.top - self.params.bottom)
+        tool_eq = self.params.tip_diameter + 2.0 * cut_h * math.tan(half_angle_rad)
         opts.extras['tool_equidistant'] = tool_eq
         opts.extras['smooth_offset_for_tool'] = bool(
             getattr(self.params, 'smooth_offset_for_tool', False))
@@ -464,12 +535,24 @@ class PackageExporter:
             op.sequence_number = 1
         
         # Стратегия: DRILL реперов добавляется ТОЛЬКО в прямую черновую.
+        # Учитываем что юзер мог отключить конкретные реперы в UI 
+        # (per-fiducial FIDUCIAL_DRILL операции сняты галкой). Их 
+        # fiducial_id сохранены в self._fiducial_excluded_ids до strip'а.
         if not reverse:
+            # Временно фильтруем project.fiducials по excluded flag
+            excluded = getattr(self, '_fiducial_excluded_ids', set())
+            all_fids = prj.fiducials
+            prj.fiducials = [f for f in all_fids if f.id not in excluded]
+            
             drill_op = prj.make_fiducial_drill_operation(
                 tool_number=1, drill_depth=0.1)
             if drill_op is not None:
                 drill_op.sequence_number = 1
                 prj.operations.append(drill_op)
+            
+            # Восстанавливаем исходный список (deepcopy изолирует, но 
+            # для чистоты — вернём)
+            prj.fiducials = all_fids
         
         prefix = self.params.output_prefix or prj.name or "OUTPUT"
         angle = int(self.params.knife_angle)

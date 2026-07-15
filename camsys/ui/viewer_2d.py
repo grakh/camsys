@@ -138,26 +138,43 @@ class GeometryItem(QtWidgets.QGraphicsPathItem):
 
 
 class FiducialItem(QtWidgets.QGraphicsItem):
-    """Маркер репера: красный круг с крестом."""
+    """Маркер репера: красный круг с крестом. Кликается через ПКМ 
+    для включения/отключения (связка с FIDUCIAL_DRILL операцией)."""
     
     RADIUS = 4.0  # пикселей экранных
     
-    def __init__(self, fiducial: Fiducial):
+    def __init__(self, fiducial: Fiducial, op_id: str = ""):
         super().__init__()
         self.fiducial = fiducial
+        self.op_id = op_id  # id соответствующей FIDUCIAL_DRILL операции
+        self._excluded = False  # визуальное состояние (для перерисовки)
         self.setPos(fiducial.x, fiducial.y)
         self.setZValue(10)
     
     def boundingRect(self) -> QtCore.QRectF:
-        r = self.RADIUS + 2
+        r = self.RADIUS + 4  # +2мм для комфортного клика ПКМ
         return QtCore.QRectF(-r, -r, 2*r, 2*r)
+    
+    def shape(self):
+        """Расширенная область захвата клика — 2мм в сцене."""
+        path = QtGui.QPainterPath()
+        path.addEllipse(QtCore.QPointF(0, 0), 2.0, 2.0)
+        return path
+    
+    def set_excluded(self, excluded: bool):
+        """Меняет визуальный статус — отключённый серым, вкл. — красным."""
+        if self._excluded != excluded:
+            self._excluded = excluded
+            self.update()
     
     def paint(self, painter, option, widget=None):
         # Размер в пикселях экрана — нечувствительный к зуму
         scale = painter.transform().m11()
         r = self.RADIUS / abs(scale) if abs(scale) > 1e-6 else self.RADIUS
         
-        pen = QtGui.QPen(QtGui.QColor("#ff3030"))
+        # Цвет: серый для отключённого, красный для активного
+        color = QtGui.QColor("#666666") if self._excluded else QtGui.QColor("#ff3030")
+        pen = QtGui.QPen(color)
         pen.setCosmetic(True)
         pen.setWidthF(1.8)
         painter.setPen(pen)
@@ -229,29 +246,39 @@ class CamScene(QtWidgets.QGraphicsScene):
         (галка «Авто-подбор» ВЫКЛ). Иначе всё идёт через super() — Qt-логика 
         выделения GeometryItem'ов слоя Knife работает как обычно.
         """
-        if event.button() == QtCore.Qt.LeftButton and self._toolpath_selection_enabled:
+        if event.button() == QtCore.Qt.LeftButton:
             pos = event.scenePos()
             hit_op_id = ""
             
-            # ── ФАЗА 1: Приоритетный поиск УГЛА ──
-            # Углы имеют z=8, blade z=5 → в items(pos) углы уже сверху. Но 
-            # если click вне узкой shape() угла и попадает только в широкую 
-            # blade — угол пропустим. Поэтому ищем в РАСШИРЕННОЙ 5мм зоне 
-            # вокруг клика: любой найденный угол побеждает.
-            search_rect = QtCore.QRectF(pos.x()-2.5, pos.y()-2.5, 5.0, 5.0)
-            for it in self.items(search_rect):
-                if (isinstance(it, ToolpathItem) and it.op_id and it.selectable 
-                        and it.zValue() >= 7):  # z>=7 → угол
+            # ── ФАЗА 1: РЕПЕРЫ (FiducialItem) ──
+            # Реперы селектим ВСЕГДА (не только в режиме «Выделенные»), 
+            # т.к. их не редактируют через lead-поля — просто клик = выделено.
+            for it in self.items(pos):
+                if isinstance(it, FiducialItem) and it.op_id:
                     hit_op_id = it.op_id
                     break
             
-            # ── ФАЗА 2: Fallback на blade (точное попадание) ──
-            # Если угол не нашли — обычный поиск по точке (найдёт blade).
-            if not hit_op_id:
-                for it in self.items(pos):
-                    if isinstance(it, ToolpathItem) and it.op_id and it.selectable:
+            # ── ФАЗА 2+3: Toolpath (только если Выделенные режим) ──
+            if not hit_op_id and self._toolpath_selection_enabled:
+                # ── ФАЗА 2: Приоритетный поиск УГЛА ──
+                # Углы имеют z=8, blade z=5 → в items(pos) углы уже сверху. Но 
+                # если click вне узкой shape() угла и попадает только в широкую 
+                # blade — угол пропустим. Поэтому ищем в РАСШИРЕННОЙ 5мм зоне 
+                # вокруг клика: любой найденный угол побеждает.
+                search_rect = QtCore.QRectF(pos.x()-2.5, pos.y()-2.5, 5.0, 5.0)
+                for it in self.items(search_rect):
+                    if (isinstance(it, ToolpathItem) and it.op_id and it.selectable 
+                            and it.zValue() >= 7):  # z>=7 → угол
                         hit_op_id = it.op_id
                         break
+                
+                # ── ФАЗА 3: Fallback на blade (точное попадание) ──
+                # Если угол не нашли — обычный поиск по точке (найдёт blade).
+                if not hit_op_id:
+                    for it in self.items(pos):
+                        if isinstance(it, ToolpathItem) and it.op_id and it.selectable:
+                            hit_op_id = it.op_id
+                            break
             
             if hit_op_id and hit_op_id != self._selected_op_id:
                 self._selected_op_id = hit_op_id
@@ -280,6 +307,13 @@ class CamScene(QtWidgets.QGraphicsScene):
                         hit_op_id = it.op_id
                         break
             
+            # Также проверяем клик по реперу (FiducialItem)
+            if not hit_op_id:
+                for it in self.items(pos):
+                    if isinstance(it, FiducialItem) and it.op_id:
+                        hit_op_id = it.op_id
+                        break
+            
             if hit_op_id:
                 self.toolpath_right_clicked.emit(hit_op_id)
                 event.accept()
@@ -301,6 +335,24 @@ class CamScene(QtWidgets.QGraphicsScene):
             if isinstance(item, ToolpathItem):
                 item.set_selected_highlight(item.op_id == self._selected_op_id
                                               and self._selected_op_id != "")
+    
+    def refresh_fiducial_state(self, project):
+        """Обновляет визуальное состояние FiducialItem'ов по excluded flag'у.
+        
+        Вызывается когда юзер меняет excluded у FIDUCIAL_DRILL операции 
+        (галка в таблице, ПКМ на канвасе). Без этого визуал репера остаётся 
+        активно-красным даже когда галка снята.
+        """
+        from ..core.project import OperationKind
+        # Строим отображение op_id → excluded
+        fid_excluded = {
+            op.id: op.attributes.get('excluded', False)
+            for op in project.operations
+            if op.kind == OperationKind.FIDUCIAL_DRILL
+        }
+        for item in self.items():
+            if isinstance(item, FiducialItem) and item.op_id in fid_excluded:
+                item.set_excluded(fid_excluded[item.op_id])
     
     def clear_selection(self):
         """Снять выделение (все ToolpathItem'ы возвращаются к обычному виду)."""
@@ -335,9 +387,25 @@ class CamScene(QtWidgets.QGraphicsScene):
                 items.append(item)
             self._layer_items[layer.name] = items
         
-        # Реперы поверх
+        # Реперы поверх — с привязкой к своим FIDUCIAL_DRILL операциям
+        # чтобы ПКМ на репере мог включать/отключать соответствующую op.
+        from ..core.project import OperationKind
+        fid_op_map = {
+            op.attributes.get('fiducial_id'): op
+            for op in project.operations
+            if op.kind == OperationKind.FIDUCIAL_DRILL 
+            and op.attributes.get('fiducial_id')
+        }
         for fid in project.fiducials:
-            item = FiducialItem(fid)
+            op = fid_op_map.get(fid.id)
+            op_id = op.id if op else ""
+            excluded = op.attributes.get('excluded', False) if op else False
+            # Фильтр по региону сшивки
+            stitch_filtered = (
+                op.attributes.get('stitch_filtered_out', False) if op else False)
+            item = FiducialItem(fid, op_id=op_id)
+            item.set_excluded(excluded)
+            item.setVisible(not stitch_filtered)
             self.addItem(item)
         
         # Обновляем bounding rect сцены
@@ -833,7 +901,8 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
     if smooth_on and not (is_3d_corner or is_2d_corner) and geom.is_closed \
             and tp.side in (ContourSide.OUTSIDE, ContourSide.INSIDE):
         from ..geometry.path_offset import (smooth_for_offset, 
-            simplify_geometry_via_shapely, has_real_3d_corners)
+            simplify_geometry_via_shapely, has_real_3d_corners,
+            merge_segments_to_arcs)
         _side = "OUTSIDE" if tp.side == ContourSide.OUTSIDE else "INSIDE"
         min_tool_r = options_extras.get('min_tool_radius', tool_offset * 0.9)
         
@@ -842,6 +911,9 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         if not has_real_3d_corners(polypath, min_tool_radius_mm=min_tool_r):
             polypath_for_vis = simplify_geometry_via_shapely(polypath, tol_mm=0.1)
             polypath_for_vis = smooth_for_offset(polypath_for_vis, tool_offset, _side)
+            # Обратная сборка полилинии в дуги (чтобы viewer показывал 
+            # чистые кривые как в .anc, а не тысячи мелких Line)
+            polypath_for_vis = merge_segments_to_arcs(polypath_for_vis, tol=0.02)
         else:
             polypath_for_vis = polypath
     else:
@@ -1146,6 +1218,11 @@ def add_toolpaths_to_scene(scene: 'CamScene', project, options_extras: dict = No
         
         # Исключённые операции (снята галочка в таблице) — не показываем
         if op.attributes.get('excluded', False):
+            continue
+        
+        # Фильтр «Выбран заказ сшивки» — оп не из активного региона.
+        # Для одиночных заказов attribute отсутствует → все показываются.
+        if op.attributes.get('stitch_filtered_out', False):
             continue
         
         # CORNER операции связаны с BLADE через geometry_id — если родительский 
