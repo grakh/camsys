@@ -348,12 +348,12 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         #   - сцена фильтруется по региону заказа  
         #   - подгружается specification_<номер>.xml
         #   - экспорт идёт по этому заказу
-        self.stitch_group = QtWidgets.QGroupBox("Сшивка")
+        self.stitch_group = QtWidgets.QGroupBox("Заказ")
         stitch_layout = QtWidgets.QFormLayout(self.stitch_group)
         self.stitch_combo = QtWidgets.QComboBox()
-        self.stitch_combo.addItem("Вся сшивка", "")
-        stitch_layout.addRow("Заказ:", self.stitch_combo)
-        self.stitch_group.setVisible(False)  # только если сшивка
+        self.stitch_combo.setEnabled(False)  # disabled пока файл не загружен
+        stitch_layout.addRow("№:", self.stitch_combo)
+        # Всегда видима — юзер видит место где будет заказ
         layout.addWidget(self.stitch_group)
         
         # ── ПАРАМЕТРЫ НОЖА ──
@@ -636,36 +636,26 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         
         layout.addWidget(gen_group)
         
-        # ── КНОПКА ЭКСПОРТА ──
-        self.btn_preview = QtWidgets.QPushButton("Превью имён файлов")
-        layout.addWidget(self.btn_preview)
+        # Две главные кнопки в один ряд: Пересчитать пути + Экспорт
+        buttons_row = QtWidgets.QHBoxLayout()
         
-        # Кнопки визуализации путей: показать (toggle) + обновить
-        paths_row = QtWidgets.QHBoxLayout()
-        
-        self.btn_show_paths = QtWidgets.QPushButton("Показать пути фрезы")
-        self.btn_show_paths.setCheckable(True)
+        self.btn_show_paths = QtWidgets.QPushButton("Пересчитать пути")
         self.btn_show_paths.setToolTip(
-            "Отрисовать на сцене траектории фрезы (как в Альфакаме): "
-            "проходы INSIDE/OUTSIDE, заходы/выходы, обработка углов. "
-            "Цвет = программа (одна программа = один цвет)."
+            "Пересчитать траектории фрезы для выбранного заказа. "
+            "Клик = построить заново с текущими параметрами. "
+            "Пути кэшируются per-order — при переключении заказов пути "
+            "уже построенных отображаются автоматически."
         )
-        paths_row.addWidget(self.btn_show_paths, stretch=3)
+        self.btn_show_paths.setMinimumHeight(40)
+        buttons_row.addWidget(self.btn_show_paths, stretch=1)
         
-        self.btn_refresh_paths = QtWidgets.QPushButton("Обновить")
-        self.btn_refresh_paths.setToolTip(
-            "Перерисовать пути с текущими параметрами "
-            "(после изменения пятки, смещения, угла захода и т.д.)"
-        )
-        paths_row.addWidget(self.btn_refresh_paths, stretch=1)
-        
-        layout.addLayout(paths_row)
-        
-        self.btn_export = QtWidgets.QPushButton("Экспорт пакета")
+        self.btn_export = QtWidgets.QPushButton("Экспорт")
         big_font = self.btn_export.font(); big_font.setBold(True)
         self.btn_export.setFont(big_font)
         self.btn_export.setMinimumHeight(40)
-        layout.addWidget(self.btn_export)
+        buttons_row.addWidget(self.btn_export, stretch=1)
+        
+        layout.addLayout(buttons_row)
         
         layout.addStretch()
         
@@ -995,9 +985,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Правая панель: параметры
         self.params_panel = CuttingParamsPanel()
         self.params_panel.btn_export.clicked.connect(self.action_export)
-        self.params_panel.btn_preview.clicked.connect(self.action_preview_files)
-        self.params_panel.btn_show_paths.toggled.connect(self.action_toggle_paths)
-        self.params_panel.btn_refresh_paths.clicked.connect(self.action_refresh_paths)
+        self.params_panel.btn_show_paths.clicked.connect(self.action_toggle_paths)
         
         # Связка радио-режимов «Авто/Все/Выделенные» с возможностью 
         # выделения ножей на канвасе. Селект работает только в режиме 
@@ -1081,20 +1069,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
             self._toolpath_items = []
-            # Снимаем checked со кнопки (блокируем сигнал чтобы не вызвать toggle)
-            self.params_panel.btn_show_paths.blockSignals(True)
-            self.params_panel.btn_show_paths.setChecked(False)
-            # ВАЖНО: blockSignals не даёт слоту toggled обновить текст → 
-            # обновляем явно, иначе кнопка останется «Скрыть пути (N)» и юзер 
-            # видит несинхронную надпись при показе путей нового файла.
-            self.params_panel.btn_show_paths.setText("Показать пути фрезы")
-            self.params_panel.btn_show_paths.blockSignals(False)
+            # Сбрасываем кэш путей per-order при открытии нового файла —
+            # старые пути не имеют отношения к новому проекту
+            self._order_toolpath_items = {}
+            self.params_panel.btn_show_paths.setText("Пересчитать пути")
             
             # Сбрасываем все параметры панели к умолчаниям — каждый новый файл
             # начинается со стандартных значений, не наследует предыдущие
             self.params_panel.set_defaults()
             
             self.session.load_ai(path)
+            self.session._last_ai_path = path  # для поиска XML вокруг файла
             self._auto_detect_corner_programs()
             self._auto_set_fiducial_x()
             
@@ -1132,22 +1117,25 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("Ошибка", 3000)
     
     def _analyze_and_setup_stitch(self, ai_path):
-        """Анализирует .ai на предмет сшивки и настраивает UI.
+        """Анализирует .ai на предмет сшивки и настраивает dropdown.
         
-        Если файл — сшивка (`<стичка>_<заказ1>_<заказ2>_..._.ai`):
-        1. Детектит регионы из слоя `namber`
-        2. Сопоставляет номера заказов с регионами через PDF-текст
-        3. Заполняет stitch_combo списком заказов
-        4. Показывает stitch_group на панели
+        Логика:
+        - Для сшивки: dropdown содержит N заказов (без «Всей сшивки»).
+          Первый заказ автоматически выбран, к нему применяется фильтр.
+        - Для одиночного заказа: dropdown содержит один элемент (номер 
+          заказа из имени файла). Фильтра нет (все ножи и так одного 
+          заказа).
         
-        Если файл — одиночный: скрывает stitch_group.
+        При выборе заказа автоматически:
+        1. Фильтр сцены (только его ножи+реперы)
+        2. output_prefix = номер заказа
+        3. Автозагрузка specification_<номер>.xml
         """
         from pathlib import Path
         from ..io_.stitch import analyze_stitch
         
         self.params_panel.stitch_combo.blockSignals(True)
         self.params_panel.stitch_combo.clear()
-        self.params_panel.stitch_combo.addItem("Вся сшивка", "")
         
         try:
             stitch_info = analyze_stitch(Path(ai_path), self.session.project)
@@ -1157,17 +1145,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session._stitch_info = stitch_info
         
         if stitch_info is None or len(stitch_info.regions) < 2:
-            self.params_panel.stitch_group.setVisible(False)
+            # Одиночный заказ — 1 элемент в dropdown, без фильтра
+            single_order = Path(ai_path).stem.rstrip('_')
+            parts = single_order.split('_')
+            numeric = [p for p in parts if p.isdigit()]
+            if numeric:
+                single_order = numeric[0]
+            self.params_panel.stitch_combo.addItem(
+                f"{single_order}", single_order)
+            self.session.cutting_params.output_prefix = single_order
+            self.params_panel.stitch_combo.setEnabled(True)
             self.params_panel.stitch_combo.blockSignals(False)
             return
         
+        # Сшивка — заполняем комбо ТОЛЬКО заказами (без «Вся сшивка»)
         for r in stitch_info.regions:
             label = r.order_number or f"регион {stitch_info.regions.index(r) + 1}"
             n_knives = len(r.knife_ids)
             display = f"{label} ({n_knives} ножей)"
             self.params_panel.stitch_combo.addItem(display, label)
         
-        self.params_panel.stitch_group.setVisible(True)
+        self.params_panel.stitch_combo.setEnabled(True)
         self.params_panel.stitch_combo.blockSignals(False)
         
         if not hasattr(self, '_stitch_signal_connected'):
@@ -1175,64 +1173,62 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._on_stitch_order_changed)
             self._stitch_signal_connected = True
         
+        # АВТОВЫБОР первого заказа — применяет фильтр
+        self.params_panel.stitch_combo.setCurrentIndex(0)
+        # Вызываем handler явно (setCurrentIndex(0) при уже 0 не эмитит сигнал)
+        self._current_stitch_order = None  # сброс чтобы точно применить
+        self._on_stitch_order_changed(0)
+        
         self.statusBar().showMessage(
             f"Сшивка {stitch_info.stitch_number}: "
             f"{len(stitch_info.regions)} заказов", 5000)
     
     def _on_stitch_order_changed(self, idx):
-        """Юзер выбрал заказ в dropdown сшивки.
+        """Юзер выбрал заказ в dropdown.
         
-        При каждом переключении заказа:
-        1. Сохраняем ТЕКУЩИЕ настройки UI в attributes предыдущего 
-           выбранного заказа (у сшивки/session есть dict _order_settings)
-        2. Загружаем настройки НОВОГО заказа (если есть) в UI 
-           (угол/пятка/высота/направление/лимит/2-я реперная)
-        3. Отфильтровываем сцену только на его ножи
-        4. Автозагружаем specification_<order>.xml (если не сохранено 
-           явно юзером)
-        
-        При выборе «Вся сшивка» — сохраняем текущие, но НЕ загружаем 
-        новые. UI остаётся с последними значениями. Фильтр снимается.
+        Всегда работаем в режиме одного заказа:
+        1. Сохранить настройки предыдущего заказа
+        2. Загрузить настройки нового (или из XML если первый раз)  
+        3. Отфильтровать сцену только на его ножи
         """
-        order = self.params_panel.stitch_combo.itemData(idx) or ""
-        stitch = getattr(self.session, '_stitch_info', None)
-        if not stitch:
+        order = self.params_panel.stitch_combo.itemData(idx)
+        if not order:
             return
         
         # 1. Сохранить настройки предыдущего заказа
         prev_order = getattr(self, '_current_stitch_order', None)
-        if prev_order:  # непустой = не "Вся сшивка"
+        if prev_order and prev_order != order:
             self._save_order_settings(prev_order)
         
-        # Запоминаем новый выбранный
-        self._current_stitch_order = order if order else None
+        self._current_stitch_order = order
         
-        if not order:
-            # Вся сшивка — снять фильтр, UI не трогаем
-            self._apply_stitch_filter(None)
-            self.statusBar().showMessage("Показана вся сшивка", 3000)
-            return
-        
-        # Конкретный заказ
-        region = stitch.get_region_by_order(order)
-        if region is None:
-            return
-        
-        # 2. Загрузить настройки заказа (если сохранены раньше)
+        # 2. Загрузить настройки (если сохранены)
         loaded = self._load_order_settings(order)
         
-        # 3. Фильтр сцены
-        self._apply_stitch_filter(region)
+        # 3. Применить фильтр по региону (если сшивка)
+        stitch = getattr(self.session, '_stitch_info', None)
+        if stitch:
+            region = stitch.get_region_by_order(order)
+            if region:
+                self._apply_stitch_filter(region)
+        # Для одиночного заказа фильтр не нужен — все ножи и так его
+        
+        # 4. Prefix для экспорта = номер заказа (не имя сшивки!)
         self.session.cutting_params.output_prefix = order
         
-        # 4. Если настройки НЕ были ранее сохранены — грузим из XML  
-        # (первое переключение на заказ)
+        # 5. Если не было сохранённых настроек — грузим из XML
         if not loaded:
             self._apply_spec_xml_for_order(order)
         
-        self.statusBar().showMessage(
-            f"Заказ {order}: {len(region.knife_ids)} ножей, "
-            f"{len(region.fiducial_ids)} реперов", 5000)
+        # Статус
+        if stitch:
+            region = stitch.get_region_by_order(order)
+            if region:
+                self.statusBar().showMessage(
+                    f"Заказ {order}: {len(region.knife_ids)} ножей, "
+                    f"{len(region.fiducial_ids)} реперов", 5000)
+        else:
+            self.statusBar().showMessage(f"Заказ {order}", 3000)
     
     def _save_order_settings(self, order):
         """Снимает текущие значения UI + attributes ops → в session dict."""
@@ -1341,24 +1337,69 @@ class MainWindow(QtWidgets.QMainWindow):
                     op.attributes['stitch_filtered_out'] = parent not in allowed_knife_geoms
         
         self._refresh_operations()
-        if self.params_panel.btn_show_paths.isChecked():
-            self.action_toggle_paths(True)
+        # При смене заказа:
+        # 1. СКРЫВАЕМ пути ВСЕХ прочих заказов
+        # 2. ПОКАЗЫВАЕМ пути ТЕКУЩЕГО заказа (из кэша)
+        # 3. Кнопка меняется:
+        #    - Если у текущего заказа есть пути → «Обновить (N)»
+        #    - Если нет → «Построение путей»
+        if hasattr(self, '_order_toolpath_items'):
+            current = getattr(self, '_current_stitch_order', None) or "_default"
+            for order_name, items in self._order_toolpath_items.items():
+                visible = (order_name == current)
+                for item in items:
+                    item.setVisible(visible)
+            current_items = self._order_toolpath_items.get(current, [])
+            if current_items:
+                self.params_panel.btn_show_paths.setText(
+                    f"Пересчитать пути ({len(current_items)})")
+            else:
+                self.params_panel.btn_show_paths.setText("Пересчитать пути")
     
     def _apply_spec_xml_for_order(self, order_number):
-        """Ищет specification_<order>.xml в папке XML/ сшивки."""
-        try:
-            ai_path = Path(self.session._stitch_info.ai_path)
-        except Exception:
+        """Ищет specification_<order>.xml в разных местах.
+        
+        Пробуем несколько вариантов расположения:
+        1. <stitch_folder>/XML/specification_<order>.xml (стандарт для сшивок)
+        2. <stitch_folder>/../<order>/XML/specification_<order>.xml (соседняя папка заказа)
+        3. <stitch_folder>/../../<order>/XML/specification_<order>.xml (на 2 уровня выше)
+        4. <ai_path>/../XML/ (для одиночного заказа с обычной структурой)
+        
+        Если XML не найден — оставляем поля розовыми (юзер введёт вручную).
+        """
+        # Определяем откуда искать — от stitch (если есть) или от project
+        ai_path = None
+        stitch = getattr(self.session, '_stitch_info', None)
+        if stitch and getattr(stitch, 'ai_path', None):
+            ai_path = Path(stitch.ai_path)
+        elif getattr(self.session, '_last_ai_path', None):
+            ai_path = Path(self.session._last_ai_path)
+        if ai_path is None or not ai_path.exists():
             return
-        order_folder = ai_path.parent.parent
-        xml_dir = order_folder / "XML"
-        if not xml_dir.is_dir():
-            return
-        candidates = list(xml_dir.glob(f"specification_{order_number}*.xml"))
-        if not candidates:
-            candidates = list(xml_dir.glob(f"*{order_number}*.xml"))
-        if candidates:
-            self._apply_spec_xml_values(candidates[0])
+        
+        # Список candidate-папок для поиска XML
+        maket_dir = ai_path.parent
+        stitch_root = maket_dir.parent
+        candidates_dirs = [
+            stitch_root / "XML",                     # <stitch>/XML/
+            stitch_root.parent / order_number / "XML",  # sibling folder ordered by number
+            stitch_root.parent.parent / order_number / "XML",  # на уровень выше
+        ]
+        
+        for xml_dir in candidates_dirs:
+            if not xml_dir.is_dir():
+                continue
+            # Ищем specification_<order>.xml
+            found = list(xml_dir.glob(f"specification_{order_number}*.xml"))
+            if not found:
+                found = list(xml_dir.glob(f"*{order_number}*.xml"))
+            if found:
+                self._apply_spec_xml_values(found[0])
+                return
+        
+        # XML не нашли — очистим поля от подсветки предыдущего заказа
+        # и выставим розовые (юзер введёт вручную)
+        self._apply_spec_xml_values("")  # пустой путь → всё розовое
     
     def _apply_spec_xml_values(self, ai_path: str):
         """Читает specification_*.xml (если есть) и заполняет поля.
@@ -1716,23 +1757,35 @@ class MainWindow(QtWidgets.QMainWindow):
         # Кнопка остаётся checked, сигнал не дёргаем.
         self.action_toggle_paths(True)
     
-    def action_toggle_paths(self, checked: bool):
-        """Включает/выключает отрисовку путей фрезы на сцене."""
-        # Снимем старые toolpath-элементы
-        for item in getattr(self, '_toolpath_items', []):
-            self.scene.removeItem(item)
-        self._toolpath_items = []
+    def action_toggle_paths(self, checked: bool = True):
+        """Кнопка «Построение путей» — строит/обновляет пути для 
+        АКТИВНОГО заказа.
         
-        if not checked:
-            self.params_panel.btn_show_paths.setText("Показать пути фрезы")
-            return
+        Кнопка всегда работает как REBUILD: клик = построить заново с 
+        текущими параметрами. Текст меняется в зависимости от состояния:
+        - Ничего не построено: «Построение путей»
+        - Пути этого заказа уже есть: «Обновить (N)» — клик пересборет
+        
+        Скрыть пути можно только переключением на другой заказ (пути 
+        текущего заказа автоматически скрываются, показываются кэш 
+        нового).
+        """
+        # Кэш путей per-order
+        if not hasattr(self, '_order_toolpath_items'):
+            self._order_toolpath_items = {}
+        
+        current_order = getattr(self, '_current_stitch_order', None) or "_default"
+        
+        # Удаляем старые пути ЭТОГО заказа перед перестройкой (rebuild)
+        old_items = self._order_toolpath_items.pop(current_order, [])
+        for item in old_items:
+            self.scene.removeItem(item)
         
         if self.session.project is None or not self.session.project.operations:
             QtWidgets.QMessageBox.information(
                 self, "Пути не доступны",
                 "Сначала загрузите .ai файл и создайте операции."
             )
-            self.params_panel.btn_show_paths.setChecked(False)
             return
         
         # ── Автоподбор лидов перед отрисовкой ──
@@ -1781,19 +1834,17 @@ class MainWindow(QtWidgets.QMainWindow):
             top = params.get('top', 0.5)
             angle = params.get('knife_angle', 80)
             tool_radius = tip / 2.0
-            # Эквидистанта = диаметр_кончика + 2 * h * tan(угол/2)
-            # где h = (top - bottom) — эффективная высота реза (высота ножа 
-            # минус глубина врезания). Это соответствует эталонному .anc:
-            # для tip=0.8, top=0.443, bottom=0.19, angle=70:
-            # eq = 0.8 + 2*0.253*tan(35°) = 1.154 (в эталоне 1.1501/2)
-            cut_h = max(0.0, top - bottom)
-            tool_eq = tip + 2 * cut_h * math.tan(math.radians(angle/2))
+            # Эквидистанта = tip + 2 * bottom * tan(угол/2)
+            # где bottom = ABS = глубина реза от вершины ножа.
+            # При уменьшении ABS радиус уменьшается — путь приближается 
+            # к контуру.
+            tool_eq = tip + 2 * bottom * math.tan(math.radians(angle/2))
             
             # Для CORNER операций используется тонкая фреза T3 (пятка 0.6мм)
             # с пропорционально меньшей эквидистантой.
             corner_tip = 0.6  # фреза T3 для углов 2D
             corner_tool_radius = corner_tip / 2.0
-            corner_tool_eq = corner_tip + 2 * cut_h * math.tan(math.radians(angle/2))
+            corner_tool_eq = corner_tip + 2 * bottom * math.tan(math.radians(angle/2))
             
             # Режим применения lead'а: 0=Авто, 1=Все, 2=Выделенные.
             # В viewer передаём вместе с id выделенного ножа (для режима 2).
@@ -1893,14 +1944,26 @@ class MainWindow(QtWidgets.QMainWindow):
             # Назначаем program_number ПОСЛЕ добавления corner'ов — чтобы 
             # цвета визуализации совпадали с реальной разбивкой на чистовые 
             # программы (1_M, 2_M, ...) с учётом всех операций.
+            #
+            # ВАЖНО для сшивок: временно ВЫДЕЛЯЕМ только ноги активного 
+            # заказа (не отфильтрованные). Иначе алгоритм видит все ноги 
+            # сшивки, длины суммируются кросс-между заказами, и в 121561 
+            # первый нож попадает в другую программу чем следующие.
             from ..core.macros import assign_program_numbers
-            assign_program_numbers(
-                self.session.project,
-                max_geom_len=self.session.cutting_params.max_geom_len,
-                direction=self.session.cutting_params.direction.value,
-                corridor_tolerance=self.session.cutting_params.corridor_tolerance,
-                passes_per_part=2,
-            )
+            _saved_ops = list(self.session.project.operations)
+            active_ops = [op for op in _saved_ops 
+                          if not op.attributes.get('stitch_filtered_out', False)]
+            self.session.project.operations = active_ops
+            try:
+                assign_program_numbers(
+                    self.session.project,
+                    max_geom_len=self.session.cutting_params.max_geom_len,
+                    direction=self.session.cutting_params.direction.value,
+                    corridor_tolerance=self.session.cutting_params.corridor_tolerance,
+                    passes_per_part=2,
+                )
+            finally:
+                self.session.project.operations = _saved_ops
             
             if new_corners_added > 0:
                 # Обновим таблицу чтобы CORNER появились
@@ -1941,6 +2004,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 show_filter=show_filter,
                 progress_callback=_on_progress,
             )
+            # Кэшируем построенные items под ключом текущего заказа
+            self._order_toolpath_items[current_order] = list(self._toolpath_items)
             progress.setValue(100)
             progress.close()
             
@@ -1949,7 +2014,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._selected_op_id = ""
             
             n = len(self._toolpath_items)
-            self.params_panel.btn_show_paths.setText(f"Скрыть пути ({n})")
+            self.params_panel.btn_show_paths.setText(f"Пересчитать пути ({n})")
             self.statusBar().showMessage(f"Показано путей: {n}", 5000)
         except Exception as e:
             QtWidgets.QMessageBox.warning(
@@ -2022,8 +2087,7 @@ class MainWindow(QtWidgets.QMainWindow):
         from ..core.cutting_macro import CuttingMacroParams
         
         cp = self.session.cutting_params
-        cut_h = max(0.0, cp.top - cp.bottom)
-        tool_eq = cp.tip_diameter + 2.0 * cut_h * math.tan(
+        tool_eq = cp.tip_diameter + 2.0 * cp.bottom * math.tan(
             math.radians(cp.knife_angle / 2.0))
         tool_offset = tool_eq / 2.0
         
@@ -2062,6 +2126,38 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self, "Папка NC не определена",
                 f"{e}\nВыберите папку вручную.")
+        
+        # ── ПОДМЕНА ПАПКИ ДЛЯ СШИВОК ──
+        # Для сшивки resolve_nc_dir возвращает папку с именем стички 
+        # (напр. '41000_121554_121561_121555_-NC'), т.к. знает только имя 
+        # .ai. Но у сшивки ЭКСПОРТИРУЕМ ОДИН ЗАКАЗ — папка должна называться 
+        # по номеру заказа (напр. '121554-NC'). Пробуем найти уже существующую 
+        # папку заказа на 1-2 уровня выше .ai, иначе создаём рядом.
+        current_order = getattr(self, '_current_stitch_order', None)
+        stitch_info = getattr(self.session, '_stitch_info', None)
+        if current_order and stitch_info:
+            ai_path = Path(self.session.project.source_ai_path or "")
+            if ai_path.exists():
+                stitch_root = ai_path.parent.parent  # <stitch>/maket/ai → <stitch>
+                candidates = [
+                    stitch_root.parent / f"{current_order}-NC",   # sibling
+                    stitch_root.parent / f"{current_order}_NC",
+                    stitch_root.parent / current_order / "NC",
+                    stitch_root.parent / current_order / f"{current_order}-NC",
+                    stitch_root / f"{current_order}-NC",           # внутри стички
+                    stitch_root / f"{current_order}_NC",
+                ]
+                # Ищем существующую (приоритет)
+                found = None
+                for c in candidates:
+                    if c.is_dir():
+                        found = c
+                        break
+                if found:
+                    nc_dir = found
+                else:
+                    # Не нашли — создаём рядом со сшивочной папкой
+                    nc_dir = stitch_root.parent / f"{current_order}-NC"
         
         if nc_dir is not None:
             # Покажем куда будем писать и предупредим про архивацию
@@ -2159,10 +2255,13 @@ class MainWindow(QtWidgets.QMainWindow):
             progress = None
             try:
                 if nc_dir is not None:
-                    # Папка известна — прогресс сразу
+                    # Папка известна — прогресс сразу, передаём override 
+                    # чтобы session использовал именно эту папку (не 
+                    # resolve_nc_dir которая для сшивки даст стичка_имя-NC)
                     progress = _make_progress()
                     self.session._progress_callback = _make_callback(progress)
-                    result = self.session.export_package_auto()
+                    result = self.session.export_package_auto(
+                        nc_dir_override=str(nc_dir))
                     written = result['written']
                     out_dir = result['dir']
                     archived = result['archived']
@@ -2276,14 +2375,19 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def _on_operation_toggled(self):
         """Обработчик изменения галочки в таблице операций.
-        Перерисовываем визуализацию путей если она активна.
+        Перерисовываем визуализацию путей если они уже построены.
         Также синхронизируем визуал реперов (серый если отключены).
         """
         # Синхронизируем FiducialItem с новым excluded flag
         self.scene.refresh_fiducial_state(self.session.project)
-        # Пути перестраиваются только если показаны
-        if self.params_panel.btn_show_paths.isChecked():
-            self.action_refresh_paths()
+        # Пересобираем пути ТЕКУЩЕГО заказа если они уже были построены —
+        # иначе снятие галки не влияет на визуал (пути кэшированы и не 
+        # знают об изменении excluded)
+        current_order = getattr(self, '_current_stitch_order', None) or "_default"
+        cached = getattr(self, '_order_toolpath_items', {})
+        if current_order in cached and cached[current_order]:
+            # Пересчитаем — action_toggle_paths удалит старые и построит новые
+            self.action_toggle_paths()
     
     def _on_layer_visibility(self, layer_name: str, visible: bool):
         self.session.set_layer_visibility(layer_name, visible)

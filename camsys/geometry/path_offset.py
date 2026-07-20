@@ -1092,6 +1092,94 @@ def offset_polypath_uniform(polypath: Polypath, offset: float,
     return Polypath(segments=new_segments, closed=polypath.closed)
 
 
+def offset_polypath_shapely_clean(polypath: Polypath, offset: float,
+                                   inward: bool) -> Polypath:
+    """Чистый offset через shapely buffer — без самопересечений.
+    
+    Использует shapely.buffer() который автоматически обрабатывает 
+    самопересечения на тесных вогнутых углах: заменяет пересечение
+    на маленькую дугу (rounding).
+    
+    Работает так же как AlphaCAM визуализирует пути на канвасе —
+    чистые сглаженные offset-полилинии без крестов на sharp corners.
+    
+    Args:
+        polypath: замкнутый контур
+        offset: расстояние смещения в мм (> 0)
+        inward: True = внутрь контура (buffer -), False = наружу (buffer +)
+    
+    Returns:
+        Новый Polypath (полилиния Line, дуги преобразованы в короткие
+        линии из-за shapely). Возвращает original если shapely 
+        недоступен или offset очень мал.
+    """
+    if not polypath or not polypath.segments or abs(offset) < 1e-9:
+        return polypath
+    
+    try:
+        from shapely.geometry import Polygon, LineString
+        from shapely.ops import unary_union
+    except ImportError:
+        # Fallback на обычный offset если shapely не установлен
+        return offset_polypath_uniform(polypath, offset, inward)
+    
+    # Сэмплим контур в точки
+    pts = _sample_polypath_points(polypath, step_mm=0.1)
+    if len(pts) < 3:
+        return polypath
+    
+    try:
+        poly = Polygon(pts)
+        if not poly.is_valid:
+            # Пытаемся починить самопересекающийся полигон
+            poly = poly.buffer(0)
+            if not poly.is_valid or poly.is_empty:
+                return offset_polypath_uniform(polypath, offset, inward)
+        
+        # Знак offset: inward → сжатие (-), outward → расширение (+)
+        signed_offset = -offset if inward else offset
+        # join_style=2 (mitre) с большим mitre_limit — сохраняет ОСТРЫЕ 
+        # углы на местах где фреза не пролезает (как AlphaCAM). Не 
+        # добавляет полукруг-скругление. cap_style=1 (round) для 
+        # открытых линий, но у нас замкнутый контур — не влияет.
+        # mitre_limit=10 достаточно чтобы не резать «острия» на очень 
+        # тесных углах.
+        result = poly.buffer(signed_offset, join_style=2, mitre_limit=10.0, 
+                             quad_segs=32)
+        
+        if result.is_empty:
+            return polypath
+        
+        # Берём внешнюю границу (если MultiPolygon — самый большой)
+        if result.geom_type == 'MultiPolygon':
+            result = max(result.geoms, key=lambda p: p.area)
+        
+        if not hasattr(result, 'exterior'):
+            return polypath
+        
+        # Конвертируем обратно в Polypath (полилиния из Line сегментов)
+        coords = list(result.exterior.coords)
+        if len(coords) < 3:
+            return polypath
+        
+        # Удаляем дубликат последней точки если совпадает с первой
+        if coords[0] == coords[-1]:
+            coords = coords[:-1]
+        
+        segments = []
+        for i in range(len(coords)):
+            a = coords[i]
+            b = coords[(i+1) % len(coords)]
+            if abs(a[0]-b[0]) < 1e-9 and abs(a[1]-b[1]) < 1e-9:
+                continue
+            segments.append(Line(a=a, b=b))
+        
+        return Polypath(segments=segments, closed=True)
+    except Exception:
+        # На любую ошибку — fallback
+        return offset_polypath_uniform(polypath, offset, inward)
+
+
 def _segment_chord_intersect(s1, s2, eps: float = 1e-6):
     """Пересечение хорд (a-b) двух сегментов.
     
@@ -1827,14 +1915,15 @@ def _point_in_polypath(point: Point, polypath: Polypath) -> bool:
 
 def merge_segments_to_arcs(polypath: Polypath, tol: float = 0.02, 
                             min_chain: int = 3,
-                            tangent_tol_deg: float = 3.0) -> Polypath:
+                            tangent_tol_deg: float = 3.0,
+                            short_seg: float = 1.0) -> Polypath:
     """Объединяет цепочки коротких сегментов в одну дугу или линию.
     
     После biarc-разбиения кривых Безье из .ai контуры могут содержать 
     десятки мелких Line+Arc сегментов на одно скругление. Эта функция
     жадно объединяет их в минимально возможное число сегментов:
     
-    - длинные одиночные сегменты (Line >=1мм или Arc) остаются как есть;
+    - длинные одиночные сегменты (Line >= short_seg мм или Arc) остаются как есть;
     - подряд идущие короткие сегменты накапливаются в цепочку, для 
       которой подбирается ОДНА дуга через все точки (с допуском tol).
       Радиус берётся такой, который удовлетворяет ВСЕМ точкам цепочки.
@@ -1852,6 +1941,10 @@ def merge_segments_to_arcs(polypath: Polypath, tol: float = 0.02,
         min_chain: минимум сегментов в цепочке для объединения
         tangent_tol_deg: макс. допустимый излом касательной между 
                          соседними сегментами в градусах
+        short_seg: порог «короткого» сегмента (мм). Line >= этого не 
+                   объединяется. По умолчанию 1.0. Для сглаженных под 
+                   фрезу полилиний (много Line 1-5мм, аппроксимирующих 
+                   круг) полезно передать 10-20мм.
     
     Returns:
         Новый Polypath.
@@ -1941,7 +2034,7 @@ def merge_segments_to_arcs(polypath: Polypath, tol: float = 0.02,
             ccw = ccw_default
         return Arc(a=p_start, b=p_end, center=(cx, cy), ccw=ccw)
     
-    SHORT_SEG = 1.0  # сегменты короче 1мм — кандидаты на объединение
+    SHORT_SEG = short_seg  # сегменты короче — кандидаты на объединение
     tangent_cos_tol = math.cos(math.radians(tangent_tol_deg))
     
     result: List[Segment] = []

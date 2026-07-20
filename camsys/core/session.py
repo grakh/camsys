@@ -485,7 +485,7 @@ class CamSession:
             shutil.move(str(p), str(old_dir / p.name))
         return str(old_dir)
 
-    def export_package_auto(self) -> Dict[str, Any]:
+    def export_package_auto(self, nc_dir_override: Optional[str] = None) -> Dict[str, Any]:
         """Главный авто-экспорт: папка NC вычисляется из пути .ai, старые .anc
         архивируются в oldN, затем пишутся новые.
 
@@ -493,6 +493,11 @@ class CamSession:
         бросить ошибку — тогда папка не тронута), и ТОЛЬКО при успехе
         архивируем старое и пишем новое. Иначе сбой генерации оставил бы
         папку пустой, а рабочие файлы — уехавшими в old.
+
+        Args:
+            nc_dir_override: если задан — использует эту папку вместо 
+                автоопределения. Нужно для сшивок (папка = номер заказа, 
+                не имя стички).
 
         Returns:
             {'dir': папка NC, 'archived': папка oldN или None, 'written': [...]}
@@ -516,7 +521,10 @@ class CamSession:
                 "активные ножи (галки) и включены типы программ.")
 
         # 2. Папка NC и архивация старого (только после успешной генерации)
-        nc = self.resolve_nc_dir()
+        if nc_dir_override:
+            nc = Path(nc_dir_override)
+        else:
+            nc = self.resolve_nc_dir()
         nc.mkdir(parents=True, exist_ok=True)
         archived = self._archive_old_anc(nc)
 
@@ -590,6 +598,12 @@ class CamSession:
             raise RuntimeError(
                 "Генератор не вернул ни одного файла. Проверьте, что есть "
                 "активные ножи (галки) и включены типы программ.")
+        # Архивируем существующие .anc в подпапку oldN (перед записью новых)
+        from pathlib import Path
+        out_path = Path(output_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        self._archive_old_anc(out_path)
+        
         written = exporter.write_files(output_dir, files)
         return [
             {'path': str(p), 'name': p.name, 'size': p.stat().st_size}

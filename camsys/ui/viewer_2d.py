@@ -864,6 +864,7 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
     # Для открытых CORNER фрагментов — geometric oriented by center.
     from ..geometry.path_offset import (offset_polypath_toward_center,
                                          offset_polypath_uniform,
+                                         offset_polypath_shapely_clean,
                                          simplify_for_visualization,
                                          flatten_arcs_to_chords,
                                          join_polypath_corners,
@@ -913,7 +914,7 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
             polypath_for_vis = smooth_for_offset(polypath_for_vis, tool_offset, _side)
             # Обратная сборка полилинии в дуги (чтобы viewer показывал 
             # чистые кривые как в .anc, а не тысячи мелких Line)
-            polypath_for_vis = merge_segments_to_arcs(polypath_for_vis, tol=0.02)
+            polypath_for_vis = merge_segments_to_arcs(polypath_for_vis, tol=0.05, short_seg=15.0)
         else:
             polypath_for_vis = polypath
     else:
@@ -939,20 +940,16 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         polypath_offset = join_polypath_corners(polypath_offset, tol=0.01)
     elif tp.side == ContourSide.INSIDE:
         # ВНЕШНИЙ рез (INSIDE=CCW + G41 → НАРУЖУ от центра, «+»).
-        polypath_offset = offset_polypath_uniform(
+        # Используем shapely-based offset для чистой визуализации без
+        # самопересечений на тесных вогнутых углах (как AlphaCAM).
+        polypath_offset = offset_polypath_shapely_clean(
             polypath_for_vis, tool_offset, inward=False
         )
-        # Удаляем самопересечения (петли в местах тугой кривизны)
-        polypath_offset = trim_self_intersections(polypath_offset)
-        # Стыкуем углы — после оффсета параллельные сегменты не соединены
-        polypath_offset = join_polypath_corners(polypath_offset, tol=0.01)
     elif tp.side == ContourSide.OUTSIDE:
         # ВНУТРЕННИЙ рез (OUTSIDE=CW + G42 → ВНУТРЬ к центру, «−»).
-        polypath_offset = offset_polypath_uniform(
+        polypath_offset = offset_polypath_shapely_clean(
             polypath_for_vis, tool_offset, inward=True
         )
-        polypath_offset = trim_self_intersections(polypath_offset)
-        polypath_offset = join_polypath_corners(polypath_offset, tol=0.01)
     else:
         polypath_offset = polypath
     

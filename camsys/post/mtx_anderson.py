@@ -587,7 +587,10 @@ class MtxAndersonGVM(PostProcessor):
                 # После сглаживания получаем полилинию из мелких Line — 
                 # собираем обратно в дуги где возможно, чтобы NC-файл был 
                 # компактным (одна G3/G2 команда на дугу вместо десятков G1).
-                polypath = merge_segments_to_arcs(polypath, tol=0.02)
+                # short_seg=15мм — сглаженные Line сегменты обычно 2-5мм,
+                # с большим порогом их получается объединить в одну арку
+                # (иначе станок идёт мелкими волнами по каждой прямой).
+                polypath = merge_segments_to_arcs(polypath, tol=0.05, short_seg=15.0)
             # else: пропускаем сглаживание — сохраняем 3D углы как есть
         
         # ── ВНУТРЕННЕЕ СГЛАЖИВАНИЕ для NC-эмиссии ──
@@ -1133,17 +1136,29 @@ class MtxAndersonGVM(PostProcessor):
               f"F{op.settings.feed_cut} SCLN(2)")
             line_no += 1
         
-        # ── ДВИЖЕНИЯ ПО КОНТУРУ ──
+        # ── ДВИЖЕНИЯ ПО КОНТУРУ (modal G-code как в AlphaCAM) ──
+        # G-код указывается ТОЛЬКО при смене (G1 → G2, G2 → G3, G3 → G1). 
+        # Последующие строки без явного G наследуют режим. Это уменьшает 
+        # размер .anc в ~2× (у AlphaCAM 232 строки на нож, без modal у нас
+        # было 106; с modal ~110 строк на нож).
+        last_g = "G1"  # после lead-in обычно "G1" по факту, но неявно 
+                       # первый arc/line получит явный G-код в любом случае
         for seg in segments:
             if isinstance(seg, Line):
                 end = seg.b
-                w(f"N{line_no} G1 X{self.format_coord(end[0])} "
+                # G1 в modal вставляем только если предыдущий был G2/G3
+                g_prefix = "G1 " if last_g != "G1" else ""
+                w(f"N{line_no} {g_prefix}X{self.format_coord(end[0])} "
                   f"Y{self.format_coord(end[1])}")
+                last_g = "G1"
             elif isinstance(seg, Arc):
                 end = seg.b
                 g_arc = "G3" if seg.ccw else "G2"
-                w(f"N{line_no} {g_arc} X{self.format_coord(end[0])} "
+                # G2/G3 вставляем только при смене направления
+                g_prefix = f"{g_arc} " if last_g != g_arc else ""
+                w(f"N{line_no} {g_prefix}X{self.format_coord(end[0])} "
                   f"Y{self.format_coord(end[1])} R{self.format_coord(seg.radius)}")
+                last_g = g_arc
             line_no += 1
         
         # ── LEAD-OUT: дуга G12/G13 + прямая с G40 ──

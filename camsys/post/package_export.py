@@ -142,14 +142,13 @@ class PackageExporter:
                        progress_callback=None) -> Dict[str, str]:
         from ..core.project import OperationKind
         # ── ПРОВЕРКА СОВМЕСТИМОСТИ ФРЕЗЫ С МАКЕТОМ ──
-        # Если зазор между ножами меньше суммы эквидистант (2*tool_offset),
-        # фреза физически не может пройти — выводим предупреждение.
-        # Формула эквидистанты: tip + 2 * (top - bottom) * tan(angle/2)
-        # где (top - bottom) = эффективная глубина реза (высота ножа - врезание)
+        # Формула эквидистанты: tip + 2 * bottom * tan(angle/2)
+        # где bottom = ABS = глубина реза от вершины ножа.
+        # При уменьшении ABS путь приближается к контуру (радиус 
+        # уменьшается) — это ожидаемое поведение оператора.
         import math
         half_angle_rad = math.radians(self.params.knife_angle / 2.0)
-        cut_h = max(0.0, self.params.top - self.params.bottom)
-        tool_eq = self.params.tip_diameter + 2.0 * cut_h * math.tan(half_angle_rad)
+        tool_eq = self.params.tip_diameter + 2.0 * self.params.bottom * math.tan(half_angle_rad)
         tool_offset = tool_eq / 2.0
         
         problem = self.check_tool_fits_layout(tool_offset)
@@ -385,15 +384,12 @@ class PackageExporter:
         opts.extras['tool_radius'] = self.params.tip_diameter / 2.0
         # Угол инструмента — для SD.WZRec.UD.Ed[1].Geo.Ang
         opts.extras['tool_angle'] = self.params.knife_angle
-        # Эквидистанта = d_tip + 2·(top - bottom)·tan(угол/2)
-        # (top - bottom) = эффективная высота реза (высота ножа - врезание)
-        # Проверено на эталонном .anc 120795_70_2_R.anc:
-        # V70°, d=0.8, top=0.443, bottom=0.19: 
-        # h = 0.253, eq = 0.8 + 2*0.253*tan(35°) = 1.154 (эталон 1.1501)
+        # Эквидистанта = d_tip + 2·bottom·tan(угол/2)
+        # где bottom = ABS = глубина реза от вершины ножа.
+        # При уменьшении ABS путь приближается к контуру.
         import math
         half_angle_rad = math.radians(self.params.knife_angle / 2.0)
-        cut_h = max(0.0, self.params.top - self.params.bottom)
-        tool_eq = self.params.tip_diameter + 2.0 * cut_h * math.tan(half_angle_rad)
+        tool_eq = self.params.tip_diameter + 2.0 * self.params.bottom * math.tan(half_angle_rad)
         opts.extras['tool_equidistant'] = tool_eq
         opts.extras['smooth_offset_for_tool'] = bool(
             getattr(self.params, 'smooth_offset_for_tool', False))
