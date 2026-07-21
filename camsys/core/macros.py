@@ -326,10 +326,26 @@ def assign_program_numbers(project: Project,
         big_singles = sum(1 for ci, clen in enumerate(corridor_lengths)
                           if clen > max_path_len and len(corridors[ci]) == 1
                           and ci not in oversized)
-        n_normal_programs = max(
-            math.ceil(normal_total / max_path_len),
-            big_singles  # каждый большой одиночный = своя программа
-        )
+        # Максимальная длина среди нормальных корридоров
+        normal_corridors = [ci for ci, clen in enumerate(corridor_lengths)
+                            if clen <= max_path_len]
+        n_normal_corridors = len(normal_corridors)
+        if normal_corridors:
+            max_normal_clen = max(corridor_lengths[ci] for ci in normal_corridors)
+            # Сколько корридоров помещается в одну программу (по лимиту)
+            if max_normal_clen > 0:
+                max_per_program = max(1, int(max_path_len / max_normal_clen))
+            else:
+                max_per_program = n_normal_corridors
+            # N = достаточно чтобы (а) уложиться в total, (б) вместить все 
+            # корридоры при max_per_program штук в программе
+            n_normal_programs = max(
+                math.ceil(normal_total / max_path_len),
+                math.ceil(n_normal_corridors / max_per_program),
+                big_singles,
+            )
+        else:
+            n_normal_programs = max(1, big_singles)
         n_normal_programs = max(1, n_normal_programs)
     else:
         n_normal_programs = 0
@@ -408,23 +424,24 @@ def assign_program_numbers(project: Project,
             cur_normal_prog = 0
             normal_acc = 0.0
         else:
-            # Нормальный коридор: распределяем по программам равномерно.
-            # Программа определяется по позиции середины коридора в нормальном
-            # потоке: prog = floor((normal_acc + clen/2) / normal_total * N) + 1
-            if n_normal_programs > 0 and normal_total > 0:
-                center_pos = normal_acc + clen / 2.0
-                local_prog = int(center_pos / normal_total * n_normal_programs) + 1
-                local_prog = max(1, min(local_prog, n_normal_programs))
-            else:
-                local_prog = 1
-            
-            if local_prog != cur_normal_prog:
-                # Новая программа
-                cur_normal_prog = local_prog
+            # Нормальный коридор: GREEDY-накопление.
+            # Добавляем коридор в текущую программу пока сумма ≤ лимита.
+            # Как только следующий коридор превысит — новая программа с него.
+            # 
+            # Для 4 колонок × 2170мм при лимите 3000 → каждая = отдельная 
+            # программа (4 шт). Для 4 колонок × 1000мм → до 3 в программе 
+            # (потом 4-я одна).
+            if cur_normal_prog == 0:
                 prog_no += 1
+                cur_normal_prog = prog_no
+                normal_acc = 0.0
+            elif normal_acc + clen > max_path_len:
+                prog_no += 1
+                cur_normal_prog = prog_no
+                normal_acc = 0.0
             
             for op in group:
-                op.attributes['program_number'] = prog_no
+                op.attributes['program_number'] = cur_normal_prog
             normal_acc += clen
     
     if prog_no == 0:

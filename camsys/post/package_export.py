@@ -651,16 +651,40 @@ class PackageExporter:
         from ..geometry.corner_detect import (detect_geometric_corners,
                                                group_corner_arcs)
         
-        # Порог радиуса для 2D-обработки (тонкая фреза 0.6)
-        radius_threshold_2d = self.params.corner_radius_threshold_mm
+        # Порог радиуса — динамический, зависит от реального радиуса фрезы.
+        # Если у скругления R >= tool_offset, то основная фреза физически 
+        # проходит внутри → corner_rework НЕ НУЖЕН.
+        # Раньше был фикс 0.7мм → детектились «углы» даже там, где фреза 
+        # 0.8 с угом 70° и ABS 0.25 (tool_offset=0.575) вполне проходит.
+        # 
+        # Формула tool_offset уже посчитана в _build_post_options:
+        # tool_offset = tip/2 + ABS * tan(angle/2)
+        import math
+        half_angle_rad = math.radians(self.params.knife_angle / 2.0)
+        tool_offset = (self.params.tip_diameter / 2.0 
+                       + self.params.bottom * math.tan(half_angle_rad))
+        # Порог = actual_tool_offset + небольшой запас на неточность биарк-
+        # аппроксимации Illustrator'а. Юзер задаёт `corner_radius_threshold_mm`
+        # как ФИКСИРОВАННЫЙ верхний предел — уважаем если он МЕНЬШЕ 
+        # динамического (юзер хочет более строгий отбор).
+        dynamic_threshold = tool_offset
+        radius_threshold_2d = min(
+            self.params.corner_radius_threshold_mm,
+            dynamic_threshold
+        )
         
         ops_2d: List[Operation] = []
         ops_3d: List[Operation] = []
         
         # Перебираем существующие BLADE_FORMING операции (в их текущем 
         # порядке — после sort_by_grid). Это даёт «по ножам» обход углов.
+        # ВАЖНО для сшивок: пропускаем ноги отфильтрованных заказов —
+        # углы для соседних заказов НЕ создаём вообще (не только не 
+        # выводим). Иначе они могут случайно попасть в _corner.anc и 
+        # запортить соседний заказ на плите.
         blade_ops = [op for op in self.project.operations 
-                     if op.kind == OperationKind.BLADE_FORMING]
+                     if op.kind == OperationKind.BLADE_FORMING
+                     and not op.attributes.get('stitch_filtered_out', False)]
         
         for blade_op in blade_ops:
             if not blade_op.geometry_ids:

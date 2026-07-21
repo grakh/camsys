@@ -232,6 +232,8 @@ def _match_orders_to_regions(regions: List[BBox], text_items: List[TextItem],
     result: Dict[int, str] = {}
     order_items = find_text_matching(text_items, orders)
     
+    # ЭТАП 1: точный point-in-bbox матчинг
+    unmatched_items = []
     for it in order_items:
         if not it.text.isdigit() or it.text not in orders:
             continue
@@ -242,13 +244,39 @@ def _match_orders_to_regions(regions: List[BBox], text_items: List[TextItem],
         x_ai = it.cx / scale
         y_ai = (page_h - it.cy) / scale
         # Ищем в какой регион попал центр
+        matched = False
         for idx, bbox in enumerate(regions):
             if idx in result:
                 continue
             x0, y0, x1, y1 = bbox
             if x0 <= x_ai <= x1 and y0 <= y_ai <= y1:
                 result[idx] = it.text
+                matched = True
                 break
+        if not matched:
+            unmatched_items.append((it, x_ai, y_ai))
+    
+    # ЭТАП 2: fuzzy fallback — оставшиеся номера привязываем к 
+    # ближайшему НЕ сопоставленному региону по расстоянию до центра. 
+    # Работает если номер отпечатан РЯДОМ с регионом (за его bbox), 
+    # например над рамкой или сбоку. Тогда точный in-bbox не срабатывает, 
+    # но ближайший центр региона однозначно определяет привязку.
+    for it, x_ai, y_ai in unmatched_items:
+        if it.text in result.values():
+            continue
+        best_idx = None
+        best_dist = float('inf')
+        for idx, bbox in enumerate(regions):
+            if idx in result:
+                continue  # регион уже занят
+            cx = (bbox[0] + bbox[2]) / 2.0
+            cy = (bbox[1] + bbox[3]) / 2.0
+            dist = ((cx - x_ai)**2 + (cy - y_ai)**2) ** 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+        if best_idx is not None:
+            result[best_idx] = it.text
     
     return result
 

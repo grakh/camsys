@@ -621,7 +621,10 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         gen_layout.addWidget(self.gen_sv)
         
         self.gen_corner = QtWidgets.QCheckBox("Острые углы 2D (_corner.anc)")
-        self.gen_corner.setChecked(True)
+        # По умолчанию ВЫКЛЮЧЕНО: если геометрия без острых углов, юзеру 
+        # не нужен пустой _corner.anc в выводе. Включает вручную при 
+        # необходимости для конкретного заказа.
+        self.gen_corner.setChecked(False)
         gen_layout.addWidget(self.gen_corner)
         
         self.gen_corner_3d = QtWidgets.QCheckBox("Острые углы 3D (_corner3D.anc)")
@@ -738,7 +741,7 @@ class CuttingParamsPanel(QtWidgets.QWidget):
             self.gen_reverse.setChecked(True)
             self.gen_finish.setChecked(True)
             self.gen_sv.setChecked(True)
-            self.gen_corner.setChecked(True)
+            self.gen_corner.setChecked(False)
             self.gen_corner_3d.setChecked(False)
             self.gen_smooth.setChecked(False)
             self.auto_avoid_all.setChecked(True)
@@ -1467,19 +1470,32 @@ class MainWindow(QtWidgets.QMainWindow):
         ли в контурах соответствующие углы.
         
         Логика:
-            - Есть скруглённые углы (R<0.7мм)  → _corner.anc ВКЛЮЧАЕТСЯ
-            - Нет таких углов                  → _corner.anc ВЫКЛЮЧАЕТСЯ
+            - Есть скругления радиусом МЕНЬШЕ рабочего радиуса фрезы
+              → _corner.anc ВКЛЮЧАЕТСЯ (фреза не проходит, нужен T3)
+            - Нет таких скруглений             → _corner.anc ВЫКЛЮЧАЕТСЯ
             - Есть полностью острые углы       → _corner3D.anc ВКЛЮЧАЕТСЯ
             - Нет таких углов                  → _corner3D.anc ВЫКЛЮЧАЕТСЯ
-        Пользователь может вручную переключить чекбоксы после.
+        
+        Порог для 2D — ДИНАМИЧЕСКИЙ, равен реальному радиусу фрезы 
+        (tip/2 + ABS·tan(angle/2)), чтобы согласоваться с алгоритмом 
+        _build_corner_operations в постпроцессоре. Если фреза 0.8 с 
+        углом 70 и ABS 0.25 → порог 0.575мм. Скругления R>=0.575 фреза 
+        проходит, corner_rework не нужен.
         """
         from ..geometry.corner_detect import (
             has_small_radius_corners, has_pointed_corners
         )
+        import math
         
         prj = self.session.project
         if prj is None:
             return
+        
+        # Динамический порог = реальный радиус фрезы
+        cp = self.session.cutting_params
+        half_angle_rad = math.radians(cp.knife_angle / 2.0)
+        dynamic_threshold = (cp.tip_diameter / 2.0 
+                             + cp.bottom * math.tan(half_angle_rad))
         
         # Перебираем все геометрии на слое Knife
         knife = prj.get_layer_by_name("Knife")
@@ -1491,7 +1507,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for g in knife.geometries:
             if not g.polypath:
                 continue
-            if not any_small and has_small_radius_corners(g.polypath, 0.7):
+            if not any_small and has_small_radius_corners(g.polypath, dynamic_threshold):
                 any_small = True
             if not any_pointed and has_pointed_corners(g.polypath, 30.0):
                 any_pointed = True

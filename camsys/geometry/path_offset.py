@@ -1123,8 +1123,11 @@ def offset_polypath_shapely_clean(polypath: Polypath, offset: float,
         # Fallback на обычный offset если shapely не установлен
         return offset_polypath_uniform(polypath, offset, inward)
     
-    # Сэмплим контур в точки
-    pts = _sample_polypath_points(polypath, step_mm=0.1)
+    # Сэмплим контур в точки с высокой точностью (маленький шаг). 
+    # Это принципиально для качества offset — при chord_err=0.05 мелкие 
+    # дуги превращались в 8-16 отрезков ломаной. При 0.005 — плотная 
+    # сетка точек, offset получается близким к оригиналу арок.
+    pts = _sample_polypath_points(polypath, chord_err_mm=0.005)
     if len(pts) < 3:
         return polypath
     
@@ -1174,7 +1177,14 @@ def offset_polypath_shapely_clean(polypath: Polypath, offset: float,
                 continue
             segments.append(Line(a=a, b=b))
         
-        return Polypath(segments=segments, closed=True)
+        result_pp = Polypath(segments=segments, closed=True)
+        # После shapely получаем много мелких прямых даже на скруглениях.
+        # Собираем обратно в дуги где возможно. short_seg=20мм — сегменты 
+        # 1-5мм аппроксимирующие арки объединяются в одну дугу вместо 
+        # ломаной. tol=0.05мм — точность оффсета.
+        result_pp = merge_segments_to_arcs(
+            result_pp, tol=0.05, short_seg=20.0)
+        return result_pp
     except Exception:
         # На любую ошибку — fallback
         return offset_polypath_uniform(polypath, offset, inward)
