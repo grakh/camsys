@@ -459,10 +459,27 @@ class CamView(QtWidgets.QGraphicsView):
             self.geometriesSelected.emit(ids)
     
     def wheelEvent(self, event: QtGui.QWheelEvent):
-        """Колесо мыши — зум."""
+        """Колесо мыши — зум с центром под курсором.
+
+        AnchorUnderMouse у QGraphicsView в паре с scale(1,-1) ведёт себя
+        неустойчиво (сцена «уплывает» при интенсивной прокрутке), поэтому
+        компенсируем сдвиг вручную: замеряем сцену-точку под курсором до и
+        после scale, разницу возвращаем translate'ом.
+        """
         angle = event.angleDelta().y()
-        factor = 1.15 if angle > 0 else 1/1.15
+        if angle == 0:
+            return
+        factor = 1.15 if angle > 0 else 1 / 1.15
+        # QWheelEvent.position() — QPointF в координатах вьюпорта
+        try:
+            pos_view = event.position().toPoint()
+        except AttributeError:  # старые Qt: pos()
+            pos_view = event.pos()
+        old_scene = self.mapToScene(pos_view)
         self.scale(factor, factor)
+        new_scene = self.mapToScene(pos_view)
+        delta = new_scene - old_scene
+        self.translate(delta.x(), delta.y())
     
     def mousePressEvent(self, event: QtGui.QMouseEvent):
         if event.button() == QtCore.Qt.MiddleButton:

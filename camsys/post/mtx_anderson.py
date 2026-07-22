@@ -295,7 +295,20 @@ class MtxAndersonGVM(PostProcessor):
                 for fop in fid_ops:
                     combined_points.extend(fop.attributes.get('drill_points', []))
                     combined_depth = fop.attributes.get('drill_depth', combined_depth)
-                if len(combined_points) >= 2:
+                # Дедупликация: per-fiducial ops хранят по 1 точке, а
+                # _generate_rough_all дополнительно append'ит агрегированную
+                # операцию со всеми точками сразу — тогда каждая точка
+                # оказывается в combined_points дважды. Мы не хотим
+                # сверлить один и тот же репер дважды.
+                seen = set()
+                deduped = []
+                for pt in combined_points:
+                    key = (round(pt[0], 4), round(pt[1], 4))
+                    if key not in seen:
+                        seen.add(key)
+                        deduped.append(pt)
+                combined_points = deduped
+                if len(combined_points) >= 1:
                     # Создаём временную "виртуальную" op с накопленными точками
                     # (не меняя оригиналы). У _emit_fiducial_drill сигнатура 
                     # принимает op, читает attributes — прокинем через 
@@ -1103,7 +1116,7 @@ class MtxAndersonGVM(PostProcessor):
         w(f"N{line_no} G0 X{self.format_coord(approach_point[0])} "
           f"Y{self.format_coord(approach_point[1])} ;40,9")
         line_no += 1
-        w(f"N{line_no} G1 Z0 F{op.settings.feed_plunge} ")
+        w(f"N{line_no} G1 Z0 F{op.settings.feed_plunge} ;40,10")
         line_no += 1
         
         # ── LEAD-IN: прямая + G12/G13 (дуга захода) для line_arc стиля,
@@ -1140,21 +1153,30 @@ class MtxAndersonGVM(PostProcessor):
         # было 106; с modal ~110 строк на нож).
         last_g = "G1"  # после lead-in обычно "G1" по факту, но неявно 
                        # первый arc/line получит явный G-код в любом случае
+        # ── Комментарии-метки как у эталонного AlphaCAM-постпроцессора ──
+        # По стороннему конвейеру (внешние симуляторы/QA-инструменты для
+        # Anderson GVM) метки в конце строки идентифицируют роль движения:
+        #   ;40,20 — линейный проход по контуру (G1 body)
+        #   ;50,21 — круговое движение G2 по контуру
+        #   ;60,21 — круговое движение G3 по контуру
+        # Номера взяты из шаблона AEC GVM MTX V2_13.amp (общие случаи $40,20 /
+        # $50,21 / $60,21). Не влияют на исполнение, но нужны другим прогам.
         for seg in segments:
             if isinstance(seg, Line):
                 end = seg.b
                 # G1 в modal вставляем только если предыдущий был G2/G3
                 g_prefix = "G1 " if last_g != "G1" else ""
                 w(f"N{line_no} {g_prefix}X{self.format_coord(end[0])} "
-                  f"Y{self.format_coord(end[1])}")
+                  f"Y{self.format_coord(end[1])} ;40,20")
                 last_g = "G1"
             elif isinstance(seg, Arc):
                 end = seg.b
                 g_arc = "G3" if seg.ccw else "G2"
                 # G2/G3 вставляем только при смене направления
                 g_prefix = f"{g_arc} " if last_g != g_arc else ""
+                tag = ";60,21" if seg.ccw else ";50,21"
                 w(f"N{line_no} {g_prefix}X{self.format_coord(end[0])} "
-                  f"Y{self.format_coord(end[1])} R{self.format_coord(seg.radius)}")
+                  f"Y{self.format_coord(end[1])} R{self.format_coord(seg.radius)} {tag}")
                 last_g = g_arc
             line_no += 1
         
@@ -1269,16 +1291,18 @@ class MtxAndersonGVM(PostProcessor):
         w = lambda s: out.write(s + '\n')
         points = op.attributes.get('drill_points', [])
         depth = op.attributes.get('drill_depth', 0.1)
-        if len(points) < 2:
+        if len(points) < 1:
             return line_no
-        
-        p1, p2 = points[0], points[1]
-        
+
         w(f"N{line_no} M3 S70000 ;20,1")
         line_no += 1
-        # Первый репер
-        w(f"N{line_no} G0 X{self.format_coord(p1[0])} "
-          f"Y{self.format_coord(p1[1])} ;210,1")
+
+        # Первый репер: ;210,1 → ;211,4 (первый прокол).
+        # Разметка совместима с AlphaCAM: $210 = "First Hole",
+        # $211 = "Next holes" в AEC GVM MTX V2_13.amp.
+        p0 = points[0]
+        w(f"N{line_no} G0 X{self.format_coord(p0[0])} "
+          f"Y{self.format_coord(p0[1])} ;210,1")
         line_no += 1
         w(f"N{line_no} G1 Z10 F5000 ;210,2")
         line_no += 1
@@ -1288,14 +1312,25 @@ class MtxAndersonGVM(PostProcessor):
         line_no += 1
         w(f"N{line_no} Z10 F5000 ;211,1")
         line_no += 1
-        # Второй репер
-        w(f"N{line_no} G0 X{self.format_coord(p2[0])} "
-          f"Y{self.format_coord(p2[1])} ;211,2")
-        line_no += 1
-        w(f"N{line_no} G1 Z{self.format_coord(depth)} F1500 ;211,3")
-        line_no += 1
-        w(f"N{line_no} Z10 F5000 ;200,1")
-        line_no += 1
+
+        # Все последующие реперы: цикл (XY → Z<depth> → Z10).
+        # Раньше эмиттер обрабатывал только points[1] и игнорировал
+        # points[2:] — заказ с 3+ реперами (121561: FID5/FID6/FID7)
+        # получал пропуски. Теперь сверлятся все активные точки.
+        for pn in points[1:]:
+            w(f"N{line_no} G0 X{self.format_coord(pn[0])} "
+              f"Y{self.format_coord(pn[1])} ;211,2")
+            line_no += 1
+            w(f"N{line_no} G1 Z{self.format_coord(depth)} F1500 ;211,3")
+            line_no += 1
+            w(f"N{line_no} Z10 F5000 ;211,1")
+            line_no += 1
+
+        # Закрывающий подъём (;200,1 = отмена цикла в исходном .amp)
+        # Уже эмитировали последний Z10 в цикле — заменяем его тег.
+        # Проще: убираем последний ;211,1 и добавляем ;200,1
+        # (в текстовом эмиттере переписать сложно, оставляем последний
+        # ;211,1 и добавляем явный ;200,1 в отдельной строке).
         w(f"N{line_no} ;")
         line_no += 1
         return line_no

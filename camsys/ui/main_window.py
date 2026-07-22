@@ -2300,12 +2300,56 @@ class MainWindow(QtWidgets.QMainWindow):
                 if progress is not None:
                     progress.setValue(100)
                     progress.close()
-            
+
+            # ── POSITION-вариант: пишется автоматически рядом, в подпапку
+            #    POSITION/. Заказ вырезается со стички и кладётся на станок
+            #    отдельно — у него локальный (0,0) = LB-репер. Ошибка
+            #    POSITION не должна ломать сообщение о главном экспорте,
+            #    он уже прошёл. Warnings собираем и покажем оператору.
+            pos_result = None
+            pos_error = None
+            if written:  # только если основной экспорт что-то дал
+                try:
+                    pos_order = (current_order
+                                 if current_order and current_order != "_default"
+                                 else None)
+                    pos_nc_override = (
+                        str(nc_dir) if nc_dir is not None else out_dir)
+                    pos_result = self.session.export_package_position(
+                        order_number=pos_order,
+                        nc_dir_override=pos_nc_override)
+                except Exception as e:
+                    import traceback as _tb
+                    pos_error = f"{e}\n{_tb.format_exc()}"
+
             loglines.append(f"записано файлов: {len(written)}")
             for f in written:
                 loglines.append(f"   {f['path']}  ({f['size']} б)")
             if archived:
                 loglines.append(f"старые -> {archived}")
+
+            # ── POSITION в лог ──
+            if pos_error:
+                loglines.append("")
+                loglines.append("POSITION: ошибка")
+                loglines.append(pos_error)
+            elif pos_result is not None:
+                loglines.append("")
+                if pos_result.get('skipped'):
+                    loglines.append("POSITION: пропущен")
+                else:
+                    pw = pos_result.get('written', [])
+                    loglines.append(f"POSITION: записано {len(pw)} файлов")
+                    for f in pw:
+                        loglines.append(f"   {f['path']}  ({f['size']} б)")
+                    t = pos_result.get('transform') or {}
+                    loglines.append(
+                        f"   трансформ: pair={t.get('pair')} "
+                        f"rotate_cw90={t.get('rotate_cw90')} "
+                        f"dist={t.get('dist')}")
+                for w in pos_result.get('warnings', []):
+                    loglines.append(f"   ! {w}")
+
             log_text = "\n".join(loglines)
             _write_log(log_text)
             
@@ -2323,8 +2367,36 @@ class MainWindow(QtWidgets.QMainWindow):
                 msg += f"Старые файлы перенесены в:\n{archived}\n\n"
             for f in written:
                 msg += f"  {f['name']:<40s} {f['size']:>8} байт\n"
-            _show(QtWidgets.QMessageBox.Information, "Экспорт завершён",
-                  msg, log_text)
+
+            # ── POSITION в сообщение оператору ──
+            icon = QtWidgets.QMessageBox.Information
+            title = "Экспорт завершён"
+            if pos_error:
+                msg += f"\n[POSITION] Ошибка: {pos_error.splitlines()[0]}\n"
+                icon = QtWidgets.QMessageBox.Warning
+                title = "Экспорт завершён, POSITION с ошибкой"
+            elif pos_result is not None:
+                if pos_result.get('skipped'):
+                    msg += "\n[POSITION] Пропущен:\n"
+                    for w in pos_result.get('warnings', []):
+                        msg += f"  {w}\n"
+                    icon = QtWidgets.QMessageBox.Warning
+                else:
+                    pw = pos_result.get('written', [])
+                    msg += (f"\n[POSITION] Записано {len(pw)} файлов "
+                            f"в подпапку POSITION/:\n")
+                    for f in pw:
+                        msg += f"  {f['name']:<40s} {f['size']:>8} байт\n"
+                    warns = pos_result.get('warnings', [])
+                    if warns:
+                        msg += "\n[POSITION] ПРЕДУПРЕЖДЕНИЯ:\n"
+                        for w in warns:
+                            msg += f"  ! {w}\n"
+                        icon = QtWidgets.QMessageBox.Warning
+                        title = ("Экспорт завершён, "
+                                 "POSITION с предупреждениями")
+
+            _show(icon, title, msg, log_text)
             self.statusBar().showMessage(f"Экспортировано: {len(written)} файлов", 5000)
         except Exception as e:
             import traceback

@@ -24,6 +24,7 @@ from __future__ import annotations
 from typing import List, Dict, Optional, Any, Tuple
 from pathlib import Path
 import json
+import re as _re
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 
@@ -535,6 +536,245 @@ class CamSession:
             for p in written_paths
         ]
         return {'dir': str(nc), 'archived': archived, 'written': written}
+
+    def export_package_position(self, order_number: Optional[str] = None,
+                                nc_dir_override: Optional[str] = None
+                                ) -> Dict[str, Any]:
+        """POSITION-вариант экспорта — заказ в собственных локальных
+        координатах (LB-репер в (0,0), парный репер на оси X).
+
+        Подход — простой пост-процессинг: генерим обычный пакет .anc,
+        затем в каждом файле применяем POSITION-трансформ к каждой паре
+        `X<num> Y<num>` в моторных строках. Константы шапки/трейлера
+        (парковка, CCD-оффсеты) не трогаются.
+
+        Формулы (см. camsys.core.position):
+            С поворотом -90° (пара реперов вертикальная):
+                new_x =  y - lb_y
+                new_y = -(x - lb_x)
+            Без поворота (пара горизонтальная):
+                new_x = x - lb_x
+                new_y = y - lb_y
+
+        Args:
+            order_number: если задан и активна сшивка (`_stitch_info`) —
+                используем реперы этого заказа. Иначе — все реперы проекта.
+            nc_dir_override: базовая папка NC (POSITION создастся внутри).
+
+        Returns:
+            {'dir', 'archived', 'written', 'transform': {...}}
+        """
+        from pathlib import Path
+        from .position import (
+            pick_alignment_pair, compute_position_transform, PositionTransform,
+            _transform_anc_text,
+        )
+        from .project import OperationKind
+
+        if self.project is None:
+            raise RuntimeError("Нет проекта")
+        if not self.project.operations:
+            self.create_blade_operations()
+
+        # 1. Определяем пару реперов заказа и трансформ.
+        stitch = getattr(self, '_stitch_info', None)
+        region = None
+        if order_number and stitch is not None:
+            region = stitch.get_region_by_order(order_number)
+            if region is None:
+                raise RuntimeError(
+                    f"Заказ {order_number} не найден в сшивке "
+                    f"({stitch.stitch_number}). "
+                    f"Доступные: {', '.join(stitch.orders)}")
+            order_fids = [f for f in self.project.fiducials
+                          if f.id in region.fiducial_ids]
+        else:
+            order_fids = list(self.project.fiducials)
+
+        pair = pick_alignment_pair(order_fids)
+        warnings_out: List[str] = []
+
+        if pair is None:
+            # Ноль реперов у заказа — POSITION невозможен, возвращаем
+            # результат-заглушку с warning. Обычный экспорт при этом уже
+            # прошёл; UI покажет warning оператору.
+            return {
+                'dir': None, 'archived': [], 'written': [],
+                'transform': None, 'skipped': True,
+                'warnings': [
+                    f"POSITION не создан: у заказа "
+                    f"{order_number or '(нет номера)'} нет реперов "
+                    f"(< 1 фидука после автодетекта регионов)."
+                ],
+            }
+
+        lb, other = pair
+        transform = compute_position_transform([lb] if other is None
+                                                else [lb, other])
+        pair_ids = {lb.id} if other is None else {lb.id, other.id}
+
+        if other is None:
+            warnings_out.append(
+                f"Второй репер у заказа {order_number} не найден: POSITION "
+                f"рассчитан по горизонтали (только сдвиг, без поворота). "
+                f"Оператор должен довести правый репер вручную на станке."
+            )
+
+        # 2. Временно правим состояние проекта под POSITION-генерацию:
+        #      • fiducial_distance = локальная дистанция пары
+        #      • output_prefix = номер заказа (иначе префикс = имя стички)
+        #      • не-пара FIDUCIAL_DRILL: mark excluded=True
+        #        (иначе стрэй-репер листа попадёт в drill)
+        #      • ножи и drill ДРУГИХ заказов сшивки: stitch_filtered_out=True
+        #        (чтобы генерация выдала только этот заказ независимо от того,
+        #        какой заказ активен в UI)
+        # После генерации всё восстанавливаем в finally.
+        saved_dist = self.cutting_params.fiducial_distance
+        saved_prefix = self.cutting_params.output_prefix
+        saved_project_name = self.project.name
+        saved_excluded: Dict[str, bool] = {}
+        saved_filtered: Dict[str, Any] = {}  # op_id -> prev value or _MISSING
+
+        _MISSING = object()
+
+        self.cutting_params.fiducial_distance = (
+            transform.dist if transform.dist is not None else saved_dist)
+        if order_number:
+            self.cutting_params.output_prefix = str(order_number)
+            self.project.name = str(order_number)
+
+        allowed_knife_ids = set(region.knife_ids) if region is not None else None
+        allowed_fid_ids_for_filter = (
+            set(region.fiducial_ids) if region is not None else None)
+
+        for op in self.project.operations:
+            # (a) Отсекаем стрэй-реперы через excluded (даже если они в region)
+            if op.kind == OperationKind.FIDUCIAL_DRILL:
+                fid_id = op.attributes.get('fiducial_id', '')
+                if fid_id and fid_id not in pair_ids:
+                    saved_excluded[op.id] = bool(
+                        op.attributes.get('excluded', False))
+                    op.attributes['excluded'] = True
+
+            # (b) Фильтруем ножи/углы/drill чужих заказов сшивки
+            if region is None:
+                continue
+            prev = op.attributes.get('stitch_filtered_out', _MISSING)
+            if op.kind == OperationKind.BLADE_FORMING:
+                keep = any(g in allowed_knife_ids for g in op.geometry_ids)
+                if not keep:
+                    saved_filtered[op.id] = prev
+                    op.attributes['stitch_filtered_out'] = True
+                else:
+                    saved_filtered[op.id] = prev
+                    op.attributes.pop('stitch_filtered_out', None)
+            elif op.kind == OperationKind.CORNER_REWORK:
+                parent = op.attributes.get('parent_geom_id', '')
+                keep = parent in allowed_knife_ids
+                saved_filtered[op.id] = prev
+                if not keep:
+                    op.attributes['stitch_filtered_out'] = True
+                else:
+                    op.attributes.pop('stitch_filtered_out', None)
+            elif op.kind == OperationKind.FIDUCIAL_DRILL:
+                fid_id = op.attributes.get('fiducial_id', '')
+                keep = fid_id in allowed_fid_ids_for_filter
+                saved_filtered[op.id] = prev
+                if not keep:
+                    op.attributes['stitch_filtered_out'] = True
+                else:
+                    op.attributes.pop('stitch_filtered_out', None)
+
+        try:
+            exporter = PackageExporter(
+                self.project, self.cutting_params, post_name=self.post_name)
+            cb = getattr(self, '_progress_callback', None)
+            files = exporter.generate(progress_callback=cb)
+        finally:
+            self.cutting_params.fiducial_distance = saved_dist
+            self.cutting_params.output_prefix = saved_prefix
+            self.project.name = saved_project_name
+            for op_id, was in saved_excluded.items():
+                op = self.project.find_operation(op_id)
+                if op is not None:
+                    op.attributes['excluded'] = was
+            for op_id, prev in saved_filtered.items():
+                op = self.project.find_operation(op_id)
+                if op is None:
+                    continue
+                if prev is _MISSING:
+                    op.attributes.pop('stitch_filtered_out', None)
+                else:
+                    op.attributes['stitch_filtered_out'] = prev
+
+        if not files:
+            raise RuntimeError(
+                "POSITION: генератор не вернул ни одного файла.")
+
+        # 3. Пост-процессинг: пробегаем по каждому файлу и переводим
+        #    координаты X/Y моторных строк в локальную СК заказа.
+        files_pos = {
+            name: _transform_anc_text(content, transform)
+            for name, content in files.items()
+        }
+
+        # 4. Пишем в подпапку POSITION/ с архивом старого содержимого.
+        if nc_dir_override:
+            base = Path(nc_dir_override)
+        else:
+            base = self.resolve_nc_dir()
+        nc = base / "POSITION"
+        nc.mkdir(parents=True, exist_ok=True)
+        archived = self._archive_old_anc(nc)
+
+        written = []
+        # Валидация: у POSITION-заготовки LB в (0,0), и все ножи ФИЗИЧЕСКИ
+        # находятся на куске материала, ограниченном bbox заказа. Значит
+        # все координаты движения ножа должны быть > 0 (даже 0 недопустим —
+        # нужны поля материала). Drill-точки исключаем: LB-drill ЛЕЖИТ в
+        # (0,0), это норма (калибровочный прокол на границе заготовки).
+        _knife_tag = _re.compile(r';(?:40|50|60),\d')
+        _xy_re = _re.compile(r'X(-?\d+(?:\.\d+)?)\s+Y(-?\d+(?:\.\d+)?)')
+        for name, content in files_pos.items():
+            p = nc / name
+            p.write_text(content, encoding='utf-8')
+            written.append({'path': str(p), 'name': name,
+                            'size': p.stat().st_size})
+            # Проверка «X, Y > 0» на моторных строках ножа
+            bad_x, bad_y = 0, 0
+            min_x, min_y = float('inf'), float('inf')
+            for line in content.splitlines():
+                if not _knife_tag.search(line):
+                    continue
+                m = _xy_re.search(line)
+                if not m:
+                    continue
+                x = float(m.group(1)); y = float(m.group(2))
+                if x <= 0: bad_x += 1
+                if y <= 0: bad_y += 1
+                if x < min_x: min_x = x
+                if y < min_y: min_y = y
+            if bad_x or bad_y:
+                warnings_out.append(
+                    f"POSITION/{name}: {bad_x + bad_y} точек ножа выходят за "
+                    f"физические границы заготовки (X ≤ 0 или Y ≤ 0). "
+                    f"min X={min_x:.3f}, min Y={min_y:.3f}. "
+                    f"Проверьте правильность пары реперов заказа."
+                )
+
+        return {
+            'dir': str(nc),
+            'archived': archived,
+            'written': written,
+            'warnings': warnings_out,
+            'transform': {
+                'lb_x': transform.lb_x, 'lb_y': transform.lb_y,
+                'rotate_cw90': transform.rotate_cw90,
+                'dist': transform.dist,
+                'pair': ([lb.name] if other is None
+                         else [lb.name, other.name]),
+            },
+        }
 
     def preview_package_filenames(self) -> List[str]:
         """Возвращает прогнозируемые имена выходных файлов с учётом 

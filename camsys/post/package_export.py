@@ -96,20 +96,30 @@ class PackageExporter:
             and op.attributes.get('excluded', False)
         }
         
-        # Аналогично для FIDUCIAL — сохраняем set fiducial_id снятых юзером 
-        # реперов. make_fiducial_drill_operation() читает это через 
-        # self._fiducial_excluded_ids (см. ниже filter в _generate_rough_all).
+        # Аналогично для FIDUCIAL — сохраняем set fiducial_id снятых юзером
+        # реперов И реперов ДРУГИХ заказов сшивки. Иначе _generate_rough_all
+        # пересобирает drill_op из ПОЛНОГО списка prj.fiducials (без учёта
+        # stitch_filtered_out) и сверлит все реперы стички, а не только
+        # текущего заказа.
         self._fiducial_excluded_ids = {
             op.attributes.get('fiducial_id')
             for op in _all_ops
             if op.kind == OperationKind.FIDUCIAL_DRILL
-            and op.attributes.get('excluded', False)
+            and (op.attributes.get('excluded', False)
+                 or op.attributes.get('stitch_filtered_out', False))
             and op.attributes.get('fiducial_id')
         }
         
-        # Полное число ножей ДО фильтра (для порога режима доработки _dop)
+        # Полное число ножей ДО фильтра excluded, но В ПРЕДЕЛАХ scope
+        # текущего экспорта: stitch_filtered_out исключён из счёта. Иначе
+        # маленький заказ на большой сшивке (например 6/25) ошибочно
+        # триггерит режим доработки _dop.anc, потому что active_n=6 <
+        # 25*0.5. Смысл dop-порога — «оператор снял большинство галок
+        # для доработки», а не «заказ занимает малую долю сшивки».
         self._total_blade_count = sum(
-            1 for op in _all_ops if op.kind == OperationKind.BLADE_FORMING)
+            1 for op in _all_ops
+            if op.kind == OperationKind.BLADE_FORMING
+            and not op.attributes.get('stitch_filtered_out', False))
         # Отбрасываем:
         #  - операции с галкой excluded (сняты в UI);
         #  - НАКОПЛЕННЫЕ CORNER_REWORK: они могли быть добавлены в проект при
