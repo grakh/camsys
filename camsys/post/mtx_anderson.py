@@ -519,7 +519,12 @@ class MtxAndersonGVM(PostProcessor):
             # сдвигаем на длину top line — попадаем на её правый конец = TR угол.
             seg0 = polypath.segments[0]
             from ..geometry.primitives import Line
-            if isinstance(seg0, Line) and seg0.b[0] > seg0.a[0]:
+            # Сохраняем направление ДО потенциального CW-extra-shift'а,
+            # т.к. после него seg0 становится правой стороной (не top line)
+            # и определять направление по нему уже нельзя.
+            _polypath_is_cw = (isinstance(seg0, Line)
+                               and seg0.b[0] > seg0.a[0])
+            if _polypath_is_cw:
                 # Top line идёт слева направо = CW → сдвиг на длину к RT
                 import math as _m_shift
                 top_len = _m_shift.hypot(seg0.b[0] - seg0.a[0], 
@@ -557,9 +562,23 @@ class MtxAndersonGVM(PostProcessor):
         
         if (not is_corner_rework and geom.is_closed and tp.entry.enabled 
                 and abs(_override_offset) > 1e-9):
-            effective_offset = _override_offset
-            if tp.side == ContourSide.INSIDE:
-                effective_offset = -effective_offset
+            # Инвертируем знак offset ПО НАПРАВЛЕНИЮ ПОЛИПАСА (сохранённому
+            # выше в _polypath_is_cw), а не по стороне прохода. Оба прохода
+            # одного ножа наследуют одно направление полипаса, значит должны
+            # получать одинаковый эффективный знак сдвига — тогда оба лида
+            # окажутся симметрично влево от RT по верху ножа.
+            #
+            # Раньше инверсия была `if tp.side == INSIDE`, что работало
+            # только при предпосылке «OUTSIDE=CW, INSIDE=CCW». На реальных
+            # CCW-ножах (пример: 122425 из 41287) это давало асимметрию:
+            # INSIDE попадал куда надо, OUTSIDE уезжал вниз по правой
+            # стороне на -5мм от RT.
+            #
+            # ВАЖНО: направление определяем до CW-extra-shift'а, потому что
+            # после него seg0 становится правой стороной (dx=0), и признак
+            # `seg0.b[0] > seg0.a[0]` перестаёт различать направление.
+            effective_offset = (_override_offset if _polypath_is_cw
+                                else -_override_offset)
             polypath = shift_start_along_contour(polypath, effective_offset)
         
         # ── OVERLAP откладывается до ПОСЛЕ автоподбора ──

@@ -26,7 +26,7 @@ from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 import copy
 
-from ..core.project import Project, Operation
+from ..core.project import Project, Operation, OperationKind
 from ..core.cutting_macro import CuttingMacroParams
 from ..geometry.corner_detect import (
     detect_sharp_corners, classify_corners_for_tooling
@@ -251,9 +251,15 @@ class PackageExporter:
             )
             
             # Группируем операции по program_number
+            # ВАЖНО: FIDUCIAL_DRILL сюда НЕ включаем — drill эмитится
+            # только в _all_R (прямой черновой). Иначе первый _N_M-файл
+            # (тот, что содержит операции с program_number=1) получит
+            # прошивку реперов вдобавок к чистовому проходу.
             from collections import OrderedDict
             prog_groups: "OrderedDict[int, list]" = OrderedDict()
             for op in self.project.operations:
+                if op.kind == OperationKind.FIDUCIAL_DRILL:
+                    continue
                 pn = op.attributes.get('program_number', 1)
                 prog_groups.setdefault(pn, []).append(op)
             
@@ -549,6 +555,17 @@ class PackageExporter:
         for op in prj.operations:
             op.sequence_number = 1
         
+        # Стратегия: DRILL реперов добавляется ТОЛЬКО в прямую черновую
+        # (_all_R). В reverse-программе (_revers_R) реперы уже насверлены
+        # прямой, поэтому здесь их не эмитим — иначе засверлимся дважды.
+        # Убираем существующие FIDUCIAL_DRILL из prj.operations на этом
+        # проходе (в prima ниже они пересобираются заново).
+        if reverse:
+            prj.operations = [
+                op for op in prj.operations
+                if op.kind != OperationKind.FIDUCIAL_DRILL
+            ]
+        
         # Стратегия: DRILL реперов добавляется ТОЛЬКО в прямую черновую.
         # Учитываем что юзер мог отключить конкретные реперы в UI 
         # (per-fiducial FIDUCIAL_DRILL операции сняты галкой). Их 
@@ -608,9 +625,12 @@ class PackageExporter:
                 "SV", comment="No operations for SV check")
         
         # Считаем центры всех операций
+        # ВАЖНО: FIDUCIAL_DRILL пропускаем — SV показывает 4 крайних НОЖА
+        # для контроля сведения, реперы туда не входят.
         from ..core.macros import operation_center
         op_centers = [(op, operation_center(op, self.project))
-                      for op in self.project.operations]
+                      for op in self.project.operations
+                      if op.kind != OperationKind.FIDUCIAL_DRILL]
         # POSITION-хук: см. пояснение в _generate_rough_all
         _ct = getattr(self, '_center_transform', None)
         if _ct is not None:

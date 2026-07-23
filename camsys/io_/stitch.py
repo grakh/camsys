@@ -391,14 +391,50 @@ def analyze_stitch(ai_path: Path, project) -> Optional[StitchInfo]:
                     r.knife_ids.append(g.id)
                     break
     
+    # Привязка реперов к регионам с учётом конвенции макетчика: реперы
+    # ВСЕГДА сидят НИЖЕ своего заказа (min Y региона), в пределах его
+    # X-диапазона. Если репер попадает в область такого «нижнего пояса»
+    # нескольких регионов — выбираем с минимальным Y-зазором. Если ни
+    # один регион не подходит по этому правилу — fallback на ближайший
+    # bbox по Евклиду.
+    #
+    # Почему это важно: между вертикально соседними регионами репер
+    # физически принадлежит ВЕРХНЕМУ (тому, что выше репера в .ai-СК),
+    # даже если по Евклиду ближе край НИЖНЕГО региона. Пример 41287:
+    # FID8(461,255) физически репер 122423 (bbox Y=264..554, репер на
+    # 9мм ниже min Y), но по Евклиду ближе край 122419 (max Y=248,
+    # 7мм выше), из-за чего попадал не в тот регион.
+    X_EPS = 10.0     # мм, допуск на X-выход за границы региона
+    Y_MAX_GAP = 30.0  # мм, макс. зазор «репер под регионом»
     for f in project.fiducials:
+        # Сначала — точный in-bbox
+        exact = None
+        for r in info.regions:
+            if r.contains(f.x, f.y):
+                exact = r
+                break
+        if exact is not None:
+            exact.fiducial_ids.append(f.id)
+            continue
+        # Правило конвенции: репер НИЖЕ min-Y региона с попаданием в X
+        best_r = None
+        best_gap = float('inf')
+        for r in info.regions:
+            x0, y0, x1, y1 = r.bbox
+            in_x = (x0 - X_EPS) <= f.x <= (x1 + X_EPS)
+            below = f.y < y0  # ниже min-Y региона (в .ai-СК Y растёт вверх)
+            if in_x and below:
+                gap = y0 - f.y
+                if gap < Y_MAX_GAP and gap < best_gap:
+                    best_gap = gap
+                    best_r = r
+        if best_r is not None:
+            best_r.fiducial_ids.append(f.id)
+            continue
+        # Fallback: ближайший регион по Евклиду от bbox (старый алгоритм)
         best_r = None
         best_dist = float('inf')
         for r in info.regions:
-            if r.contains(f.x, f.y):
-                best_r = r
-                break
-            # Если репер вне региона — привязываем к ближайшему
             dx = max(r.bbox[0] - f.x, 0, f.x - r.bbox[2])
             dy = max(r.bbox[1] - f.y, 0, f.y - r.bbox[3])
             dist = (dx * dx + dy * dy) ** 0.5
@@ -407,5 +443,5 @@ def analyze_stitch(ai_path: Path, project) -> Optional[StitchInfo]:
                 best_r = r
         if best_r is not None:
             best_r.fiducial_ids.append(f.id)
-    
+
     return info
