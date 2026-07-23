@@ -477,6 +477,15 @@ class PackageExporter:
         # ── Упорядочивание операций ──
         from ..core.macros import operation_center
         centers = {op.id: operation_center(op, prj) for op in prj.operations}
+        # POSITION-хук: если задан self._center_transform, координаты центров
+        # прогоняются через него ПЕРЕД сортировкой. Это позволяет получить
+        # порядок обхода ножей в POSITION-виде (после -90° поворота столбцы
+        # исходной сшивки становятся строками, направление user-setting'а
+        # переносится корректно). Обычный экспорт не задаёт хук, сортировка
+        # идёт по оригинальным центрам как раньше.
+        _ct = getattr(self, '_center_transform', None)
+        if _ct is not None:
+            centers = {op_id: _ct(c) for op_id, c in centers.items()}
         direction = self.params.direction.value  # "horizontal" | "vertical"
         
         if not reverse:
@@ -600,8 +609,12 @@ class PackageExporter:
         
         # Считаем центры всех операций
         from ..core.macros import operation_center
-        op_centers = [(op, operation_center(op, self.project)) 
+        op_centers = [(op, operation_center(op, self.project))
                       for op in self.project.operations]
+        # POSITION-хук: см. пояснение в _generate_rough_all
+        _ct = getattr(self, '_center_transform', None)
+        if _ct is not None:
+            op_centers = [(op, _ct(c)) for op, c in op_centers]
         
         if len(op_centers) <= 4:
             sv_ops = [op for op, _ in op_centers]

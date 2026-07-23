@@ -717,6 +717,14 @@ class CamSession:
         try:
             exporter = PackageExporter(
                 self.project, self.cutting_params, post_name=self.post_name)
+            # POSITION-хук сортировки: центры операций переводятся в
+            # локальную СК заказа ДО сортировки по коридорам. Тогда
+            # user-выбранное направление ("Горизонтально"/"Вертикально")
+            # корректно интерпретируется в системе координат POSITION-файла
+            # (после -90° поворота), и обход ножей не идёт «сверху вниз»
+            # против ожиданий оператора.
+            exporter._center_transform = lambda pt: transform.apply_point(
+                pt[0], pt[1])
             cb = getattr(self, '_progress_callback', None)
             files = exporter.generate(progress_callback=cb)
         finally:
