@@ -79,9 +79,26 @@ class StitchInfo:
     regions: List[OrderRegion] = field(default_factory=list)
     ai_path: Optional[Path] = None
     
-    def get_region_by_order(self, order_number: str) -> Optional[OrderRegion]:
+    def get_region_by_order(self, order_key: str) -> Optional[OrderRegion]:
+        """Найти регион по номеру заказа или композитному ключу «N#i».
+
+        Ключ «N#i» — i-я копия (0-based) заказа N в сшивке. Нужен, когда
+        один и тот же заказ размножен несколькими копиями и у нескольких
+        регионов совпадает `order_number`. Ключ без «#» — обратная
+        совместимость: возвращает первый регион с таким номером.
+        """
+        if order_key and '#' in order_key:
+            base, suffix = order_key.split('#', 1)
+            try:
+                n = int(suffix)
+            except ValueError:
+                return None
+            matches = [r for r in self.regions if r.order_number == base]
+            if 0 <= n < len(matches):
+                return matches[n]
+            return None
         for r in self.regions:
-            if r.order_number == order_number:
+            if r.order_number == order_key:
                 return r
         return None
     
@@ -90,6 +107,32 @@ class StitchInfo:
             if knife_id in r.knife_ids:
                 return r
         return None
+
+
+def order_key_to_filename(order_key: str) -> str:
+    """Преобразовать композитный ключ заказа в файловое имя.
+
+    "121254"    → "121254"       (уникальный номер)
+    "121254#0"  → "121254"       (первая копия — без суффикса, чтобы имена
+                                  папок/файлов не менялись у уникальных)
+    "121254#1"  → "121254_c2"    (2-я копия)
+    "121254#2"  → "121254_c3"    (3-я копия)
+
+    Символ «#» в путях местами работает, местами нет (некоторые
+    контроллеры/скрипты обрезают всё после «#»), поэтому в файловых именах
+    используем «_cN». Индексация в имени 1-based, чтобы оператору читалось
+    как «копия 1/2/3».
+    """
+    if not order_key or '#' not in order_key:
+        return order_key or ''
+    base, suffix = order_key.split('#', 1)
+    try:
+        n = int(suffix)
+    except ValueError:
+        return base
+    if n == 0:
+        return base
+    return f"{base}_c{n + 1}"
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -233,12 +276,14 @@ def _match_orders_to_regions(regions: List[BBox], text_items: List[TextItem],
     order_items = find_text_matching(text_items, orders)
     
     # ЭТАП 1: точный point-in-bbox матчинг
+    # ВАЖНО: НЕ блокируем повторные вхождения одного и того же номера.
+    # Один заказ может лежать в сшивке несколькими КОПИЯМИ — тогда
+    # номер отпечатан столько же раз, и каждая копия должна привязаться
+    # к своему региону. Регионы, наоборот, каждый может быть занят только
+    # одним номером (в списке `result` ключ = idx региона, уникален).
     unmatched_items = []
     for it in order_items:
         if not it.text.isdigit() or it.text not in orders:
-            continue
-        # Уже сопоставили этот номер?
-        if it.text in result.values():
             continue
         # PDF → .ai координаты
         x_ai = it.cx / scale
@@ -255,15 +300,13 @@ def _match_orders_to_regions(regions: List[BBox], text_items: List[TextItem],
                 break
         if not matched:
             unmatched_items.append((it, x_ai, y_ai))
-    
-    # ЭТАП 2: fuzzy fallback — оставшиеся номера привязываем к 
-    # ближайшему НЕ сопоставленному региону по расстоянию до центра. 
-    # Работает если номер отпечатан РЯДОМ с регионом (за его bbox), 
-    # например над рамкой или сбоку. Тогда точный in-bbox не срабатывает, 
+
+    # ЭТАП 2: fuzzy fallback — оставшиеся номера привязываем к
+    # ближайшему НЕ сопоставленному региону по расстоянию до центра.
+    # Работает если номер отпечатан РЯДОМ с регионом (за его bbox),
+    # например над рамкой или сбоку. Тогда точный in-bbox не срабатывает,
     # но ближайший центр региона однозначно определяет привязку.
     for it, x_ai, y_ai in unmatched_items:
-        if it.text in result.values():
-            continue
         best_idx = None
         best_dist = float('inf')
         for idx, bbox in enumerate(regions):
@@ -277,7 +320,7 @@ def _match_orders_to_regions(regions: List[BBox], text_items: List[TextItem],
                 best_idx = idx
         if best_idx is not None:
             result[best_idx] = it.text
-    
+
     return result
 
 

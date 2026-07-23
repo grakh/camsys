@@ -1162,11 +1162,28 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         
         # Сшивка — заполняем комбо ТОЛЬКО заказами (без «Вся сшивка»)
+        # Если один и тот же order_number привязан к нескольким регионам
+        # (в сшивке лежат две+ копии одного заказа), различаем их суффиксом
+        # «(копия N)» в label и составным ключом «N#i» в itemData.
+        from collections import defaultdict
+        counts = defaultdict(int)
         for r in stitch_info.regions:
-            label = r.order_number or f"регион {stitch_info.regions.index(r) + 1}"
+            if r.order_number:
+                counts[r.order_number] += 1
+        seen = defaultdict(int)
+        for i, r in enumerate(stitch_info.regions):
+            on = r.order_number or f"регион {i + 1}"
             n_knives = len(r.knife_ids)
-            display = f"{label} ({n_knives} ножей)"
-            self.params_panel.stitch_combo.addItem(display, label)
+            if r.order_number and counts[r.order_number] > 1:
+                copy_idx = seen[r.order_number]  # 0-based
+                seen[r.order_number] += 1
+                display_label = f"{on} (копия {copy_idx + 1})"
+                item_key = f"{on}#{copy_idx}"
+            else:
+                display_label = on
+                item_key = on
+            display = f"{display_label} ({n_knives} ножей)"
+            self.params_panel.stitch_combo.addItem(display, item_key)
         
         self.params_panel.stitch_combo.setEnabled(True)
         self.params_panel.stitch_combo.blockSignals(False)
@@ -1216,8 +1233,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._apply_stitch_filter(region)
         # Для одиночного заказа фильтр не нужен — все ножи и так его
         
-        # 4. Prefix для экспорта = номер заказа (не имя сшивки!)
-        self.session.cutting_params.output_prefix = order
+        # 4. Prefix для экспорта = номер заказа в файловой форме
+        #    (для копий: "121254_c2" вместо композитного ключа "121254#1")
+        from ..io_.stitch import order_key_to_filename
+        self.session.cutting_params.output_prefix = order_key_to_filename(order)
         
         # 5. Если не было сохранённых настроек — грузим из XML
         if not loaded:
@@ -2152,16 +2171,19 @@ class MainWindow(QtWidgets.QMainWindow):
         current_order = getattr(self, '_current_stitch_order', None)
         stitch_info = getattr(self.session, '_stitch_info', None)
         if current_order and stitch_info:
+            # Файловая форма ключа: "121254" или "121254_c2" — без «#»
+            from ..io_.stitch import order_key_to_filename
+            current_order_fname = order_key_to_filename(current_order)
             ai_path = Path(self.session.project.source_ai_path or "")
             if ai_path.exists():
                 stitch_root = ai_path.parent.parent  # <stitch>/maket/ai → <stitch>
                 candidates = [
-                    stitch_root.parent / f"{current_order}-NC",   # sibling
-                    stitch_root.parent / f"{current_order}_NC",
-                    stitch_root.parent / current_order / "NC",
-                    stitch_root.parent / current_order / f"{current_order}-NC",
-                    stitch_root / f"{current_order}-NC",           # внутри стички
-                    stitch_root / f"{current_order}_NC",
+                    stitch_root.parent / f"{current_order_fname}-NC",   # sibling
+                    stitch_root.parent / f"{current_order_fname}_NC",
+                    stitch_root.parent / current_order_fname / "NC",
+                    stitch_root.parent / current_order_fname / f"{current_order_fname}-NC",
+                    stitch_root / f"{current_order_fname}-NC",           # внутри стички
+                    stitch_root / f"{current_order_fname}_NC",
                 ]
                 # Ищем существующую (приоритет)
                 found = None
@@ -2173,7 +2195,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     nc_dir = found
                 else:
                     # Не нашли — создаём рядом со сшивочной папкой
-                    nc_dir = stitch_root.parent / f"{current_order}-NC"
+                    nc_dir = stitch_root.parent / f"{current_order_fname}-NC"
         
         if nc_dir is not None:
             # Покажем куда будем писать и предупредим про архивацию
@@ -2377,10 +2399,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 title = "Экспорт завершён, POSITION с ошибкой"
             elif pos_result is not None:
                 if pos_result.get('skipped'):
-                    msg += "\n[POSITION] Пропущен:\n"
-                    for w in pos_result.get('warnings', []):
-                        msg += f"  {w}\n"
-                    icon = QtWidgets.QMessageBox.Warning
+                    reason = pos_result.get('skip_reason')
+                    if reason == 'identity':
+                        # LB уже в (0,0) — заказ уже в локальных координатах.
+                        # Это норма (первый заказ сшивки), не тревога.
+                        msg += "\n[POSITION] Не требуется:\n"
+                        for w in pos_result.get('warnings', []):
+                            msg += f"  {w}\n"
+                        # icon остаётся Information
+                    else:
+                        msg += "\n[POSITION] Пропущен:\n"
+                        for w in pos_result.get('warnings', []):
+                            msg += f"  {w}\n"
+                        icon = QtWidgets.QMessageBox.Warning
                 else:
                     pw = pos_result.get('written', [])
                     msg += (f"\n[POSITION] Записано {len(pw)} файлов "

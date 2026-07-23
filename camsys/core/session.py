@@ -601,6 +601,7 @@ class CamSession:
             return {
                 'dir': None, 'archived': [], 'written': [],
                 'transform': None, 'skipped': True,
+                'skip_reason': 'no_fiducials',
                 'warnings': [
                     f"POSITION не создан: у заказа "
                     f"{order_number or '(нет номера)'} нет реперов "
@@ -612,6 +613,31 @@ class CamSession:
         transform = compute_position_transform([lb] if other is None
                                                 else [lb, other])
         pair_ids = {lb.id} if other is None else {lb.id, other.id}
+
+        # ── Identity-случай: LB уже в (0,0) и поворота нет ──
+        # Обычно это первый заказ сшивки (LB=FID1 в (0,0) по конвенции
+        # макетчика). POSITION-трансформ вырождается в тождество, файлы
+        # получились бы байт-в-байт как обычные — писать бессмысленно.
+        IDENTITY_EPS = 0.01  # 10 микрон, безопасный порог
+        if (not transform.rotate_cw90
+                and abs(transform.lb_x) < IDENTITY_EPS
+                and abs(transform.lb_y) < IDENTITY_EPS):
+            return {
+                'dir': None, 'archived': [], 'written': [],
+                'transform': {
+                    'lb_x': transform.lb_x, 'lb_y': transform.lb_y,
+                    'rotate_cw90': False, 'dist': transform.dist,
+                    'pair': ([lb.name] if other is None
+                             else [lb.name, other.name]),
+                },
+                'skipped': True,
+                'skip_reason': 'identity',
+                'warnings': [
+                    f"POSITION для заказа {order_number} пропущен: "
+                    f"LB-репер уже в (0,0), заказ УЖЕ в локальных "
+                    f"координатах — POSITION-файлы совпали бы с обычными."
+                ],
+            }
 
         if other is None:
             warnings_out.append(
@@ -640,8 +666,11 @@ class CamSession:
         self.cutting_params.fiducial_distance = (
             transform.dist if transform.dist is not None else saved_dist)
         if order_number:
-            self.cutting_params.output_prefix = str(order_number)
-            self.project.name = str(order_number)
+            # Файловая форма ключа для prefix'а: "121254#1" → "121254_c2"
+            from ..io_.stitch import order_key_to_filename
+            fname_key = order_key_to_filename(order_number)
+            self.cutting_params.output_prefix = fname_key
+            self.project.name = fname_key
 
         allowed_knife_ids = set(region.knife_ids) if region is not None else None
         allowed_fid_ids_for_filter = (
