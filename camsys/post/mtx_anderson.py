@@ -518,12 +518,19 @@ class MtxAndersonGVM(PostProcessor):
             # Чтобы оба прохода стартовали с RT (как в Alpha), для CW дополнительно
             # сдвигаем на длину top line — попадаем на её правый конец = TR угол.
             seg0 = polypath.segments[0]
-            from ..geometry.primitives import Line
+            from ..geometry.primitives import Line, Arc
             # Сохраняем направление ДО потенциального CW-extra-shift'а,
             # т.к. после него seg0 становится правой стороной (не top line)
             # и определять направление по нему уже нельзя.
-            _polypath_is_cw = (isinstance(seg0, Line)
-                               and seg0.b[0] > seg0.a[0])
+            # Для Line: CW если top идёт L→R. Для Arc (круглые ножи, где
+            # линий вообще нет и `shift_start_to_top_line` не срабатывает):
+            # прямо смотрим на флаг Arc.ccw.
+            if isinstance(seg0, Line):
+                _polypath_is_cw = seg0.b[0] > seg0.a[0]
+            elif isinstance(seg0, Arc):
+                _polypath_is_cw = not seg0.ccw
+            else:
+                _polypath_is_cw = False
             if _polypath_is_cw:
                 # Top line идёт слева направо = CW → сдвиг на длину к RT
                 import math as _m_shift

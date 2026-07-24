@@ -486,7 +486,9 @@ class CamSession:
             shutil.move(str(p), str(old_dir / p.name))
         return str(old_dir)
 
-    def export_package_auto(self, nc_dir_override: Optional[str] = None) -> Dict[str, Any]:
+    def export_package_auto(self, nc_dir_override: Optional[str] = None,
+                            order_number: Optional[str] = None
+                            ) -> Dict[str, Any]:
         """Главный авто-экспорт: папка NC вычисляется из пути .ai, старые .anc
         архивируются в oldN, затем пишутся новые.
 
@@ -499,6 +501,12 @@ class CamSession:
             nc_dir_override: если задан — использует эту папку вместо 
                 автоопределения. Нужно для сшивок (папка = номер заказа, 
                 не имя стички).
+            order_number: если задан — временно применяем stitch-фильтр
+                для этого заказа перед генерацией (как в
+                `export_package_position`), в finally восстанавливаем
+                исходные флаги. Позволяет вызывать экспорт для заказа,
+                отличного от активного в UI, — нужно для батча по
+                нескольким видимым заказам через одну кнопку.
 
         Returns:
             {'dir': папка NC, 'archived': папка oldN или None, 'written': [...]}
@@ -509,33 +517,82 @@ class CamSession:
         if not self.project.operations:
             self.create_blade_operations()
 
-        # 1. Генерация В ПАМЯТЬ (до любых изменений на диске)
-        exporter = PackageExporter(
-            self.project, self.cutting_params, post_name=self.post_name)
-        # Прокидываем progress-callback если он был установлен
-        # (main_window ставит перед вызовом для показа прогресс-диалога)
-        cb = getattr(self, '_progress_callback', None)
-        files = exporter.generate(progress_callback=cb)
-        if not files:
-            raise RuntimeError(
-                "Генератор не вернул ни одного файла. Проверьте, что есть "
-                "активные ножи (галки) и включены типы программ.")
+        # Если задан order_number — временно применяем stitch-фильтр для
+        # этого заказа. Симметрично restore в finally, чтобы live-состояние
+        # UI не сломалось (например, если пользователь смотрит другой заказ,
+        # но батч-экспортит несколько).
+        stitch = getattr(self, '_stitch_info', None)
+        _saved_filtered: Dict[str, Any] = {}
+        _MISSING = object()
+        if order_number and stitch is not None:
+            region = stitch.get_region_by_order(order_number)
+            if region is None:
+                raise RuntimeError(
+                    f"Заказ {order_number} не найден в сшивке")
+            from .project import OperationKind
+            ak = set(region.knife_ids)
+            af = set(region.fiducial_ids)
+            for op in self.project.operations:
+                prev = op.attributes.get('stitch_filtered_out', _MISSING)
+                _saved_filtered[op.id] = prev
+                if op.kind == OperationKind.BLADE_FORMING:
+                    keep = any(g in ak for g in op.geometry_ids)
+                    if not keep:
+                        op.attributes['stitch_filtered_out'] = True
+                    else:
+                        op.attributes.pop('stitch_filtered_out', None)
+                elif op.kind == OperationKind.CORNER_REWORK:
+                    parent = op.attributes.get('parent_geom_id', '')
+                    if parent not in ak:
+                        op.attributes['stitch_filtered_out'] = True
+                    else:
+                        op.attributes.pop('stitch_filtered_out', None)
+                elif op.kind == OperationKind.FIDUCIAL_DRILL:
+                    fid_id = op.attributes.get('fiducial_id', '')
+                    if fid_id not in af:
+                        op.attributes['stitch_filtered_out'] = True
+                    else:
+                        op.attributes.pop('stitch_filtered_out', None)
 
-        # 2. Папка NC и архивация старого (только после успешной генерации)
-        if nc_dir_override:
-            nc = Path(nc_dir_override)
-        else:
-            nc = self.resolve_nc_dir()
-        nc.mkdir(parents=True, exist_ok=True)
-        archived = self._archive_old_anc(nc)
+        try:
+            # 1. Генерация В ПАМЯТЬ (до любых изменений на диске)
+            exporter = PackageExporter(
+                self.project, self.cutting_params, post_name=self.post_name)
+            cb = getattr(self, '_progress_callback', None)
+            files = exporter.generate(progress_callback=cb)
+            if not files:
+                raise RuntimeError(
+                    "Генератор не вернул ни одного файла. Проверьте, что есть "
+                    "активные ножи (галки) и включены типы программ.")
 
-        # 3. Запись новых файлов
-        written_paths = exporter.write_files(str(nc), files)
-        written = [
-            {'path': str(p), 'name': p.name, 'size': p.stat().st_size}
-            for p in written_paths
-        ]
-        return {'dir': str(nc), 'archived': archived, 'written': written}
+            # 2. Папка NC и архивация старого (только после успешной генерации)
+            if nc_dir_override:
+                nc = Path(nc_dir_override)
+            else:
+                nc = self.resolve_nc_dir()
+            nc.mkdir(parents=True, exist_ok=True)
+            archived = self._archive_old_anc(nc)
+
+            # 3. Запись новых файлов
+            written_paths = exporter.write_files(str(nc), files)
+            written = [
+                {'path': str(p), 'name': p.name, 'size': p.stat().st_size}
+                for p in written_paths
+            ]
+            return {'dir': str(nc), 'archived': archived, 'written': written}
+        finally:
+            # Восстанавливаем исходные stitch_filtered_out флаги (если
+            # применяли фильтр под order_number). live-состояние UI
+            # (какой заказ там активен) не должно измениться.
+            if _saved_filtered:
+                for op_id, prev in _saved_filtered.items():
+                    op = self.project.find_operation(op_id)
+                    if op is None:
+                        continue
+                    if prev is _MISSING:
+                        op.attributes.pop('stitch_filtered_out', None)
+                    else:
+                        op.attributes['stitch_filtered_out'] = prev
 
     def export_package_position(self, order_number: Optional[str] = None,
                                 nc_dir_override: Optional[str] = None

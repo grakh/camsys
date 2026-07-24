@@ -2116,6 +2116,56 @@ class MainWindow(QtWidgets.QMainWindow):
             box.setDetailedText(tb)
             box.exec()
 
+    def _orders_to_export(self):
+        """Возвращает список ключей заказов для экспорта: активный первый,
+        далее все `_extra_shown_orders`. Порядок стабильный, дубликатов
+        нет. Если сшивка не активна — возвращает [None] (одиночный
+        режим или дефолт).
+        """
+        stitch = getattr(self.session, '_stitch_info', None)
+        if stitch is None:
+            return [None]
+        active = getattr(self, '_current_stitch_order', None)
+        result = []
+        if active:
+            result.append(active)
+        for key in getattr(self, '_extra_shown_orders', set()):
+            if key and key != active and key not in result:
+                # Проверим что ключ реально существует как регион сшивки
+                if stitch.get_region_by_order(key) is not None:
+                    result.append(key)
+        return result or [None]
+
+    def _resolve_nc_dir_for_order(self, order_key):
+        """Возвращает Path NC-папки для заказа `order_key` по тому же
+        списку кандидатов, что и основной экспорт (первый найденный, иначе
+        конструирует sibling `<order>-NC`). None если не удалось."""
+        if not order_key:
+            try:
+                return self.session.resolve_nc_dir()
+            except Exception:
+                return None
+        from pathlib import Path
+        from ..io_.stitch import order_key_to_filename
+        fname = order_key_to_filename(order_key)
+        ai_path = Path(self.session.project.source_ai_path or "")
+        if not ai_path.exists():
+            return None
+        stitch_root = ai_path.parent.parent
+        candidates = [
+            stitch_root.parent / f"{fname}-NC",
+            stitch_root.parent / f"{fname}_NC",
+            stitch_root.parent / fname / "NC",
+            stitch_root.parent / fname / f"{fname}-NC",
+            stitch_root / f"{fname}-NC",
+            stitch_root / f"{fname}_NC",
+        ]
+        for c in candidates:
+            if c.is_dir():
+                return c
+        # Не нашли — sibling
+        return stitch_root.parent / f"{fname}-NC"
+
     def _do_export(self):
         if not self.session.has_project():
             QtWidgets.QMessageBox.warning(self, "Нет проекта", 
@@ -2179,77 +2229,52 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.statusBar().showMessage("Экспорт отменён", 3000)
                 return
         
-        # ── ОПРЕДЕЛЕНИЕ ПАПКИ NC (авто, по пути .ai) ──
-        # Папка <номер>-NC рядом с .ai. Старые .anc архивируются в oldN.
-        # Если путь .ai неизвестен (проект из сохранённого состояния) —
-        # просим выбрать папку вручную.
+        # ── ПЛАН БАТЧ-ЭКСПОРТА ──
+        # Собираем список заказов, которые будут сохранены: активный
+        # (первым) + все, у кого пути видны на сцене после клика по подписи
+        # (_extra_shown_orders). Для каждого резолвим целевую NC-папку.
         from pathlib import Path
-        nc_dir = None
-        try:
-            nc_dir = self.session.resolve_nc_dir()
-        except Exception as e:
-            QtWidgets.QMessageBox.information(
-                self, "Папка NC не определена",
-                f"{e}\nВыберите папку вручную.")
-        
-        # ── ПОДМЕНА ПАПКИ ДЛЯ СШИВОК ──
-        # Для сшивки resolve_nc_dir возвращает папку с именем стички 
-        # (напр. '41000_121554_121561_121555_-NC'), т.к. знает только имя 
-        # .ai. Но у сшивки ЭКСПОРТИРУЕМ ОДИН ЗАКАЗ — папка должна называться 
-        # по номеру заказа (напр. '121554-NC'). Пробуем найти уже существующую 
-        # папку заказа на 1-2 уровня выше .ai, иначе создаём рядом.
-        current_order = getattr(self, '_current_stitch_order', None)
-        stitch_info = getattr(self.session, '_stitch_info', None)
-        if current_order and stitch_info:
-            # Файловая форма ключа: "121254" или "121254_c2" — без «#»
-            from ..io_.stitch import order_key_to_filename
-            current_order_fname = order_key_to_filename(current_order)
-            ai_path = Path(self.session.project.source_ai_path or "")
-            if ai_path.exists():
-                stitch_root = ai_path.parent.parent  # <stitch>/maket/ai → <stitch>
-                candidates = [
-                    stitch_root.parent / f"{current_order_fname}-NC",   # sibling
-                    stitch_root.parent / f"{current_order_fname}_NC",
-                    stitch_root.parent / current_order_fname / "NC",
-                    stitch_root.parent / current_order_fname / f"{current_order_fname}-NC",
-                    stitch_root / f"{current_order_fname}-NC",           # внутри стички
-                    stitch_root / f"{current_order_fname}_NC",
-                ]
-                # Ищем существующую (приоритет)
-                found = None
-                for c in candidates:
-                    if c.is_dir():
-                        found = c
-                        break
-                if found:
-                    nc_dir = found
-                else:
-                    # Не нашли — создаём рядом со сшивочной папкой
-                    nc_dir = stitch_root.parent / f"{current_order_fname}-NC"
-        
-        if nc_dir is not None:
-            # Покажем куда будем писать и предупредим про архивацию
-            existing = sorted(Path(nc_dir).glob("*.anc")) if Path(nc_dir).is_dir() else []
-            arch_note = (f"\n\nВ папке уже есть {len(existing)} .anc — они будут "
-                         f"перенесены в подпапку old.") if existing else ""
-            box = QtWidgets.QMessageBox(self)
-            box.setIcon(QtWidgets.QMessageBox.Question)
-            box.setWindowTitle("Экспорт пакета")
-            box.setText(f"Писать .anc в папку:\n{nc_dir}{arch_note}")
-            b_ok = box.addButton("Писать сюда", QtWidgets.QMessageBox.AcceptRole)
-            b_other = box.addButton("Другая папка…", QtWidgets.QMessageBox.ActionRole)
-            box.addButton("Отмена", QtWidgets.QMessageBox.RejectRole)
-            box.setDefaultButton(b_ok)
-            box.exec()
-            clicked = box.clickedButton()
-            if clicked is b_other:
-                nc_dir = None  # уйдём в ручной выбор ниже
-            elif clicked is not b_ok:
+        orders = self._orders_to_export()
+        plan = []  # [(order_key, nc_dir_Path or None), ...]
+        for key in orders:
+            plan.append((key, self._resolve_nc_dir_for_order(key)))
+        is_multi = len(plan) > 1
+
+        # ── ПРЕДДИАЛОГ: список заказов и папок ──
+        # Одна кнопка «Экспорт», у одиночного заказа — ещё «Другая папка…».
+        lines = []
+        for key, nc in plan:
+            display = key if key else "(проект)"
+            lines.append(f"  {display}  →  {nc if nc else '?'}")
+        text = ("Будут сохранены следующие заказы:\n\n"
+                + "\n".join(lines))
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Question)
+        box.setWindowTitle("Экспорт пакета")
+        box.setText(text)
+        b_ok = box.addButton("Экспорт", QtWidgets.QMessageBox.AcceptRole)
+        b_other = None
+        if not is_multi:
+            b_other = box.addButton("Другая папка…",
+                                    QtWidgets.QMessageBox.ActionRole)
+        box.addButton("Отмена", QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(b_ok)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is b_other:
+            # Единичный заказ, юзер хочет другую папку
+            chosen = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "Папка для пакета (.anc)", self._last_dir)
+            if not chosen:
                 self.statusBar().showMessage("Экспорт отменён", 3000)
                 return
-        
-        # ── Лог экспорта: пишется РЯДОМ С .ai (где юзер и смотрит) и в дом.
-        # папку, плюс показывается прямо в окне результата (кнопка «Подробнее»).
+            self._last_dir = chosen
+            plan = [(plan[0][0], Path(chosen))]
+        elif clicked is not b_ok:
+            self.statusBar().showMessage("Экспорт отменён", 3000)
+            return
+
+        # ── ЛОГ + ПРОГРЕСС ──
         from pathlib import Path as _P
         import datetime, os as _os
         ai_src = self.session.project.source_ai_path
@@ -2259,206 +2284,161 @@ class MainWindow(QtWidgets.QMainWindow):
         log_targets.append(_P.home() / "camsys_export.log")
 
         def _write_log(text):
-            for lp in log_targets:
+            stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            block = f"\n===== {stamp} =====\n{text}\n"
+            for t in log_targets:
                 try:
-                    prev = lp.read_text(encoding='utf-8') if lp.exists() else ""
-                    lp.write_text(prev + text + "\n", encoding='utf-8')
+                    t.parent.mkdir(parents=True, exist_ok=True)
+                    prev = t.read_text(encoding='utf-8') if t.exists() else ""
+                    t.write_text(prev + block, encoding='utf-8')
                 except Exception:
                     pass
 
-        cp2 = self.session.cutting_params
-        from ..core.project import OperationKind as _OK
-        n_blade = sum(1 for o in self.session.project.operations
-                      if o.kind == _OK.BLADE_FORMING)
-        n_active = sum(1 for o in self.session.project.operations
-                       if o.kind == _OK.BLADE_FORMING
-                       and not o.attributes.get('excluded', False))
         loglines = [
-            f"\n===== ЭКСПОРТ {datetime.datetime.now():%Y-%m-%d %H:%M:%S} =====",
-            f".ai: {ai_src}",
-            f"целевая папка: {nc_dir}",
-            f"ножей всего={n_blade} активно(галка)={n_active}",
-            f"типы файлов: rough={cp2.generate_rough_all} reverse={cp2.generate_reverse} "
-            f"finish={cp2.generate_finish_per_op} sv={cp2.generate_sv} "
-            f"corner={cp2.generate_corner} corner3d={cp2.generate_corner_3d}",
-            f"лог пишется в: {', '.join(str(t) for t in log_targets)}",
+            f"экспорт запущен, заказов в плане: {len(plan)}",
         ]
+        for key, nc in plan:
+            loglines.append(f"  {key or '(проект)'} → {nc}")
 
         def _show(icon, title, text, details):
-            box = QtWidgets.QMessageBox(self)
-            box.setIcon(icon)
-            box.setWindowTitle(title)
-            box.setText(text)
-            box.setDetailedText(details)
-            box.exec()
+            b = QtWidgets.QMessageBox(self)
+            b.setIcon(icon)
+            b.setWindowTitle(title)
+            b.setText(text)
+            if details:
+                b.setDetailedText(details)
+            b.exec()
 
         try:
             self.statusBar().showMessage("Экспорт...")
             QtWidgets.QApplication.processEvents()
-            
-            # ── Прогресс-диалог показывается ТОЛЬКО когда началась 
-            # реальная генерация (после выбора папки). Иначе он 
-            # выскакивал поверх диалога выбора папки и мешал юзеру.
+
             def _make_progress():
                 d = QtWidgets.QProgressDialog(
                     "Генерация файлов...", "Отмена", 0, 100, self)
                 d.setWindowTitle("Экспорт")
                 d.setWindowModality(QtCore.Qt.WindowModal)
-                d.setMinimumDuration(500)
+                d.setMinimumDuration(300)
                 d.setValue(0)
                 return d
-            
-            def _make_callback(dlg):
+
+            def _make_callback(dlg, prefix):
                 def _cb(current, total, stage_name):
                     if dlg.wasCanceled():
                         return False
                     pct = int(current * 100 / max(1, total))
                     dlg.setValue(pct)
                     dlg.setLabelText(
-                        f"Генерация: {stage_name}...  ({current+1}/{total})")
+                        f"{prefix}: {stage_name}... ({current+1}/{total})")
                     QtWidgets.QApplication.processEvents()
                     return True
                 return _cb
-            
-            progress = None
+
+            # ── ЦИКЛ ПО ЗАКАЗАМ ──
+            progress = _make_progress()
+            all_written = []       # аггрегированный список файлов
+            per_order_summary = [] # строки для итогового детального лога
+            n_ok = 0
+            n_err = 0
+            cancelled = False
             try:
-                if nc_dir is not None:
-                    # Папка известна — прогресс сразу, передаём override 
-                    # чтобы session использовал именно эту папку (не 
-                    # resolve_nc_dir которая для сшивки даст стичка_имя-NC)
-                    progress = _make_progress()
-                    self.session._progress_callback = _make_callback(progress)
-                    result = self.session.export_package_auto(
-                        nc_dir_override=str(nc_dir))
-                    written = result['written']
-                    out_dir = result['dir']
-                    archived = result['archived']
-                else:
-                    # Ждём выбора папки
-                    out_dir = QtWidgets.QFileDialog.getExistingDirectory(
-                        self, "Папка для пакета (.anc)", self._last_dir)
-                    if not out_dir:
-                        self.statusBar().showMessage(
-                            "Экспорт отменён — папка не выбрана", 4000)
-                        return
-                    self._last_dir = out_dir
-                    # Папку выбрали — теперь показываем прогресс
-                    progress = _make_progress()
-                    self.session._progress_callback = _make_callback(progress)
-                    written = self.session.export_package(out_dir)
-                    archived = None
+                for i, (order_key, nc_dir) in enumerate(plan):
+                    if progress.wasCanceled():
+                        cancelled = True
+                        break
+                    disp = order_key or "(проект)"
+                    self.session._progress_callback = _make_callback(
+                        progress, f"[{i+1}/{len(plan)}] {disp}")
+                    # Основной пакет
+                    try:
+                        r_main = self.session.export_package_auto(
+                            order_number=order_key,
+                            nc_dir_override=str(nc_dir) if nc_dir else None)
+                        written = r_main.get('written', [])
+                        archived = r_main.get('archived')
+                    except Exception as e_main:
+                        n_err += 1
+                        per_order_summary.append(
+                            f"  {disp}: ОШИБКА — {e_main}")
+                        loglines.append(f"{disp}: ошибка экспорта: {e_main}")
+                        continue
+                    # POSITION-вариант
+                    pos_written_n = 0
+                    pos_note = ""
+                    try:
+                        r_pos = self.session.export_package_position(
+                            order_number=order_key,
+                            nc_dir_override=str(nc_dir) if nc_dir else None)
+                        if r_pos.get('skipped'):
+                            reason = r_pos.get('skip_reason', '')
+                            if reason == 'identity':
+                                pos_note = " POSITION не требуется"
+                            else:
+                                pos_note = f" POSITION пропущен ({reason})"
+                        else:
+                            pos_written_n = len(r_pos.get('written', []))
+                    except Exception as e_pos:
+                        pos_note = f" POSITION ошибка: {e_pos}"
+
+                    all_written.extend(written)
+                    n_ok += 1
+                    per_order_summary.append(
+                        f"  {disp}: {len(written)} файлов + {pos_written_n} POSITION"
+                        f"{pos_note}")
+                    loglines.append(
+                        f"{disp}: main={len(written)} pos={pos_written_n} "
+                        f"dir={nc_dir}")
+                    if archived:
+                        loglines.append(f"  архив → {archived}")
+                    for f in written:
+                        loglines.append(f"    {f['name']}  ({f['size']} б)")
             finally:
                 self.session._progress_callback = None
-                if progress is not None:
-                    progress.setValue(100)
-                    progress.close()
-
-            # ── POSITION-вариант: пишется автоматически рядом, в подпапку
-            #    POSITION/. Заказ вырезается со стички и кладётся на станок
-            #    отдельно — у него локальный (0,0) = LB-репер. Ошибка
-            #    POSITION не должна ломать сообщение о главном экспорте,
-            #    он уже прошёл. Warnings собираем и покажем оператору.
-            pos_result = None
-            pos_error = None
-            if written:  # только если основной экспорт что-то дал
-                try:
-                    pos_order = (current_order
-                                 if current_order and current_order != "_default"
-                                 else None)
-                    pos_nc_override = (
-                        str(nc_dir) if nc_dir is not None else out_dir)
-                    pos_result = self.session.export_package_position(
-                        order_number=pos_order,
-                        nc_dir_override=pos_nc_override)
-                except Exception as e:
-                    import traceback as _tb
-                    pos_error = f"{e}\n{_tb.format_exc()}"
-
-            loglines.append(f"записано файлов: {len(written)}")
-            for f in written:
-                loglines.append(f"   {f['path']}  ({f['size']} б)")
-            if archived:
-                loglines.append(f"старые -> {archived}")
-
-            # ── POSITION в лог ──
-            if pos_error:
-                loglines.append("")
-                loglines.append("POSITION: ошибка")
-                loglines.append(pos_error)
-            elif pos_result is not None:
-                loglines.append("")
-                if pos_result.get('skipped'):
-                    loglines.append("POSITION: пропущен")
-                else:
-                    pw = pos_result.get('written', [])
-                    loglines.append(f"POSITION: записано {len(pw)} файлов")
-                    for f in pw:
-                        loglines.append(f"   {f['path']}  ({f['size']} б)")
-                    t = pos_result.get('transform') or {}
-                    loglines.append(
-                        f"   трансформ: pair={t.get('pair')} "
-                        f"rotate_cw90={t.get('rotate_cw90')} "
-                        f"dist={t.get('dist')}")
-                for w in pos_result.get('warnings', []):
-                    loglines.append(f"   ! {w}")
+                progress.setValue(100)
+                progress.close()
 
             log_text = "\n".join(loglines)
             _write_log(log_text)
-            
-            if not written:
+
+            if cancelled:
+                _show(QtWidgets.QMessageBox.Warning, "Экспорт отменён",
+                      f"Отменено. Успешно до отмены: {n_ok} заказ(ов).",
+                      log_text)
+                self.statusBar().showMessage("Экспорт отменён", 4000)
+                return
+
+            if n_ok == 0:
                 _show(QtWidgets.QMessageBox.Warning, "Ничего не записано",
                       "Экспорт завершился, но не создано ни одного файла.\n"
-                      "Проверьте, включены ли типы программ в панели справа.",
+                      "Проверьте включены ли типы программ и есть ли активные ножи.",
                       log_text)
                 self.statusBar().showMessage("Экспорт: 0 файлов", 4000)
                 return
-            
-            real_dir = _os.path.dirname(_os.path.abspath(written[0]['path']))
-            msg = (f"Записано {len(written)} файлов.\n\nПАПКА:\n{real_dir}\n\n")
-            if archived:
-                msg += f"Старые файлы перенесены в:\n{archived}\n\n"
-            for f in written:
-                msg += f"  {f['name']:<40s} {f['size']:>8} байт\n"
 
-            # ── POSITION в сообщение оператору ──
-            icon = QtWidgets.QMessageBox.Information
-            title = "Экспорт завершён"
-            if pos_error:
-                msg += f"\n[POSITION] Ошибка: {pos_error.splitlines()[0]}\n"
-                icon = QtWidgets.QMessageBox.Warning
-                title = "Экспорт завершён, POSITION с ошибкой"
-            elif pos_result is not None:
-                if pos_result.get('skipped'):
-                    reason = pos_result.get('skip_reason')
-                    if reason == 'identity':
-                        # LB уже в (0,0) — заказ уже в локальных координатах.
-                        # Это норма (первый заказ сшивки), не тревога.
-                        msg += "\n[POSITION] Не требуется:\n"
-                        for w in pos_result.get('warnings', []):
-                            msg += f"  {w}\n"
-                        # icon остаётся Information
-                    else:
-                        msg += "\n[POSITION] Пропущен:\n"
-                        for w in pos_result.get('warnings', []):
-                            msg += f"  {w}\n"
-                        icon = QtWidgets.QMessageBox.Warning
-                else:
-                    pw = pos_result.get('written', [])
-                    msg += (f"\n[POSITION] Записано {len(pw)} файлов "
-                            f"в подпапку POSITION/:\n")
-                    for f in pw:
-                        msg += f"  {f['name']:<40s} {f['size']:>8} байт\n"
-                    warns = pos_result.get('warnings', [])
-                    if warns:
-                        msg += "\n[POSITION] ПРЕДУПРЕЖДЕНИЯ:\n"
-                        for w in warns:
-                            msg += f"  ! {w}\n"
-                        icon = QtWidgets.QMessageBox.Warning
-                        title = ("Экспорт завершён, "
-                                 "POSITION с предупреждениями")
+            # ── ФИНАЛЬНЫЙ ДИАЛОГ: «Готово» + подробности в details ──
+            total_files = len(all_written)
+            headline = f"Готово. Заказов сохранено: {n_ok}"
+            if n_err:
+                headline += f" (ошибок: {n_err})"
+            headline += f". Всего файлов: {total_files}."
+            details_body = "\n".join(per_order_summary)
+            title = ("Экспорт завершён" if n_err == 0
+                     else "Экспорт завершён с ошибками")
+            icon = (QtWidgets.QMessageBox.Information if n_err == 0
+                    else QtWidgets.QMessageBox.Warning)
+            _show(icon, title, headline,
+                  details_body + "\n\n---\n" + log_text)
+            self.statusBar().showMessage(
+                f"Экспортировано: {n_ok} заказ(ов), {total_files} файлов", 5000)
 
-            _show(icon, title, msg, log_text)
-            self.statusBar().showMessage(f"Экспортировано: {len(written)} файлов", 5000)
+            # Пути пересчитались во время экспорта — обновим подписи регионов
+            # (у экспортированных ожидаемо has_paths=True, но кэш путей UI
+            # пополняется через btn_show_paths, а не через session-экспорт;
+            # так что просто refresh безопасен).
+            try:
+                self._refresh_stitch_labels()
+            except Exception:
+                pass
         except Exception as e:
             import traceback
             tb = traceback.format_exc()

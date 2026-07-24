@@ -966,11 +966,16 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         # Направление обхода полипаса — фиксируем ДО потенциального
         # CW-extra-shift'а, т.к. после него seg0 становится правой
         # стороной (dx=0) и признак `seg0.b[0] > seg0.a[0]` перестаёт
-        # различать направление.
+        # различать направление. Для круглых ножей (Arc-only контур)
+        # используем прямой флаг Arc.ccw.
         seg0 = polypath.segments[0]
-        from camsys.geometry.primitives import Line as _LineCls
-        _polypath_is_cw = (isinstance(seg0, _LineCls)
-                           and seg0.b[0] > seg0.a[0])
+        from camsys.geometry.primitives import Line as _LineCls, Arc as _ArcCls
+        if isinstance(seg0, _LineCls):
+            _polypath_is_cw = seg0.b[0] > seg0.a[0]
+        elif isinstance(seg0, _ArcCls):
+            _polypath_is_cw = not seg0.ccw
+        else:
+            _polypath_is_cw = False
 
         # СИММЕТРИЯ INSIDE/OUTSIDE: оба прохода на RT конец top line
         # Для CCW (top line R→L) start уже на TR ✓
