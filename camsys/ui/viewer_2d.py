@@ -202,14 +202,20 @@ class CamScene(QtWidgets.QGraphicsScene):
     # (включить/исключить нож из экспорта). Аргумент — id операции.
     toolpath_right_clicked = QtCore.Signal(str)
     
+    # Сигнал: юзер кликнул подпись региона на сцене. Аргумент — order_key
+    # (композитный ключ типа "121254" или "121254#1"). main_window
+    # переключает видимость путей этого заказа (D3).
+    stitch_label_clicked = QtCore.Signal(str)
+    
     def __init__(self):
         super().__init__()
         self.setBackgroundBrush(QtGui.QColor("#0d0d0d"))  # тёмный как Альфакам
         
         # Соответствие Geometry.id → GeometryItem (для выделения по id)
         self._geom_items: Dict[str, GeometryItem] = {}
-        # Layer.name → список GeometryItem (для управления видимостью)
+        # Пункты сцены по AI-слоям и виртуальный «Регионы» для подписей заказов
         self._layer_items: Dict[str, List[QtWidgets.QGraphicsItem]] = {}
+        self._stitch_label_items: List[QtWidgets.QGraphicsItem] = []
         # id выделенного toolpath (для переопределения lead'а)
         self._selected_op_id: str = ""
         # Флаг: разрешено ли выделение toolpath'ов кликом. Ставится главным 
@@ -249,6 +255,18 @@ class CamScene(QtWidgets.QGraphicsScene):
         if event.button() == QtCore.Qt.LeftButton:
             pos = event.scenePos()
             hit_op_id = ""
+
+            # ── ФАЗА 0: Подписи регионов сшивки (виртуальный слой) ──
+            # Приоритетно, потому что подписи всегда наверху (z=999+).
+            for it in self.items(pos):
+                if it in self._stitch_label_items:
+                    key = it.data(0)
+                    if isinstance(key, str) and key:
+                        self.stitch_label_clicked.emit(key)
+                        event.accept()
+                        return
+                # Только верхний элемент — если это не подпись, идём дальше
+                break
             
             # ── ФАЗА 1: РЕПЕРЫ (FiducialItem) ──
             # Реперы селектим ВСЕГДА (не только в режиме «Выделенные»), 
@@ -363,6 +381,112 @@ class CamScene(QtWidgets.QGraphicsScene):
         self.clear()
         self._geom_items.clear()
         self._layer_items.clear()
+        self._stitch_label_items.clear()
+
+    def add_stitch_labels(self, stitch_info, order_states=None):
+        """Рисует подписи номеров заказов у нижней границы каждого региона.
+
+        Args:
+            stitch_info: StitchInfo с регионами.
+            order_states: dict {order_key: {'has_paths': bool, 'is_shown': bool}}
+                — состояние заказа в сессии. `has_paths=True` = пути
+                уже посчитаны и лежат в кэше `_order_toolpath_items` (тогда
+                подпись зелёная и с ✓). `is_shown=True` = пути этого заказа
+                сейчас видны на сцене (тогда фон подсвечен ярче). Оба флага
+                независимы: юзер может ✓ но скрытый (или наоборот).
+
+        Подписи получают data(0)=order_key — при клике сцена эмитит
+        `stitch_label_clicked(order_key)`.
+        """
+        for item in self._stitch_label_items:
+            self.removeItem(item)
+        self._stitch_label_items.clear()
+
+        if stitch_info is None or not stitch_info.regions:
+            return
+
+        if order_states is None:
+            order_states = {}
+
+        from collections import defaultdict
+        from ..io_.stitch import order_key_to_filename
+        counts = defaultdict(int)
+        for r in stitch_info.regions:
+            if r.order_number:
+                counts[r.order_number] += 1
+        seen = defaultdict(int)
+
+        for i, r in enumerate(stitch_info.regions):
+            on = r.order_number or f"регион {i + 1}"
+            # Композитный ключ для копий (совпадает с dropdown itemData)
+            if r.order_number and counts[r.order_number] > 1:
+                copy_idx = seen[r.order_number]
+                seen[r.order_number] += 1
+                label_base = f"{on} (копия {copy_idx + 1})"
+                order_key = f"{on}#{copy_idx}"
+            else:
+                label_base = on
+                order_key = on
+
+            st = order_states.get(order_key, {})
+            has_paths = bool(st.get('has_paths', False))
+            is_shown = bool(st.get('is_shown', False))
+
+            label_text = label_base + ("  ✓" if has_paths else "")
+
+            # Позиция — центр X региона, у нижней границы (там где L-test)
+            x0, y0, x1, y1 = r.bbox
+            cx = (x0 + x1) / 2.0
+            cy = y0
+
+            font = QtGui.QFont()
+            font.setPointSizeF(9.0)
+            font.setBold(True)
+            text_item = QtWidgets.QGraphicsSimpleTextItem(label_text)
+            text_item.setFont(font)
+            # Цвет:
+            #   зелёный = has_paths (пути посчитаны в сессии)
+            #   белый   = has_paths=False
+            #   is_shown добавляет яркую жёлтую рамку/цвет
+            if is_shown:
+                colour = QtGui.QColor("#ffff00")
+            elif has_paths:
+                colour = QtGui.QColor("#00ff88")
+            else:
+                colour = QtGui.QColor("#ffffff")
+            text_item.setBrush(QtGui.QBrush(colour))
+            text_item.setTransform(QtGui.QTransform().scale(1, -1))
+            br = text_item.boundingRect()
+            text_item.setPos(cx - br.width() / 2.0, cy + br.height() + 2.0)
+            text_item.setZValue(1000)
+            # Кладём order_key на элемент, чтобы поймать клик и понять кого
+            text_item.setData(0, order_key)
+
+            pad = 2.0
+            bg = QtWidgets.QGraphicsRectItem(
+                cx - br.width() / 2.0 - pad,
+                cy + 2.0 - pad,
+                br.width() + 2 * pad,
+                br.height() + 2 * pad,
+            )
+            # Фон: тёмный (обычный) или тёмно-жёлтый (когда показан)
+            if is_shown:
+                bg.setBrush(QtGui.QBrush(QtGui.QColor(80, 60, 0, 220)))
+                bg.setPen(QtGui.QPen(QtGui.QColor("#ffff00"), 0))
+            else:
+                bg.setBrush(QtGui.QBrush(QtGui.QColor(0, 0, 0, 180)))
+                bg.setPen(QtGui.QPen(QtCore.Qt.NoPen))
+            bg.setZValue(999)
+            bg.setData(0, order_key)  # клик по фону тоже должен работать
+
+            self.addItem(bg)
+            self.addItem(text_item)
+            self._stitch_label_items.extend([bg, text_item])
+
+    def set_stitch_labels_visible(self, visible: bool):
+        """Показать/скрыть подписи заказов (виртуальный слой «Регионы»)."""
+        for item in self._stitch_label_items:
+            item.setVisible(visible)
     
     def load_project(self, project: Project):
         """Перезагружает сцену из проекта."""
@@ -839,22 +963,32 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         from camsys.geometry.path_offset import shift_start_to_top_line
         polypath = shift_start_to_top_line(polypath)
         
-        # СИММЕТРИЯ INSIDE/OUTSIDE: оба прохода на RT конец top line
-        # Для CCW (INSIDE) top line идёт RIGHT→LEFT, start = TR ✓
-        # Для CW (OUTSIDE) top line идёт LEFT→RIGHT, start = TL ✗ → сдвигаем 
-        # на длину top line чтобы start стал TR концом. Тогда offset одинаково
-        # сдвигает обе точки старта в одну сторону по верхней грани.
+        # Направление обхода полипаса — фиксируем ДО потенциального
+        # CW-extra-shift'а, т.к. после него seg0 становится правой
+        # стороной (dx=0) и признак `seg0.b[0] > seg0.a[0]` перестаёт
+        # различать направление.
         seg0 = polypath.segments[0]
         from camsys.geometry.primitives import Line as _LineCls
-        if isinstance(seg0, _LineCls) and seg0.b[0] > seg0.a[0]:
+        _polypath_is_cw = (isinstance(seg0, _LineCls)
+                           and seg0.b[0] > seg0.a[0])
+
+        # СИММЕТРИЯ INSIDE/OUTSIDE: оба прохода на RT конец top line
+        # Для CCW (top line R→L) start уже на TR ✓
+        # Для CW  (top line L→R) start на TL → сдвигаем на длину top line
+        # чтобы start стал TR концом.
+        if _polypath_is_cw:
             import math as _m_sym
             top_len = _m_sym.hypot(seg0.b[0] - seg0.a[0], seg0.b[1] - seg0.a[1])
             polypath = shift_start_along_contour(polypath, top_len)
-        
-        # Инверсия знака offset: для INSIDE (CCW) сдвиг -5 без инверсии шёл
-        # бы вниз по правой стороне. Инверсия делает оба прохода идущими от
-        # RT в одну сторону (влево по верху).
-        effective_offset = -user_offset if tp.side == ContourSide.INSIDE else user_offset
+
+        # Инверсия знака offset ПО НАПРАВЛЕНИЮ ПОЛИПАСА (а не по стороне
+        # прохода). Оба прохода одного ножа наследуют одно направление
+        # полипаса, значит должны получать одинаковый эффективный сдвиг
+        # → оба лида окажутся симметрично слева от RT по верху.
+        # Это тот же фикс, что применён в mtx_anderson.py — здесь дублируем
+        # для соответствия визуализации коду .anc.
+        effective_offset = (user_offset if _polypath_is_cw
+                            else -user_offset)
         if abs(effective_offset) > 1e-9:
             polypath = shift_start_along_contour(polypath, effective_offset)
         

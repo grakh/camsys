@@ -72,6 +72,21 @@ class LayerTree(QtWidgets.QTreeWidget):
             
             self.addTopLevelItem(item)
         
+        # Виртуальный слой «Регионы» — подписи номеров заказов над регионами
+        # сшивки. Появляется только если сшивка распознана.
+        stitch_info = getattr(sess, '_stitch_info', None)
+        if stitch_info is not None and len(stitch_info.regions) >= 2:
+            item = QtWidgets.QTreeWidgetItem()
+            item.setText(0, "Регионы")
+            item.setText(1, f"{len(stitch_info.regions)} заказов")
+            item.setData(0, QtCore.Qt.UserRole, "__stitch_labels__")
+            pix = QtGui.QPixmap(14, 14)
+            pix.fill(QtGui.QColor("#ffff88"))
+            item.setIcon(0, QtGui.QIcon(pix))
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(0, QtCore.Qt.Checked)
+            self.addTopLevelItem(item)
+
         self.resizeColumnToContents(0)
         self.resizeColumnToContents(1)
         self._block_signals = False
@@ -1010,6 +1025,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # Правый клик на toolpath — переключить excluded (быстрая замена 
         # галочки в operations-таблице).
         self.scene.toolpath_right_clicked.connect(self._on_toolpath_right_clicked)
+        # Клик по подписи региона на сцене (D3): переключает видимость
+        # путей этого заказа в дополнение к текущему активному.
+        self.scene.stitch_label_clicked.connect(self._on_stitch_label_clicked)
+        # Множество заказов, у которых пути ПОКАЗАНЫ на сцене дополнительно
+        # к активному (управляется через клики по подписям).
+        self._extra_shown_orders: set = set()
         # Прокручиваемая обёртка
         scroll = QtWidgets.QScrollArea()
         scroll.setWidget(self.params_panel)
@@ -1192,7 +1213,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.params_panel.stitch_combo.currentIndexChanged.connect(
                 self._on_stitch_order_changed)
             self._stitch_signal_connected = True
-        
+
+        # Подписи номеров заказов на сцене (виртуальный слой «Регионы»)
+        # с индикатором «пути в кэше» и «сейчас видны на сцене».
+        self._refresh_stitch_labels()
+
         # АВТОВЫБОР первого заказа — применяет фильтр
         self.params_panel.stitch_combo.setCurrentIndex(0)
         # Вызываем handler явно (setCurrentIndex(0) при уже 0 не эмитит сигнал)
@@ -1367,8 +1392,9 @@ class MainWindow(QtWidgets.QMainWindow):
         #    - Если нет → «Построение путей»
         if hasattr(self, '_order_toolpath_items'):
             current = getattr(self, '_current_stitch_order', None) or "_default"
+            extra = getattr(self, '_extra_shown_orders', set())
             for order_name, items in self._order_toolpath_items.items():
-                visible = (order_name == current)
+                visible = (order_name == current) or (order_name in extra)
                 for item in items:
                     item.setVisible(visible)
             current_items = self._order_toolpath_items.get(current, [])
@@ -1377,6 +1403,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"Пересчитать пути ({len(current_items)})")
             else:
                 self.params_panel.btn_show_paths.setText("Пересчитать пути")
+        # После смены активного заказа перерисуем подписи регионов
+        self._refresh_stitch_labels()
     
     def _apply_spec_xml_for_order(self, order_number):
         """Ищет specification_<order>.xml в разных местах.
@@ -2041,6 +2069,8 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             # Кэшируем построенные items под ключом текущего заказа
             self._order_toolpath_items[current_order] = list(self._toolpath_items)
+            # Подписи обновляем — у текущего заказа теперь стоит ✓ (has_paths)
+            self._refresh_stitch_labels()
             progress.setValue(100)
             progress.close()
             
@@ -2509,8 +2539,65 @@ class MainWindow(QtWidgets.QMainWindow):
             self.action_toggle_paths()
     
     def _on_layer_visibility(self, layer_name: str, visible: bool):
+        if layer_name == "__stitch_labels__":
+            # Виртуальный слой «Регионы» — подписи заказов
+            self.scene.set_stitch_labels_visible(visible)
+            return
         self.session.set_layer_visibility(layer_name, visible)
         self.scene.set_layer_visible(layer_name, visible)
+
+    def _refresh_stitch_labels(self):
+        """Перерисовывает подписи с актуальным состоянием заказов:
+        has_paths (пути в кэше) и is_shown (сейчас отображается). Вызывать
+        после смены заказа, пересчёта путей или клика по подписи."""
+        stitch_info = getattr(self.session, '_stitch_info', None)
+        if stitch_info is None:
+            return
+        cached = getattr(self, '_order_toolpath_items', {})
+        current = getattr(self, '_current_stitch_order', None)
+        # Ключи может отличаться от order_number если у заказа несколько
+        # копий (композитный ключ вида "121254#1"). Собираем состояния
+        # для всех ключей из dropdown (order_key берётся из itemData).
+        from collections import defaultdict
+        counts = defaultdict(int)
+        for r in stitch_info.regions:
+            if r.order_number:
+                counts[r.order_number] += 1
+        seen = defaultdict(int)
+        order_states = {}
+        for r in stitch_info.regions:
+            on = r.order_number or ""
+            if on and counts[on] > 1:
+                key = f"{on}#{seen[on]}"
+                seen[on] += 1
+            else:
+                key = on
+            items = cached.get(key, [])
+            has_paths = len(items) > 0
+            is_shown = (key == current) or (key in self._extra_shown_orders)
+            order_states[key] = {'has_paths': has_paths, 'is_shown': is_shown}
+        self.scene.add_stitch_labels(stitch_info, order_states=order_states)
+
+    def _on_stitch_label_clicked(self, order_key: str):
+        """D3: клик по подписи заказа на сцене → переключить видимость
+        путей этого заказа. Активный заказ (из dropdown) всегда показан,
+        клик по его подписи ничего не делает (нельзя «спрятать активного»
+        — для этого сначала выбирают другой в dropdown'е)."""
+        current = getattr(self, '_current_stitch_order', None)
+        if order_key == current:
+            return  # активный заказ не выключается кликом
+        if order_key in self._extra_shown_orders:
+            self._extra_shown_orders.discard(order_key)
+        else:
+            self._extra_shown_orders.add(order_key)
+        # Обновляем видимость всех кэшированных toolpath'ов
+        cached = getattr(self, '_order_toolpath_items', {})
+        for key, items in cached.items():
+            visible = (key == current) or (key in self._extra_shown_orders)
+            for it in items:
+                it.setVisible(visible)
+        # Перерисуем подписи чтобы отразить новое состояние
+        self._refresh_stitch_labels()
 
 
 # ─────────────────────────────────────────────────────────────────────────
