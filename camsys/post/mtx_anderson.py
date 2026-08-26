@@ -504,39 +504,35 @@ class MtxAndersonGVM(PostProcessor):
         if not is_corner_rework and geom.is_closed:
             from ..geometry.path_offset import (
                 shift_start_to_corner, shift_start_to_top_line,
-                shift_start_along_contour)
-            polypath = shift_start_to_corner(polypath, "RT")
-            # Если RT-угол попал на дугу (овал со скруглениями = ширина/высоте),
-            # сдвинуть start к началу ближайшей прямой стороны по обходу,
-            # чтобы offset работал по прямой, а не по скруглению.
-            polypath = shift_start_to_top_line(polypath)
-            
-            # ── СИММЕТРИЯ INSIDE/OUTSIDE: оба прохода на RT конец top line ──
-            # После shift_start_to_top_line старт оказывается на НАЧАЛЕ top line.
-            # Для CCW (INSIDE) это RT угол ✓ (top line идёт RIGHT→LEFT).
-            # Для CW (OUTSIDE) это LT угол ✗ (top line идёт LEFT→RIGHT, начало = TL).
-            # Чтобы оба прохода стартовали с RT (как в Alpha), для CW дополнительно
-            # сдвигаем на длину top line — попадаем на её правый конец = TR угол.
-            seg0 = polypath.segments[0]
-            from ..geometry.primitives import Line, Arc
-            # Сохраняем направление ДО потенциального CW-extra-shift'а,
-            # т.к. после него seg0 становится правой стороной (не top line)
-            # и определять направление по нему уже нельзя.
-            # Для Line: CW если top идёт L→R. Для Arc (круглые ножи, где
-            # линий вообще нет и `shift_start_to_top_line` не срабатывает):
-            # прямо смотрим на флаг Arc.ccw.
-            if isinstance(seg0, Line):
-                _polypath_is_cw = seg0.b[0] > seg0.a[0]
-            elif isinstance(seg0, Arc):
-                _polypath_is_cw = not seg0.ccw
-            else:
-                _polypath_is_cw = False
-            if _polypath_is_cw:
-                # Top line идёт слева направо = CW → сдвиг на длину к RT
-                import math as _m_shift
-                top_len = _m_shift.hypot(seg0.b[0] - seg0.a[0], 
-                                          seg0.b[1] - seg0.a[1])
-                polypath = shift_start_along_contour(polypath, top_len)
+                shift_start_along_contour, shift_start_to_point)
+            from ..geometry.direction import normalize_for_side as _nfs
+            # ── ЕДИНАЯ ТОЧКА СТАРТА ДЛЯ ОБОИХ ПРОХОДОВ ──
+            # Target-точка вычисляется ОДИН раз на референсной CCW-намотке
+            # (независимой от направления текущего прохода), затем оба
+            # прохода ставятся в неё через shift_start_to_point.
+            #
+            # Раньше цепочка была направление-зависимой:
+            #   corner("RT") → top_line → CW-extra-shift (на длину seg0).
+            # На прямоугольниках CW и CCW сходились в RT. Но на формах,
+            # где верхняя грань РАЗОРВАНА дугой на две линии («гантель»
+            # из 41000: левая линия + круг + правая линия), CW-extra-shift
+            # сдвигал на длину ЛЕВОЙ линии и попадал к центру (52.07), а
+            # CCW-проход вставал на правую (174.4) — два прохода одного
+            # ножа заходили в РАЗНЫХ местах при одинаковых полях (-5/-5).
+            _ref = _nfs(geom.polypath, "INSIDE")   # INSIDE = CCW намотка
+            _ref = shift_start_to_corner(_ref, "RT")
+            _ref = shift_start_to_top_line(_ref)
+            _target_pt = _ref.segments[0].a
+            polypath = shift_start_to_point(polypath, _target_pt)
+
+            # Направление полипаса (для инверсии offset ниже) — через
+            # shoelace-сумму по вершинам: надёжно для любой формы, не
+            # зависит от того, каким оказался первый сегмент после разреза
+            # в _target_pt (он может быть коротким остатком линии/дуги).
+            _sh = 0.0
+            for _s in polypath.segments:
+                _sh += (_s.b[0] - _s.a[0]) * (_s.b[1] + _s.a[1])
+            _polypath_is_cw = _sh > 0
         
         # ── СМЕЩЕНИЕ ТОЧКИ СТАРТА ВДОЛЬ КОНТУРА ──
         # Поле «Смещение по» из диалога Cutting / start_offset в EntryExitConfig.
@@ -620,13 +616,31 @@ class MtxAndersonGVM(PostProcessor):
             _side = "OUTSIDE" if tp.side == ContourSide.OUTSIDE else "INSIDE"
             
             if not has_real_3d_corners(polypath, min_tool_radius_mm=min_tool_r):
-                # Безопасно сглаживать
-                polypath = simplify_geometry_via_shapely(polypath, tol_mm=0.1)
-                polypath = smooth_for_offset(polypath, tool_r, _side)
-                # После сглаживания получаем полилинию из мелких Line — 
-                # собираем обратно в дуги где возможно, чтобы NC-файл был 
-                # компактным (одна G3/G2 команда на дугу вместо десятков G1).
-                polypath = merge_segments_to_arcs(polypath, tol=0.02)
+                # ДВУХФАЗНОЕ сглаживание.
+                #
+                # Фаза 1 (проба): вызываем smooth_for_offset на ОРИГИНАЛЕ
+                # без предварительной линеаризации. Он патчит только
+                # физически непроходимые зоны (узкие щели), а проходимые
+                # контуры (круги/овалы) возвращает ТЕМ ЖЕ объектом.
+                _probe = smooth_for_offset(polypath, tool_r, _side)
+                if _probe is polypath:
+                    # Непроходимых мест НЕТ — контур проходим фрезой как
+                    # есть (типичный круг R6.6). НИЧЕГО не трогаем: дуги
+                    # остаются дугами, G42-компенсация работает штатно.
+                    # Так чиним баг «no correction method» — раньше здесь
+                    # simplify_geometry_via_shapely линеаризовал круг в
+                    # полилинию, merge не собирал обратно, и на линиях
+                    # падала компенсация.
+                    pass
+                else:
+                    # Есть непроходимые зоны (щели/карманы) — нужен полный
+                    # pipeline с shapely-линеаризацией и обратной сборкой
+                    # дуг. Здесь линеаризация оправдана: щель физически
+                    # непроходима и всё равно требует перестроения.
+                    polypath = simplify_geometry_via_shapely(
+                        polypath, tol_mm=0.1)
+                    polypath = smooth_for_offset(polypath, tool_r, _side)
+                    polypath = merge_segments_to_arcs(polypath, tol=0.02)
             # else: пропускаем сглаживание — сохраняем 3D углы как есть
         
         # ── ВНУТРЕННЕЕ СГЛАЖИВАНИЕ для NC-эмиссии ──
@@ -1014,11 +1028,36 @@ class MtxAndersonGVM(PostProcessor):
                     forced_side=forced_out_side,
                 )
             
+            # Если у ножа есть ручной lead_override (режим «Выделенные»,
+            # юзер сам задал позицию) — авто-подбор ОТКЛЮЧАЕМ: позиция
+            # юзера закон. Иначе автоподбор «исправлял» ручные значения:
+            # пример 41000 — юзер ставит offset +20, точка попадает на
+            # правую сторону рядом с соседним ножом, avoid перевозил её
+            # обратно на верхнюю линию — «смещается чуть и не в ту
+            # сторону». Коллизия при этом всё равно детектится (флаг
+            # _coll) и подсветится в viewer'е красным.
+            # auto_avoid отключаем если:
+            #  - у ножа есть ручной lead_override («Выделенные»), ИЛИ
+            #  - проект в режиме «Все элементы» (lead_mode==1).
+            # ДОКАЗАНО (41000/121555): при offset=0 и avoid=OFF оба прохода
+            # сходятся в единую target-точку (65.3, 451.7). При avoid=ON
+            # алгоритм РАЗВОДИТ проходы в разные стороны от соседей —
+            # именно поэтому в «Все элементы» заход не вставал на угол
+            # при offset=0. В «Все» юзер расставляет заходы сам, автосдвиг
+            # только мешает — отключаем.
+            _has_user_override = bool(op.attributes.get('lead_override'))
+            _proj_lead_mode = 0
+            try:
+                _proj_lead_mode = int(getattr(project, 'attributes', {})
+                                      .get('lead_mode', 0))
+            except Exception:
+                _proj_lead_mode = 0
+            _no_avoid = _has_user_override or (_proj_lead_mode == 1)
             polypath, _lead_in_poly, _coll, lead_in_geom = plan_lead_in(
                 polypath, req_in,
                 contours_lines_cache, contours_bboxes_cache,
                 geom.id, tool_offset,
-                auto_avoid=True, safety_factor=1.2,
+                auto_avoid=(not _no_avoid), safety_factor=1.2,
                 exit_request=exit_req,
                 overlap=pending_overlap)
             
@@ -1177,8 +1216,18 @@ class MtxAndersonGVM(PostProcessor):
         # Последующие строки без явного G наследуют режим. Это уменьшает 
         # размер .anc в ~2× (у AlphaCAM 232 строки на нож, без modal у нас
         # было 106; с modal ~110 строк на нож).
-        last_g = "G1"  # после lead-in обычно "G1" по факту, но неявно 
-                       # первый arc/line получит явный G-код в любом случае
+        # После lead-in модальный режим станка — G12 (активация
+        # SCLN-компенсации), а НЕ G1. Поэтому ПЕРВЫЙ сегмент тела обязан
+        # нести ЯВНЫЙ G-код (G1 для линии, G2/G3 для дуги) — иначе станок
+        # получает голые координаты после G12 и не может применить
+        # компенсацию к прямому входу:
+        #   «Internal error: no correction method for actual block».
+        # Ставим last_g в None-подобный маркер, чтобы первый сегмент
+        # ГАРАНТИРОВАННО напечатал свой G-код (даже G1 для линии).
+        # РАНЬШЕ здесь было last_g="G1" — и когда первый сегмент контура
+        # линия, g_prefix пустел (last_g уже G1), строка шла без G1 →
+        # компенсация падала на кругах, начинающихся с прямого сегмента.
+        last_g = None  # первый сегмент ВСЕГДА печатает явный G-код
         # ── Комментарии-метки как у эталонного AlphaCAM-постпроцессора ──
         # По стороннему конвейеру (внешние симуляторы/QA-инструменты для
         # Anderson GVM) метки в конце строки идентифицируют роль движения:

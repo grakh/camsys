@@ -594,6 +594,294 @@ class CamSession:
                     else:
                         op.attributes['stitch_filtered_out'] = prev
 
+    def compute_anc_blades(self, order_number: Optional[str] = None
+                           ) -> List[Any]:
+        """Возвращает список BladeBlock'ов, распарсенных из сгенерированного
+        `_all_R.anc`, для полной визуализации из G-code.
+
+        Каждый BladeBlock — один проход ножа (INSIDE или OUTSIDE) с
+        последовательностью движений (approach → plunge → lead-in →
+        body → lead-out → retract). Viewer рисует прямо по этим
+        движениям, без независимого расчёта geometry.
+
+        Args:
+            order_number: если задан — применяет stitch-фильтр под этот
+                заказ (как в compute_anc_tangents).
+
+        Returns:
+            List[BladeBlock]. Каждый блок содержит атрибут `op_id`
+            (сматченный по bbox с BLADE_FORMING операциями проекта).
+        """
+        from ..geometry.anc_movement_parser import parse_anc_movements
+        from .project import OperationKind
+
+        if self.project is None or not self.project.operations:
+            return []
+
+        stitch = getattr(self, '_stitch_info', None)
+        _saved_filtered: Dict[str, Any] = {}
+        _MISSING = object()
+        if order_number and stitch is not None:
+            region = stitch.get_region_by_order(order_number)
+            if region is not None:
+                ak = set(region.knife_ids)
+                af = set(region.fiducial_ids)
+                for op in self.project.operations:
+                    prev = op.attributes.get('stitch_filtered_out', _MISSING)
+                    _saved_filtered[op.id] = prev
+                    if op.kind == OperationKind.BLADE_FORMING:
+                        keep = any(g in ak for g in op.geometry_ids)
+                        if not keep:
+                            op.attributes['stitch_filtered_out'] = True
+                        else:
+                            op.attributes.pop('stitch_filtered_out', None)
+                    elif op.kind == OperationKind.FIDUCIAL_DRILL:
+                        fid_id = op.attributes.get('fiducial_id', '')
+                        if fid_id not in af:
+                            op.attributes['stitch_filtered_out'] = True
+                        else:
+                            op.attributes.pop('stitch_filtered_out', None)
+
+        try:
+            exporter = PackageExporter(
+                self.project, self.cutting_params, post_name=self.post_name)
+            files = exporter.generate()
+            # Парсим ВСЕ .anc файлы пакета, каждому блоку присваиваем kind
+            # (для show_filter) и program (для цветовой раскраски):
+            #   _all_R.anc → kind='rough',    program='rough'
+            #   _N_M.anc  → kind='finish',   program='finish_N' (уникальный по N)
+            #   _corner.anc → kind='corner_2d', program='corner_2d' (тонкой 2D-фрезой)
+            #   _corner3D.anc → kind='corner_3d', program='corner_3d' (3D-фрезой)
+            #   _SV.anc → kind='drill', program='drill' (4 угловых сверления)
+            #   _revers_R.anc → skip (реверс = дубликат all_R в обратном направлении)
+            blocks = []
+            import re as _re
+            for name, content in files.items():
+                if '_all_R.anc' in name:
+                    kind = 'rough'
+                    program = 'rough'
+                elif '_corner3D.anc' in name:
+                    kind = 'corner_3d'
+                    program = 'corner_3d'
+                elif '_corner.anc' in name:
+                    kind = 'corner_2d'
+                    program = 'corner_2d'
+                elif '_SV.anc' in name:
+                    kind = 'drill'
+                    program = 'drill'
+                elif '_M.anc' in name:
+                    kind = 'finish'
+                    m_match = _re.search(r'_(\d+)_M\.anc', name)
+                    program = f'finish_{m_match.group(1)}' if m_match else 'finish'
+                else:
+                    continue  # revers_R и др.
+                try:
+                    file_blocks = parse_anc_movements(content)
+                except Exception:
+                    continue
+                for b in file_blocks:
+                    b.kind = kind
+                    b.program = program
+                    blocks.append(b)
+            if not blocks:
+                return []
+            # Матчим каждый блок с ближайшей op'ой по bbox
+            # (INSIDE и OUTSIDE проходы одного ножа получат одну op)
+            ops_with_bbox = []
+            for op in self.project.operations:
+                if op.kind != OperationKind.BLADE_FORMING:
+                    continue
+                if op.attributes.get('stitch_filtered_out'):
+                    continue
+                if op.attributes.get('excluded'):
+                    continue
+                geom_id = op.geometry_ids[0] if op.geometry_ids else None
+                if not geom_id:
+                    continue
+                geom = self.project.get_geometry(geom_id)
+                if geom is None or geom.polypath is None:
+                    continue
+                segs = geom.polypath.segments
+                if not segs:
+                    continue
+                xs, ys = [], []
+                for s in segs:
+                    xs.extend([s.a[0], s.b[0]])
+                    ys.extend([s.a[1], s.b[1]])
+                ops_with_bbox.append(
+                    (op.id, (min(xs), min(ys), max(xs), max(ys))))
+            for b in blocks:
+                bb = b.bbox()
+                if bb is None:
+                    b.op_id = None
+                    continue
+                cx = (bb[0] + bb[2]) / 2
+                cy = (bb[1] + bb[3]) / 2
+                best = None
+                for op_id, (x0, y0, x1, y1) in ops_with_bbox:
+                    if x0 <= cx <= x1 and y0 <= cy <= y1:
+                        best = op_id
+                        break
+                b.op_id = best
+            return blocks
+        except Exception:
+            return []
+        finally:
+            if _saved_filtered:
+                for op_id, prev in _saved_filtered.items():
+                    op = self.project.find_operation(op_id)
+                    if op is None:
+                        continue
+                    if prev is _MISSING:
+                        op.attributes.pop('stitch_filtered_out', None)
+                    else:
+                        op.attributes['stitch_filtered_out'] = prev
+
+    def compute_anc_tangents(self, order_number: Optional[str] = None,
+                             only_op_id: Optional[str] = None
+                             ) -> Dict[str, Any]:
+        """Возвращает точки касания лид-in контурам, извлечённые из
+        реально сгенерированного .anc-файла.
+
+        Использование: viewer вызывает этот метод перед построением
+        визуализации toolpath'ов, чтобы заменить свой самопальный
+        расчёт тангенса на тот, который реально попадёт в станок.
+        Гарантирует визуальное совпадение viewer'а с G-code.
+
+        Реализация:
+          1. Генерирует пакет в память (без записи на диск).
+          2. Парсит `_all_R.anc` через `parse_anc_leads`.
+          3. Матчит тангенсы с BLADE_FORMING операциями по попаданию
+             в bbox их полипасов.
+
+        Args:
+            order_number: если задан — применяет stitch-фильтр для
+                этого заказа. Иначе — весь проект.
+            only_op_id: если задан — считает тангенс ТОЛЬКО для этого
+                ножа (остальные BLADE временно исключаются из генерации).
+                Резко ускоряет пересчёт при правке одного выделенного
+                элемента: пакет содержит один нож вместо всех.
+                ВАЖНО: auto_avoid этого ножа по-прежнему видит СОСЕДЕЙ
+                через contours_cache (коллизии считаются корректно) —
+                исключаются только из ГЕНЕРАЦИИ тела программы, но
+                геометрия соседей остаётся в проекте для проверки
+                пересечений.
+
+        Returns:
+            {op_id: [(tangent_x, tangent_y), ...]} — тангенсы по проходам.
+            Пустой dict если .anc не смог сгенерироваться.
+        """
+        from ..geometry.anc_lead_trace import (
+            parse_anc_leads, match_tangents_to_ops)
+        from .project import OperationKind
+
+        if self.project is None or not self.project.operations:
+            return {}
+
+        # Временный stitch-фильтр (как в export_package_auto).
+        stitch = getattr(self, '_stitch_info', None)
+        _saved_filtered: Dict[str, Any] = {}
+        _MISSING = object()
+        if order_number and stitch is not None:
+            region = stitch.get_region_by_order(order_number)
+            if region is not None:
+                ak = set(region.knife_ids)
+                af = set(region.fiducial_ids)
+                for op in self.project.operations:
+                    prev = op.attributes.get('stitch_filtered_out', _MISSING)
+                    _saved_filtered[op.id] = prev
+                    if op.kind == OperationKind.BLADE_FORMING:
+                        keep = any(g in ak for g in op.geometry_ids)
+                        if not keep:
+                            op.attributes['stitch_filtered_out'] = True
+                        else:
+                            op.attributes.pop('stitch_filtered_out', None)
+                    elif op.kind == OperationKind.FIDUCIAL_DRILL:
+                        fid_id = op.attributes.get('fiducial_id', '')
+                        if fid_id not in af:
+                            op.attributes['stitch_filtered_out'] = True
+                        else:
+                            op.attributes.pop('stitch_filtered_out', None)
+
+        # ── SINGLE-KNIFE фильтр (only_op_id) ──
+        # Исключаем из ГЕНЕРАЦИИ все BLADE кроме целевого — пакет строится
+        # для одного ножа, пересчёт мгновенный. Сохраняем прежнее
+        # состояние stitch_filtered_out чтобы восстановить после.
+        _saved_single: Dict[str, Any] = {}
+        if only_op_id:
+            for op in self.project.operations:
+                if op.kind != OperationKind.BLADE_FORMING:
+                    continue
+                if op.id == only_op_id:
+                    continue
+                # Уже сохранён в _saved_filtered? если да — не перетираем
+                if op.id not in _saved_filtered:
+                    _saved_single[op.id] = op.attributes.get(
+                        'stitch_filtered_out', _MISSING)
+                op.attributes['stitch_filtered_out'] = True
+
+        try:
+            exporter = PackageExporter(
+                self.project, self.cutting_params, post_name=self.post_name)
+            files = exporter.generate()
+            all_r_content = None
+            for name, content in files.items():
+                if '_all_R.anc' in name:
+                    all_r_content = content
+                    break
+            if all_r_content is None:
+                return {}
+            tangents = parse_anc_leads(all_r_content)
+            if not tangents:
+                return {}
+            # Собираем bbox'ы для активных BLADE_FORMING операций
+            ops_with_bbox = []
+            for op in self.project.operations:
+                if op.kind != OperationKind.BLADE_FORMING:
+                    continue
+                if op.attributes.get('stitch_filtered_out'):
+                    continue
+                if op.attributes.get('excluded'):
+                    continue
+                geom_id = op.geometry_ids[0] if op.geometry_ids else None
+                if not geom_id:
+                    continue
+                geom = self.project.get_geometry(geom_id)
+                if geom is None or geom.polypath is None:
+                    continue
+                segs = geom.polypath.segments
+                if not segs:
+                    continue
+                xs, ys = [], []
+                for s in segs:
+                    xs.extend([s.a[0], s.b[0]])
+                    ys.extend([s.a[1], s.b[1]])
+                ops_with_bbox.append(
+                    (op.id, (min(xs), min(ys), max(xs), max(ys))))
+            return match_tangents_to_ops(tangents, ops_with_bbox)
+        except Exception:
+            return {}
+        finally:
+            if _saved_filtered:
+                for op_id, prev in _saved_filtered.items():
+                    op = self.project.find_operation(op_id)
+                    if op is None:
+                        continue
+                    if prev is _MISSING:
+                        op.attributes.pop('stitch_filtered_out', None)
+                    else:
+                        op.attributes['stitch_filtered_out'] = prev
+            # Восстанавливаем single-knife фильтр (only_op_id)
+            if _saved_single:
+                for op_id, prev in _saved_single.items():
+                    op = self.project.find_operation(op_id)
+                    if op is None:
+                        continue
+                    if prev is _MISSING:
+                        op.attributes.pop('stitch_filtered_out', None)
+                    else:
+                        op.attributes['stitch_filtered_out'] = prev
+
     def export_package_position(self, order_number: Optional[str] = None,
                                 nc_dir_override: Optional[str] = None
                                 ) -> Dict[str, Any]:

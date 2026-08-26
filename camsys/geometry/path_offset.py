@@ -413,6 +413,78 @@ def distance_along_polypath(polypath: Polypath, point: Point) -> float:
     return best_acc
 
 
+def shift_start_to_point(polypath: Polypath,
+                         target,
+                         samples_per_seg: int = 32) -> Polypath:
+    """Сдвигает начало контура к точке на контуре, ближайшей к `target`.
+
+    Используется, когда точка касания лид-in известна извне (например,
+    извлечена из .anc-файла эмиттера) — приводим полипас к тому же
+    состоянию, что был бы после явных shift'ов viewer'а, но гарантированно
+    в ту же точку что видит эмиттер.
+
+    Двухэтапный поиск:
+      1. Грубый сэмпл (`samples_per_seg` точек на сегмент) — находим
+         лучший сегмент и параметр t.
+      2. Бинарное уточнение вокруг найденной точки на ~40 итераций —
+         точность до 1e-6 длины сегмента (микроны для типового ножа).
+    Уточнение критично для контуров, состоящих целиком из дуг
+    (звёздочки, ёлки, круги): большие дуги имеют длину десятки мм,
+    сэмпл 1/32 = 1-2мм промах, из-за чего лид рисуется под кривым углом
+    и визуально пересекает соседний контур.
+
+    Args:
+        polypath: закрытый Polypath.
+        target: (tx, ty) — искомая точка.
+        samples_per_seg: N — плотность грубого сэмплирования (32 хватает).
+
+    Returns:
+        Новый Polypath, стартующий в ближайшей точке контура к target.
+    """
+    if not polypath.segments:
+        return polypath
+    tx, ty = target
+    # Этап 1: грубый сэмпл
+    best_seg_idx = 0
+    best_seg_t = 0.0
+    best_dist_sq = float('inf')
+    for i, seg in enumerate(polypath.segments):
+        for k in range(samples_per_seg + 1):
+            t = k / samples_per_seg
+            px, py = seg.point_at(t)
+            d = (px - tx) * (px - tx) + (py - ty) * (py - ty)
+            if d < best_dist_sq:
+                best_dist_sq = d
+                best_seg_idx = i
+                best_seg_t = t
+    # Этап 2: бинарное уточнение на найденном сегменте
+    #   ищем локальный минимум расстояния к target внутри окна
+    #   [t - 1/N, t + 1/N] через 40 итераций золотого сечения.
+    seg = polypath.segments[best_seg_idx]
+    window = 1.0 / samples_per_seg
+    lo = max(0.0, best_seg_t - window)
+    hi = min(1.0, best_seg_t + window)
+    # золотое сечение
+    phi = (5 ** 0.5 - 1) / 2  # ≈ 0.618
+    def _dist_sq(t):
+        px, py = seg.point_at(t)
+        return (px - tx) ** 2 + (py - ty) ** 2
+    for _ in range(40):
+        a = hi - phi * (hi - lo)
+        b = lo + phi * (hi - lo)
+        if _dist_sq(a) < _dist_sq(b):
+            hi = b
+        else:
+            lo = a
+    best_seg_t = (lo + hi) / 2.0
+    # Arc-length от start до найденной точки
+    total = 0.0
+    for i in range(best_seg_idx):
+        total += polypath.segments[i].length()
+    total += polypath.segments[best_seg_idx].length() * best_seg_t
+    return shift_start_along_contour(polypath, total)
+
+
 def shift_start_to_top_line(polypath: Polypath) -> Polypath:
     """Сдвигает старт к началу САМОЙ ВЕРХНЕЙ прямой стороны контура.
     
@@ -832,6 +904,78 @@ def offset_polypath_simple(polypath: Polypath, offset: float,
     return Polypath(segments=new_segments, closed=polypath.closed)
 
 
+def offset_polypath_toward_body(polypath: Polypath, offset: float,
+                                parent_is_cw: bool) -> Polypath:
+    """Оффсет открытого фрагмента в сторону ТЕЛА контура по ЛОКАЛЬНОЙ
+    нормали (winding-based). В отличие от offset_polypath_toward_center,
+    корректно работает на ВОГНУТЫХ углах — там глобальный центр bbox
+    смотрит наружу от локального тела, а локальная нормаль всегда верна.
+
+    Направление тела определяется намоткой родительского контура:
+      - CW-намотка (parent_is_cw=True): тело СПРАВА от направления
+        обхода. Right-нормаль = (dy, -dx)/|d| для линии; для дуги —
+        к центру если ccw, от центра если cw.
+      - CCW-намотка: тело слева, нормаль инвертируется.
+
+    Args:
+        polypath: открытый фрагмент (corner subpath).
+        offset: величина смещения (положительная, всегда к телу).
+        parent_is_cw: намотка родительского контура (shoelace > 0).
+
+    Returns:
+        Смещённый Polypath.
+    """
+    if not polypath or not polypath.segments or abs(offset) < 1e-9:
+        return polypath
+    import math
+    d_abs = abs(offset)
+    # Знак: для CW тело справа → сдвигаем по right-нормали (dy,-dx).
+    # right-normal-sign: +1 = right perp, -1 = left perp.
+    right_sign = 1.0 if parent_is_cw else -1.0
+    new_segments: List[Segment] = []
+    for seg in polypath.segments:
+        if isinstance(seg, Line):
+            dx = seg.b[0] - seg.a[0]
+            dy = seg.b[1] - seg.a[1]
+            d = math.hypot(dx, dy)
+            if d < 1e-9:
+                new_segments.append(seg)
+                continue
+            # right perp = (dy, -dx)/d
+            nx = right_sign * dy / d
+            ny = right_sign * (-dx) / d
+            a2 = (seg.a[0] + nx * d_abs, seg.a[1] + ny * d_abs)
+            b2 = (seg.b[0] + nx * d_abs, seg.b[1] + ny * d_abs)
+            new_segments.append(Line(a2, b2))
+        elif isinstance(seg, Arc):
+            # Для дуги сдвиг к телу = изменение радиуса. Тело справа (CW):
+            #   - ccw-дуга: центр слева от движения → тело справа = наружу
+            #     от центра → R растёт.
+            #   - cw-дуга: центр справа → тело справа = к центру → R
+            #     уменьшается.
+            cx, cy = seg.center
+            r = math.hypot(seg.a[0] - cx, seg.a[1] - cy)
+            # Определяем, с какой стороны от направления движения центр.
+            # Для ccw центр слева, для cw центр справа.
+            body_is_toward_center = (seg.ccw and not parent_is_cw) or \
+                                     (not seg.ccw and parent_is_cw)
+            if body_is_toward_center:
+                new_r = r - d_abs
+            else:
+                new_r = r + d_abs
+            if new_r < 1e-6:
+                # Вырожденная дуга — заменяем линией
+                new_segments.append(Line(seg.a, seg.b))
+                continue
+            scale = new_r / r
+            a2 = (cx + (seg.a[0] - cx) * scale, cy + (seg.a[1] - cy) * scale)
+            b2 = (cx + (seg.b[0] - cx) * scale, cy + (seg.b[1] - cy) * scale)
+            new_segments.append(Arc(a2, b2, (cx, cy), seg.ccw))
+        else:
+            new_segments.append(seg)
+    return Polypath(new_segments)
+
+
 def offset_polypath_toward_center(polypath: Polypath, offset: float,
                                     center: Point) -> Polypath:
     """Оффсет каждого сегмента к центру (положительный offset) или от 
@@ -1190,6 +1334,117 @@ def offset_polypath_shapely_clean(polypath: Polypath, offset: float,
         return offset_polypath_uniform(polypath, offset, inward)
 
 
+def find_equidistant_kinks(equidistant: Polypath,
+                           source_polypath: Polypath = None,
+                           small_arc_max_mm: float = 2.0,
+                           cusp_angle_deg: float = 60.0,
+                           max_loop_segs: int = 6):
+    """Ищет ИЗЛОМЫ на уже построенной эквидистанте — точки, где нужен
+    угловой рез. Возвращает список изломов с классификацией 2D/3D.
+
+    Подход (по идее юзера): эквидистанта уже построена от КОНКРЕТНОГО
+    пути (внутр./внешн.), значит направление смещения зашито в ней.
+    Излом = место, где эквидистанта:
+      • САМОПЕРЕСЕКАЕТСЯ (петля) — фреза не проходит, острый внешний
+        угол свернулся в петлю, ИЛИ
+      • даёт ОСТРИЁ (cusp) — резкий разворот направления > порога.
+    Там нужен угловой рез. Сторона/направление лида уже правильные,
+    т.к. взят путь с определённым смещением.
+
+    Классификация 2D/3D — по исходной геометрии рядом с изломом:
+      • есть дуга малого R (< small_arc_max_mm) → 2D (скругление)
+      • иначе → 3D (острый стык)
+
+    Args:
+        equidistant: построенная эквидистанта пути (offset).
+        source_polypath: исходный контур (для классификации 2D/3D).
+        small_arc_max_mm: порог радиуса дуги для 2D.
+        cusp_angle_deg: порог остриё (поворот направления, град).
+        max_loop_segs: макс. длина петли самопересечения.
+
+    Returns:
+        list of dict: [{'point': (x,y), 'kind': '2D'|'3D',
+                        'type': 'loop'|'cusp'}]
+    """
+    result = []
+    if not equidistant or len(equidistant.segments) < 2:
+        return result
+    segs = equidistant.segments
+    n = len(segs)
+
+    # ── 1. САМОПЕРЕСЕЧЕНИЯ (петли) ──
+    seen_pts = []
+    for i in range(n):
+        s1 = segs[i]
+        for delta in range(2, min(max_loop_segs + 1, n - 1)):
+            j = (i + delta) % n
+            if j == i:
+                continue
+            if (j + 1) % n == i:
+                continue
+            s2 = segs[j]
+            hit = _segment_chord_intersect(s1, s2)
+            if hit is not None:
+                _t1, _t2, ix, iy = hit
+                # дедуп близких точек
+                if any(math.hypot(ix - px, iy - py) < 0.05
+                       for px, py in seen_pts):
+                    continue
+                seen_pts.append((ix, iy))
+                result.append({'point': (ix, iy), 'type': 'loop',
+                               'kind': None})
+
+    # ── 2. ОСТРИЯ (cusp): резкий разворот направления в вершине ──
+    verts = list(range(n - 1))
+    if equidistant.closed:
+        verts.append(n - 1)
+    for vi in verts:
+        s1 = segs[vi]
+        s2 = segs[(vi + 1) % n]
+        try:
+            t1 = s1.tangent_at_end()
+            t2 = s2.tangent_at_start()
+        except Exception:
+            continue
+        d1 = math.hypot(t1[0], t1[1])
+        d2 = math.hypot(t2[0], t2[1])
+        if d1 < 1e-9 or d2 < 1e-9:
+            continue
+        t1 = (t1[0] / d1, t1[1] / d1)
+        t2 = (t2[0] / d2, t2[1] / d2)
+        dot = max(-1.0, min(1.0, t1[0] * t2[0] + t1[1] * t2[1]))
+        turn = math.degrees(math.acos(dot))
+        if turn >= cusp_angle_deg:
+            pt = s1.b
+            if any(math.hypot(pt[0] - px, pt[1] - py) < 0.05
+                   for px, py in seen_pts):
+                continue
+            seen_pts.append(pt)
+            result.append({'point': pt, 'type': 'cusp', 'kind': None})
+
+    # ── 3. Классификация 2D/3D по исходной геометрии рядом с изломом ──
+    if source_polypath and source_polypath.segments:
+        for kink in result:
+            kx, ky = kink['point']
+            near_small_arc = False
+            for s in source_polypath.segments:
+                if isinstance(s, Arc) and s.radius < small_arc_max_mm:
+                    # дистанция от излома до дуги (грубо — до концов/центра)
+                    for probe in (s.a, s.b):
+                        if math.hypot(kx - probe[0], ky - probe[1]) < \
+                                small_arc_max_mm + 1.0:
+                            near_small_arc = True
+                            break
+                if near_small_arc:
+                    break
+            kink['kind'] = '2D' if near_small_arc else '3D'
+    else:
+        for kink in result:
+            kink['kind'] = '3D'
+
+    return result
+
+
 def _segment_chord_intersect(s1, s2, eps: float = 1e-6):
     """Пересечение хорд (a-b) двух сегментов.
     
@@ -1530,29 +1785,37 @@ def has_real_3d_corners(polypath: Polypath,
 def smooth_for_offset(polypath: Polypath, tool_offset: float, side: str,
                       chord_err_mm: float = 0.002) -> Polypath:
     """Сглаживает осевую так, чтобы её эквидистанта (offset фрезы на
-    tool_offset) НЕ самопересекалась.
+    tool_offset) была физически проходима фрезой.
 
-    Тугие места, куда фреза радиуса tool_offset не входит, скругляются ровно
-    до проходимого радиуса (морфологическое замыкание для OUTSIDE / размыкание
-    для INSIDE). Прямые и пологие участки сохраняются (отклонение микроны).
-    Также убирает «веера» компенсации на биарк-кластерах (осевая становится
-    чистой ломаной без чередующихся мелких дуг).
+    ПРИНЦИП (переработан): shapely-морфология используется ТОЛЬКО как
+    ДЕТЕКТОР тугих мест. Контур патчится точечно:
+      - Сегменты, которые морфология НЕ изменила (расстояние всех сэмплов
+        до morph-границы < tol) — остаются ОРИГИНАЛЬНЫМИ Line/Arc.
+        Окружность остаётся окружностью (одна G2/G3 дуга в .anc), прямые
+        остаются прямыми. НИКАКИХ «мелких волн» на гладких местах.
+      - Непрерывные кластеры изменённых сегментов (реальные углы и
+        вогнутости/выпуклости туже радиуса фрезы) — заменяются участком
+        morph-границы (короткая ломаная скругления).
 
-    Требует shapely. Если его нет — возвращает исходный контур без изменений.
+    Морфология (соответствует направлению offset стороны):
+      INSIDE  смещается НАРУЖУ (+) → замыкание buffer(+T,-T)
+      OUTSIDE смещается ВНУТРЬ (−) → размыкание buffer(-T,+T)
+
+    Требует shapely. Если его нет — возвращает исходный контур.
 
     Args:
         polypath: осевая (уже с нужной намоткой под сторону)
-        tool_offset: эквидистанта фрезы (мм), радиус, на который offset
-        side: 'OUTSIDE' (замыкание) или 'INSIDE' (размыкание)
-        chord_err_mm: точность дискретизации дуг
+        tool_offset: эквидистанта фрезы (мм)
+        side: 'OUTSIDE' или 'INSIDE'
+        chord_err_mm: точность дискретизации дуг при сэмплировании
 
     Returns:
-        Сглаженный Polypath (ломаная из Line). Намотка и старт сохранены.
+        Polypath: оригинальные сегменты + локальные заплатки в тугих местах.
     """
     if not polypath or len(polypath.segments) < 3 or tool_offset <= 1e-6:
         return polypath
     try:
-        from shapely.geometry import Polygon
+        from shapely.geometry import Polygon, Point
     except Exception:
         return polypath  # shapely не установлен — без сглаживания
 
@@ -1565,98 +1828,230 @@ def smooth_for_offset(polypath: Polypath, tool_offset: float, side: str,
             poly = poly.buffer(0)
         T = tool_offset
         up = str(side).upper()
-        # Морфология должна соответствовать НАПРАВЛЕНИЮ offset стороны:
-        #   INSIDE  смещается НАРУЖУ (+) → замыкание (buffer +T,-T): скругляет
-        #           вогнутые места уже радиуса фрезы.
-        #   OUTSIDE смещается ВНУТРЬ (−) → размыкание (buffer -T,+T): скругляет
-        #           выпуклые места уже радиуса фрезы.
-        # (См. gcomp/viewer: оба прохода = G41, внутр.+ / внешн.−)
-        if up == 'OUTSIDE':
-            corrected = poly.buffer(-T, join_style=1, quad_segs=24).buffer(
-                T, join_style=1, quad_segs=24)
-        else:  # INSIDE / прочее
-            corrected = poly.buffer(T, join_style=1, quad_segs=24).buffer(
-                -T, join_style=1, quad_segs=24)
+        # ЗАМЫКАНИЕ (closing): закрывает узкие ВЫЕМКИ (пазы/щели уже 2T),
+        # в которые фреза, идущая центром по осевой, физически не входит
+        # (тело задевает противоположную стенку). Направление side здесь
+        # НЕ важно: заплатки берутся ТОЛЬКО в зонах, помеченных
+        # физическим детектором ниже; проходимые места (выступы, острые
+        # языки, реальные углы) детектор не метит и closing их не тронет.
+        corrected = poly.buffer(T, join_style=1, quad_segs=24).buffer(
+            -T, join_style=1, quad_segs=24)
         if corrected.is_empty:
             return polypath
         if corrected.geom_type == 'MultiPolygon':
             corrected = max(corrected.geoms, key=lambda p: p.area)
-        # Упрощаем результат: убираем избыточные вершины (прямые остаются
-        # прямыми, кривые — в пределах допуска), чтобы .anc не распухал
-        # И ЧТОБЫ offset не давал петли из мелких зигзагов. Допуск 0.05мм 
-        # это компромисс между точностью реза и гладкостью эквидистанты.
-        try:
-            simp = corrected.simplify(0.05, preserve_topology=True)
-            if not simp.is_empty and simp.geom_type == 'Polygon':
-                corrected = simp
-        except Exception:
-            pass
-        coords = list(corrected.exterior.coords)
+        ring = corrected.exterior
     except Exception:
         return polypath
-    if len(coords) < 4:
-        return polypath
-    if coords[0] == coords[-1]:
-        coords = coords[:-1]
 
-    # Сохраняем намотку исходного контура (shapely отдаёт CCW для exterior)
-    def signed_area(c):
+    # ── Классификация сегментов: физическая проходимость фрезы ──
+    # НОЖЕВОЙ рез: центр фрезы идёт ПО осевой. Точка осевой проходима,
+    # если диск R=T с центром в ней не задевает ДРУГИЕ участки контура.
+    # «Другие» = точки контура на ДУГОВОМ расстоянии больше 1.5T от
+    # текущей (циклически). Так:
+    #   - реальные углы и острые «языки» НЕ детектятся (вторая сторона —
+    #     ближняя по дуге окрестность) — их дорабатывает corner-программа,
+    #     станок (SCLN) сам обрезает петли компенсации;
+    #   - узкие щели/пазы уже 2T детектятся: противоположная стенка
+    #     геометрически рядом, но по дуге далеко.
+    # Реализация: равномерный сэмпл контура (шаг ~T/3) + grid-hash для
+    # быстрого поиска соседей по расстоянию.
+    import math as _md
+    n = len(polypath.segments)
+    step = max(0.05, T / 3.0)
+    samples = []  # (x, y, s_arc, seg_idx)
+    s_acc = 0.0
+    for si, seg in enumerate(polypath.segments):
+        L = seg.length()
+        if L < 1e-9:
+            continue
+        k_n = max(1, int(L / step))
+        for k in range(k_n):
+            t = k / k_n
+            px, py = seg.point_at(t)
+            samples.append((px, py, s_acc + t * L, si))
+        s_acc += L
+    total_len = s_acc
+    M = len(samples)
+    if M < 8:
+        return polypath
+
+    cell = 2.0 * T
+    grid = {}
+    for idx, (px, py, _sv, _si) in enumerate(samples):
+        key = (int(px // cell), int(py // cell))
+        grid.setdefault(key, []).append(idx)
+
+    excl_win = 1.5 * T
+    tol_hit = T * 0.98
+    changed = [False] * n
+    for idx, (px, py, sv, si) in enumerate(samples):
+        if changed[si]:
+            continue
+        cx, cy = int(px // cell), int(py // cell)
+        hit = False
+        for gx in (cx - 1, cx, cx + 1):
+            for gy in (cy - 1, cy, cy + 1):
+                for j in grid.get((gx, gy), ()):
+                    if j == idx:
+                        continue
+                    qx, qy, sq, _sj = samples[j]
+                    ds = abs(sv - sq)
+                    ds = min(ds, total_len - ds)
+                    if ds < excl_win:
+                        continue
+                    if _md.hypot(px - qx, py - qy) < tol_hit:
+                        hit = True
+                        break
+                if hit:
+                    break
+            if hit:
+                break
+        if hit:
+            changed[si] = True
+
+    # ── Слияние кластеров через короткие «мосты» ──
+    # Нетронутый участок короче 2·excl_win, зажатый между двумя
+    # changed-зонами (типичный случай: ДНО узкого паза между его
+    # стенками — само дно ничего «чужого» рядом не видит, т.к. стенки
+    # близки по дуге и исключены), включается в кластер — иначе заплатка
+    # рвётся на две половинки по краям паза, а дно остаётся.
+    if any(changed) and not all(changed):
+        seg_lens = [seg.length() for seg in polypath.segments]
+        merged = True
+        while merged:
+            merged = False
+            i2 = 0
+            while i2 < n:
+                if changed[i2]:
+                    i2 += 1
+                    continue
+                # Скан непрерывного нетронутого блока
+                j2 = i2
+                blk_len = 0.0
+                while j2 < n and not changed[j2]:
+                    blk_len += seg_lens[j2]
+                    j2 += 1
+                left_ch = changed[(i2 - 1) % n]
+                right_ch = changed[j2 % n]
+                if left_ch and right_ch and blk_len < 2.0 * excl_win \
+                        and not (i2 == 0 and j2 == n):
+                    for k2 in range(i2, j2):
+                        changed[k2] = True
+                    merged = True
+                i2 = j2
+
+    if not any(changed):
+        return polypath          # Всё проходимо — контур не трогаем ВООБЩЕ
+    if all(changed):
+        # Весь контур туже фрезы — деградация до старого поведения:
+        # полная замена morph-ломаной.
+        coords = list(ring.coords)
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) < 3:
+            return polypath
+
+        def _sa(c):
+            a = 0.0
+            for j in range(len(c)):
+                x1, y1 = c[j]
+                x2, y2 = c[(j + 1) % len(c)]
+                a += x1 * y2 - x2 * y1
+            return a / 2.0
+        orig_a = _sa([s.a for s in polypath.segments])
+        if (_sa(coords) > 0) != (orig_a > 0):
+            coords = list(reversed(coords))
+        start = polypath.segments[0].a
+        bi = min(range(len(coords)),
+                 key=lambda j: (coords[j][0] - start[0]) ** 2
+                 + (coords[j][1] - start[1]) ** 2)
+        coords = coords[bi:] + coords[:bi]
+        return Polypath(segments=[Line(a=coords[j],
+                                       b=coords[(j + 1) % len(coords)])
+                                  for j in range(len(coords))], closed=True)
+
+    # ── Точечный патчинг кластеров ──
+    # Ротация к нетронутому сегменту, чтобы кластеры не пересекали границу
+    # списка.
+    first_ok = next(i for i in range(n) if not changed[i])
+    order = list(range(first_ok, n)) + list(range(0, first_ok))
+
+    # Подпуть morph-границы между двумя точками (вдоль ring, короткой
+    # дорогой в направлении намотки полипаса).
+    ring_coords = list(ring.coords)
+    if ring_coords and ring_coords[0] == ring_coords[-1]:
+        ring_coords = ring_coords[:-1]
+    m = len(ring_coords)
+
+    def _nearest_ring_idx(pt):
+        return min(range(m), key=lambda j: (ring_coords[j][0] - pt[0]) ** 2
+                   + (ring_coords[j][1] - pt[1]) ** 2)
+
+    def _sa2(c):
         a = 0.0
-        for i in range(len(c)):
-            x1, y1 = c[i]
-            x2, y2 = c[(i + 1) % len(c)]
+        for j in range(len(c)):
+            x1, y1 = c[j]
+            x2, y2 = c[(j + 1) % len(c)]
             a += x1 * y2 - x2 * y1
         return a / 2.0
+    ring_ccw = _sa2(ring_coords) > 0
+    poly_ccw = _sa2([s.a for s in polypath.segments]) > 0
+    step = 1 if (ring_ccw == poly_ccw) else -1
 
-    def orig_area():
-        oc = [s.a for s in polypath.segments]
-        return signed_area(oc)
+    def _ring_subpath(pt_a, pt_b):
+        """Точки ring между pt_a и pt_b по ходу намотки полипаса."""
+        ia = _nearest_ring_idx(pt_a)
+        ib = _nearest_ring_idx(pt_b)
+        out = []
+        j = ia
+        guard = 0
+        while j != ib and guard <= m:
+            out.append(ring_coords[j])
+            j = (j + step) % m
+            guard += 1
+        out.append(ring_coords[ib])
+        # Прореживание: замена плотной дискретизации буфера (шаг ~0.1мм)
+        # на разумную ломаную. RDP-лайт через shapely.
+        try:
+            from shapely.geometry import LineString
+            ls = LineString(out).simplify(0.01, preserve_topology=False)
+            out = list(ls.coords)
+        except Exception:
+            pass
+        return out
 
-    if (signed_area(coords) > 0) != (orig_area() > 0):
-        coords = list(reversed(coords))
+    new_segs: List[Segment] = []
+    i_pos = 0
+    while i_pos < n:
+        idx = order[i_pos]
+        if not changed[idx]:
+            new_segs.append(polypath.segments[idx])
+            i_pos += 1
+            continue
+        # Начало кластера изменённых сегментов
+        j_pos = i_pos
+        while j_pos < n and changed[order[j_pos]]:
+            j_pos += 1
+        # Точки стыковки: конец предыдущего нетронутого сегмента (или
+        # start первого изменённого) → начало следующего нетронутого.
+        pt_a = polypath.segments[order[i_pos]].a
+        pt_b = (polypath.segments[order[j_pos]].a if j_pos < n
+                else polypath.segments[order[0]].a)
+        patch = _ring_subpath(pt_a, pt_b)
+        # Пришиваем: линия от pt_a к первой точке patch, дальше по patch,
+        # затем линия к pt_b (микро-стыки < tol — визуально нулевые).
+        chain = [pt_a] + patch + [pt_b]
+        for k in range(len(chain) - 1):
+            a, b = chain[k], chain[k + 1]
+            if (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 < 1e-12:
+                continue
+            new_segs.append(Line(a=a, b=b))
+        i_pos = j_pos
 
-    # Сдвигаем старт к ближайшей точке к исходному старту (для захода)
-    start = polypath.segments[0].a
-    best_i = min(range(len(coords)),
-                 key=lambda i: (coords[i][0] - start[0]) ** 2
-                 + (coords[i][1] - start[1]) ** 2)
-    coords = coords[best_i:] + coords[:best_i]
-
-    # Строим polyline из Line
-    line_segs: List[Segment] = [
-        Line(a=coords[i], b=coords[(i + 1) % len(coords)])
-        for i in range(len(coords))
-    ]
-    line_polypath = Polypath(segments=line_segs, closed=True)
-    
-    # ── Восстанавливаем дуги из ломаной ──
-    # После shapely buffer мы получаем плотную полилинию (точки через ~0.25мм).
-    # Если оставить её как Line — offset параллельных линий в местах кривизны 
-    # будет давать «веер» (соседние нормали расходятся). Применяем 
-    # merge_segments_to_arcs чтобы превратить цепочки коротких Line обратно 
-    # в Arc там где они апроксимируют дугу. 
-    # 
-    # ВАЖНО: ограничиваем минимальный радиус дуг по tool_offset — иначе 
-    # merge будет фитить мелкие дуги R<tool, которые создают петли при offset
-    # (буферизация shapely как раз ДОЛЖНА была их устранить, но в углах 
-    # buffer оставляет «загиб» с малым R).
-    try:
-        result_polypath = merge_segments_to_arcs(
-            line_polypath, tol=chord_err_mm * 5,
-            min_chain=4, tangent_tol_deg=3.0
-        )
-        # Пост-обработка: arc с R < tool_offset заменяем на хорду (Line a→b).
-        # Это места которые буфер оставил с микро-кривизной — для G42 они 
-        # будут петлями, лучше прямая.
-        filtered_segs = []
-        for s in result_polypath.segments:
-            if isinstance(s, Arc) and s.radius < tool_offset * 0.95:
-                filtered_segs.append(Line(a=s.a, b=s.b))
-            else:
-                filtered_segs.append(s)
-        return Polypath(segments=filtered_segs, closed=True)
-    except Exception:
-        return line_polypath
+    if len(new_segs) < 3:
+        return polypath
+    return Polypath(segments=new_segs, closed=True)
 
 
 def flatten_arcs_to_chords(polypath: Polypath) -> Polypath:

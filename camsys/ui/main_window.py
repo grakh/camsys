@@ -367,7 +367,20 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         stitch_layout = QtWidgets.QFormLayout(self.stitch_group)
         self.stitch_combo = QtWidgets.QComboBox()
         self.stitch_combo.setEnabled(False)  # disabled пока файл не загружен
-        stitch_layout.addRow("№:", self.stitch_combo)
+        # Кнопка правки номера текущего заказа (на случай если авто-
+        # привязка номер↔регион не угадала — частый случай когда номера
+        # на макете в кривых, а не текстом).
+        self.stitch_edit_btn = QtWidgets.QToolButton()
+        self.stitch_edit_btn.setText("✎")
+        self.stitch_edit_btn.setToolTip("Изменить номер выбранного заказа")
+        self.stitch_edit_btn.setEnabled(False)
+        _stitch_row = QtWidgets.QWidget()
+        _stitch_row_lay = QtWidgets.QHBoxLayout(_stitch_row)
+        _stitch_row_lay.setContentsMargins(0, 0, 0, 0)
+        _stitch_row_lay.setSpacing(4)
+        _stitch_row_lay.addWidget(self.stitch_combo, 1)
+        _stitch_row_lay.addWidget(self.stitch_edit_btn, 0)
+        stitch_layout.addRow("№:", _stitch_row)
         # Всегда видима — юзер видит место где будет заказ
         layout.addWidget(self.stitch_group)
         
@@ -967,7 +980,13 @@ class MainWindow(QtWidgets.QMainWindow):
         a_fit = m_view.addAction("&Вписать всё")
         a_fit.setShortcut("F")
         a_fit.triggered.connect(lambda: self.viewer.fit_all())
-        
+
+        m_settings = mb.addMenu("&Настройки")
+        a_defaults = m_settings.addAction("Значения по умолчанию…")
+        a_defaults.triggered.connect(self._action_edit_defaults)
+        a_export_base = m_settings.addAction("Базовый путь экспорта…")
+        a_export_base.triggered.connect(self._action_edit_export_base)
+
         m_help = mb.addMenu("&Помощь")
         a_about = m_help.addAction("О программе")
         a_about.triggered.connect(self.action_about)
@@ -1071,13 +1090,32 @@ class MainWindow(QtWidgets.QMainWindow):
     # ─────────────────────────────────────────────────────────────────
     
     def action_open(self):
+        # Стартовая папка диалога. Приоритет:
+        #  1) папка последнего ОТКРЫТОГО в этой сессии файла (если был),
+        #  2) базовый путь экспорта из настроек (хранилище заказов),
+        #  3) домашняя папка.
+        # Так первый «Открыть» сразу ведёт в хранилище, а не гонит по
+        # сети от корня; после первого открытия помним последнюю папку.
+        start_dir = None
+        if getattr(self, '_opened_a_file', False):
+            start_dir = self._last_dir
+        if not start_dir:
+            base = self._get_export_base_path()
+            # Не проверяем exists() — для UNC (\\\\storage\\...) это сетевой
+            # запрос, который может подвесить. Если путь битый, Qt-диалог
+            # сам откроется в дефолтной папке.
+            if base:
+                start_dir = base
+        if not start_dir:
+            start_dir = self._last_dir or str(Path.home())
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Открыть .ai файл", self._last_dir,
+            self, "Открыть .ai файл", start_dir,
             "Adobe Illustrator (*.ai);;Все файлы (*.*)"
         )
         if not path:
             return
         self._last_dir = str(Path(path).parent)
+        self._opened_a_file = True
         
         try:
             self.statusBar().showMessage(f"Загружаю {Path(path).name}...")
@@ -1127,12 +1165,28 @@ class MainWindow(QtWidgets.QMainWindow):
             # автоматически определяем регионы + распределяем ножи по 
             # заказам. Результат сохраняем в session.stitch_info.
             self._analyze_and_setup_stitch(path)
-            
+
+            # ── Значения по умолчанию (Настройки) ──
+            # Проставляем сохранённые юзером дефолты (угол/пятка/ABS/
+            # высота/лимит/лиды) ДО чтения XML — чтобы XML заказа (если
+            # найден) мог их перебить, но при отсутствии XML поля были
+            # с пользовательскими дефолтами, а не заводскими.
+            self._apply_defaults_to_fields()
+
             # ── Чтение specification_*.xml из папки заказа ──
             # Ищет ../XML/specification_*.xml, парсит УголЗаточкиКромки и 
             # ВысотаНожа. Найденные значения подставляются в поля панели и 
             # подсвечиваются розовым — юзер видит откуда взято.
             self._apply_spec_xml_values(path)
+
+            # После XML высота могла измениться (spec ставит knife_height)
+            # → пересчитываем ABS по правилу-порогу от НОВОЙ высоты.
+            try:
+                _h = self.params_panel.top.value()
+                _new_abs = self._abs_for_height(_h)
+                self.params_panel.bottom.setValue(_new_abs)
+            except Exception:
+                pass
             
             self.statusBar().showMessage("Загружено", 3000)
             self.viewer.fit_all()
@@ -1207,12 +1261,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.params_panel.stitch_combo.addItem(display, item_key)
         
         self.params_panel.stitch_combo.setEnabled(True)
+        self.params_panel.stitch_edit_btn.setEnabled(True)
         self.params_panel.stitch_combo.blockSignals(False)
-        
+
         if not hasattr(self, '_stitch_signal_connected'):
             self.params_panel.stitch_combo.currentIndexChanged.connect(
                 self._on_stitch_order_changed)
             self._stitch_signal_connected = True
+        if not hasattr(self, '_stitch_edit_connected'):
+            self.params_panel.stitch_edit_btn.clicked.connect(
+                self._on_edit_order_number)
+            self._stitch_edit_connected = True
 
         # Подписи номеров заказов на сцене (виртуальный слой «Регионы»)
         # с индикатором «пути в кэше» и «сейчас видны на сцене».
@@ -1228,6 +1287,85 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Сшивка {stitch_info.stitch_number}: "
             f"{len(stitch_info.regions)} заказов", 5000)
     
+    def _on_edit_order_number(self):
+        """Ручная правка номера текущего заказа.
+
+        Нужна когда авто-привязка номер↔регион не угадала (номера на
+        макете в кривых, а не текстом; порядок в имени не совпал с
+        расположением; посторонняя метка перебила настоящий номер).
+
+        Меняет order_number соответствующего региона, обновляет label
+        в комбобоксе, itemData, подписи на сцене и ключ активного заказа.
+        """
+        combo = self.params_panel.stitch_combo
+        idx = combo.currentIndex()
+        if idx < 0:
+            return
+        stitch = getattr(self.session, '_stitch_info', None)
+        if stitch is None or idx >= len(stitch.regions):
+            return
+        region = stitch.regions[idx]
+        current = region.order_number or ""
+        new_num, ok = QtWidgets.QInputDialog.getText(
+            self, "Изменить номер заказа",
+            f"Номер заказа для региона ({len(region.knife_ids)} ножей):",
+            QtWidgets.QLineEdit.Normal, current)
+        if not ok:
+            return
+        new_num = new_num.strip()
+        if not new_num or new_num == current:
+            return
+        # Обновляем регион
+        old_key = combo.itemData(idx)
+        region.order_number = new_num
+        # Пересобираем label/ключ с учётом возможных копий-дубликатов
+        from collections import defaultdict
+        counts = defaultdict(int)
+        for r in stitch.regions:
+            if r.order_number:
+                counts[r.order_number] += 1
+        # Новый label и ключ для этого региона
+        n_knives = len(region.knife_ids)
+        if counts[new_num] > 1:
+            # Есть копии — вычисляем индекс копии среди регионов с этим №
+            copy_idx = 0
+            for j, r in enumerate(stitch.regions):
+                if j == idx:
+                    break
+                if r.order_number == new_num:
+                    copy_idx += 1
+            display = f"{new_num} (копия {copy_idx + 1}) ({n_knives} ножей)"
+            new_key = f"{new_num}#{copy_idx}"
+        else:
+            display = f"{new_num} ({n_knives} ножей)"
+            new_key = new_num
+        combo.blockSignals(True)
+        combo.setItemText(idx, display)
+        combo.setItemData(idx, new_key)
+        combo.blockSignals(False)
+        # Переносим сохранённые настройки заказа под новый ключ
+        order_settings = getattr(self.session, '_order_settings', None)
+        if order_settings and old_key in order_settings:
+            order_settings[new_key] = order_settings.pop(old_key)
+        # Обновляем активный ключ если правили текущий
+        if getattr(self, '_current_stitch_order', None) == old_key:
+            self._current_stitch_order = new_key
+            # Номер заказа связан со specification_<номер>.xml — при смене
+            # номера подтягиваем параметры ножа (угол/пятка/высота/ABS)
+            # НОВОГО заказа в поля. Пути НЕ перестраиваем автоматически —
+            # это делает юзер кнопкой «Пересчитать пути» когда готов.
+            try:
+                self._apply_spec_xml_for_order(new_num)
+            except Exception:
+                pass
+        # Обновляем подписи на сцене
+        try:
+            self._refresh_stitch_labels()
+        except Exception:
+            pass
+        self.statusBar().showMessage(
+            f"Номер заказа изменён: {current or '(пусто)'} → {new_num}", 4000)
+
     def _on_stitch_order_changed(self, idx):
         """Юзер выбрал заказ в dropdown.
         
@@ -1408,7 +1546,14 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def _apply_spec_xml_for_order(self, order_number):
         """Ищет specification_<order>.xml в разных местах.
-        
+
+        Составной ключ копии («123561#1») нормализуется до чистого
+        номера («123561») — все копии одного заказа используют ОДНУ
+        спецификацию (это тот же физический заказ, размноженный на
+        листе). Без этого XML не находился для копий (искался файл
+        specification_123561#1.xml, которого нет) и поля ножа
+        оставались розовыми.
+
         Пробуем несколько вариантов расположения:
         1. <stitch_folder>/XML/specification_<order>.xml (стандарт для сшивок)
         2. <stitch_folder>/../<order>/XML/specification_<order>.xml (соседняя папка заказа)
@@ -1417,6 +1562,10 @@ class MainWindow(QtWidgets.QMainWindow):
         
         Если XML не найден — оставляем поля розовыми (юзер введёт вручную).
         """
+        # Нормализуем составной ключ копии «N#i» → чистый номер «N».
+        # Все копии одного заказа делят одну спецификацию.
+        if order_number and '#' in str(order_number):
+            order_number = str(order_number).split('#', 1)[0]
         # Определяем откуда искать — от stitch (если есть) или от project
         ai_path = None
         stitch = getattr(self.session, '_stitch_info', None)
@@ -1512,64 +1661,60 @@ class MainWindow(QtWidgets.QMainWindow):
                 5000)
     
     def _auto_detect_corner_programs(self):
-        """Анализирует загруженный проект и АВТОМАТИЧЕСКИ ставит чекбоксы
-        генерации _corner.anc и _corner3D.anc в зависимости от того, есть
-        ли в контурах соответствующие углы.
-        
-        Логика:
-            - Есть скругления радиусом МЕНЬШЕ рабочего радиуса фрезы
-              → _corner.anc ВКЛЮЧАЕТСЯ (фреза не проходит, нужен T3)
-            - Нет таких скруглений             → _corner.anc ВЫКЛЮЧАЕТСЯ
-            - Есть полностью острые углы       → _corner3D.anc ВКЛЮЧАЕТСЯ
-            - Нет таких углов                  → _corner3D.anc ВЫКЛЮЧАЕТСЯ
-        
-        Порог для 2D — ДИНАМИЧЕСКИЙ, равен реальному радиусу фрезы 
-        (tip/2 + ABS·tan(angle/2)), чтобы согласоваться с алгоритмом 
-        _build_corner_operations в постпроцессоре. Если фреза 0.8 с 
-        углом 70 и ABS 0.25 → порог 0.575мм. Скругления R>=0.575 фреза 
-        проходит, corner_rework не нужен.
+        """Анализирует проект и АВТОМАТИЧЕСКИ ставит чекбоксы генерации
+        _corner.anc (2D) и _corner3D.anc (3D) по ФИЗИЧЕСКОМУ критерию.
+
+        Критерий — НЕ градусы угла, а поведение эквидистанты фрезы:
+        угол нужно дорабатывать, если фреза своим радиусом не проходит
+        (эквидистанта образует остриё/самопересечение, остаётся
+        непрорезанный клин). Работает для любых углов — 25°, 90°, 120° —
+        решает геометрия фрезы, а не значение угла.
+
+        Различение:
+        - 2D = скругление дугой радиусом МЕНЬШЕ радиуса фрезы (фреза не
+          входит в дугу) → нужна тонкая фреза T3.
+        - 3D = острый стык без скругления (остриё) → доработка вершины.
+
+        Радиус фрезы динамический: tip/2 + ABS·tan(angle/2). Скругление
+        R >= радиуса фрезы фреза проходит — обработка не нужна.
         """
-        from ..geometry.corner_detect import (
-            has_small_radius_corners, has_pointed_corners
-        )
+        from ..geometry.corner_detect import detect_corners_by_equidistant
         import math
-        
+
         prj = self.session.project
         if prj is None:
             return
-        
-        # Динамический порог = реальный радиус фрезы
+
+        # Радиус фрезы = реальная эквидистанта/2
         cp = self.session.cutting_params
         half_angle_rad = math.radians(cp.knife_angle / 2.0)
-        dynamic_threshold = (cp.tip_diameter / 2.0 
-                             + cp.bottom * math.tan(half_angle_rad))
-        
-        # Перебираем все геометрии на слое Knife
+        tool_radius = (cp.tip_diameter / 2.0
+                       + cp.bottom * math.tan(half_angle_rad))
+
         knife = prj.get_layer_by_name("Knife")
         if knife is None:
             return
-        
-        any_small = False
-        any_pointed = False
+
+        any_2d = False
+        any_3d = False
         for g in knife.geometries:
             if not g.polypath:
                 continue
-            if not any_small and has_small_radius_corners(g.polypath, dynamic_threshold):
-                any_small = True
-            if not any_pointed and has_pointed_corners(g.polypath, 30.0):
-                any_pointed = True
-            if any_small and any_pointed:
+            has2d, has3d = detect_corners_by_equidistant(
+                g.polypath, tool_radius)
+            any_2d = any_2d or has2d
+            any_3d = any_3d or has3d
+            if any_2d and any_3d:
                 break
-        
-        # Ставим чекбоксы (без триггера изменений если уже стоят)
+
         if hasattr(self, 'params_panel'):
-            self.params_panel.gen_corner.setChecked(any_small)
-            self.params_panel.gen_corner_3d.setChecked(any_pointed)
-        
+            self.params_panel.gen_corner.setChecked(any_2d)
+            self.params_panel.gen_corner_3d.setChecked(any_3d)
+
         msg_parts = []
-        if any_small:
+        if any_2d:
             msg_parts.append("углы 2D")
-        if any_pointed:
+        if any_3d:
             msg_parts.append("углы 3D")
         if msg_parts:
             self.statusBar().showMessage(
@@ -1755,17 +1900,40 @@ class MainWindow(QtWidgets.QMainWindow):
         # Вся группа «Точка входа/выхода» блокируется в Авто
         self.params_panel._lead_group.setEnabled(mode_id != 0)
         
-        # Управление per-op override'ами при смене режима:
-        # - При входе в «Выделенные»: снапшотим текущие ГЛОБАЛЬНЫЕ поля в 
-        #   op.attributes['lead_override'] для всех ножей (если ещё нет). 
-        #   Тогда изменения полей будут «прилипать» только к выделенному 
-        #   элементу, остальные останутся с этим снапшотом.
-        # - При выходе (Авто/Все): удаляем все override'ы — глобальные поля 
-        #   применяются ко всем.
+        # Управление режимом «Выделенные»:
+        # - При входе: ЗАМОРАЖИВАЕМ текущие lead-поля как «базу» для всех
+        #   невыделенных ножей (self._mode2_base_lead_params). Массовый
+        #   снапшот в op.attributes НЕ делаем — раньше он перезаписывал
+        #   всем ножам единые значения полей, из-за чего при входе в режим
+        #   «пересчитывался весь заказ» (позиции прыгали с авто-подобранных
+        #   на единые). Теперь вход в режим ничего не меняет.
+        # - Изменения полей влияют ТОЛЬКО на выделенный op (его override
+        #   пишется в action_toggle_paths).
+        # - При выходе (Авто/Все): удаляем override'ы и базу — глобальные
+        #   поля снова применяются ко всем.
         if self.session.project is not None:
             if mode_id == 2:  # Вход в «Выделенные»
-                self._snapshot_lead_params_to_ops()
+                p = self.params_panel
+                self._mode2_base_lead_params = {
+                    'lead_inside': {
+                        'angle': p.lead_in_angle.value(),
+                        'length': p.lead_in_length.value(),
+                        'offset': p.lead_in_offset.value(),
+                        'sign_offset': ('+' if p.lead_in_offset.value() >= 0
+                                        else '-'),
+                        'overlap': p.lead_in_overlap.value(),
+                    },
+                    'lead_outside': {
+                        'angle': p.lead_out_angle.value(),
+                        'length': p.lead_out_length.value(),
+                        'offset': p.lead_out_offset.value(),
+                        'sign_offset': ('+' if p.lead_out_offset.value() >= 0
+                                        else '-'),
+                        'overlap': p.lead_out_overlap.value(),
+                    },
+                }
             else:  # Выход
+                self._mode2_base_lead_params = None
                 self._clear_lead_overrides()
         
         # Автообновление если пути уже показаны — юзер сразу видит эффект
@@ -1801,11 +1969,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 }
     
     def _clear_lead_overrides(self):
-        """Удаляет per-op lead-override'ы у всех операций."""
+        """Удаляет per-op lead-override'ы у всех операций И из сохранённых
+        настроек заказов (_order_settings).
+
+        Второе критично: при переключении в «Авто» после ручных правок
+        override'ы уже могли быть сохранены в _order_settings[order]
+        (при смене заказа / экспорте). Если чистить только op.attributes,
+        следующий _load_order_settings их вернёт — авто-подбор не
+        сработает, останутся ручные заходы. Поэтому чистим оба места.
+        """
         if self.session.project is None:
             return
         for op in self.session.project.operations:
             op.attributes.pop('lead_override', None)
+        # Чистим сохранённые настройки всех заказов
+        order_settings = getattr(self.session, '_order_settings', None)
+        if order_settings:
+            for order_key, stored in order_settings.items():
+                op_attrs = stored.get('op_attrs')
+                if not op_attrs:
+                    continue
+                for op_id, attrs in op_attrs.items():
+                    if isinstance(attrs, dict):
+                        attrs['lead_override'] = {}
     
     def action_refresh_paths(self):
         """Принудительная перерисовка путей. Если они скрыты — включает.
@@ -1884,11 +2070,60 @@ class MainWindow(QtWidgets.QMainWindow):
                         'overlap': p.lead_out_overlap.value(),
                     },
                 }
+        elif lead_mode_id != 2:
+            # ── Авто-подбор / Все элементы: активно снимаем ВСЕ override'ы
+            # ПРЯМО ЗДЕСЬ, при каждом построении. Это гарантирует, что
+            # после ручных правок и переключения в «Авто» + «Пересчитать»
+            # ножи считаются алгоритмом заново, даже если override
+            # где-то залежался (в op.attributes или в _order_settings).
+            self._clear_lead_overrides()
         
         try:
             # Применим текущие параметры к session
             params = self.params_panel.get_params_dict()
+            # В режиме «Выделенные» глобальные lead-поля session'а держим
+            # ЗАМОРОЖЕННЫМИ (база на момент входа в режим): текущие значения
+            # полей применяются только к выделенному op'у через его
+            # lead_override (записан выше). Иначе изменение угла/длины для
+            # одного ножа пересчитало бы весь заказ.
+            _mode2_base = getattr(self, '_mode2_base_lead_params', None)
+            lead_mode_now = self.params_panel._lead_mode_bg.checkedId() \
+                if hasattr(self.params_panel, '_lead_mode_bg') else 0
+            if lead_mode_now == 2 and _mode2_base:
+                params = dict(params)
+                params['lead_inside'] = dict(_mode2_base['lead_inside'])
+                params['lead_outside'] = dict(_mode2_base['lead_outside'])
+            elif lead_mode_now == 0:
+                # ── Авто-подбор: ФИКСИРОВАННЫЙ дефолтный offset −5мм ──
+                # offset («Смещение») — сдвиг точки захода вдоль контура
+                # от RT-угла. В «Авто» НЕ берём его из полей (иначе
+                # значение, введённое в «Все элементы», залипает и
+                # разъезжает проходы — см. фикс v1.5.54). Но и не обнуляем:
+                # заход прямо в RT-угол нежелателен (угол — напряжённое
+                # место, нож может задраться). Ставим фиксированный
+                # производственный дефолт −5мм (5мм влево от угла по
+                # верхней стороне) для ОБОИХ лидов — как было до появления
+                # режимов. angle/length берутся из автоподбора
+                # (_on_auto_lead_clicked), offset фиксирован.
+                params = dict(params)
+                _li = dict(params.get('lead_inside', {}))
+                _lo = dict(params.get('lead_outside', {}))
+                _li['offset'] = -5.0
+                _li['sign_offset'] = '-'
+                _lo['offset'] = -5.0
+                _lo['sign_offset'] = '-'
+                params['lead_inside'] = _li
+                params['lead_outside'] = _lo
             self.session.set_cutting_params_from_dict(params)
+            # Прокидываем режим в проект — эмиттер (mtx_anderson) по нему
+            # решает auto_avoid: mode 1 «Все элементы» → auto_avoid OFF
+            # (offset из полей применяется ТОЧНО, юзер сам расставляет
+            # заходы); mode 0 «Авто» → auto_avoid ON (алгоритм разводит
+            # от соседей); mode 2 «Выделенные» → по override.
+            try:
+                self.session.project.attributes['lead_mode'] = int(lead_mode_now)
+            except Exception:
+                pass
             
             # Подготовим extras для построения путей (как при экспорте)
             import math
@@ -1914,6 +2149,23 @@ class MainWindow(QtWidgets.QMainWindow):
             lead_mode_id = self.params_panel._lead_mode_bg.checkedId() \
                 if hasattr(self.params_panel, '_lead_mode_bg') else 0
             
+            # ── ИНДИКАТОР ПОДГОТОВКИ ──
+            # Прогресс-диалог с индетерминантной анимацией (range 0,0)
+            # показывается СРАЗУ, чтобы юзер видел «программа думает» ещё
+            # ДО реального построения путей. Дальше `compute_anc_tangents`
+            # может занять несколько секунд на плотной сшивке (генерация
+            # .anc в память для каждого видимого заказа). Без этого
+            # индикатора UI выглядит замороженным до появления
+            # процент-прогресса.
+            prep_progress = QtWidgets.QProgressDialog(
+                "Подготовка данных…", None, 0, 0, self)  # range 0,0 = крутилка
+            prep_progress.setWindowTitle("Пожалуйста подождите")
+            prep_progress.setWindowModality(QtCore.Qt.WindowModal)
+            prep_progress.setMinimumDuration(0)  # показывать НЕМЕДЛЕННО
+            prep_progress.setCancelButton(None)  # отменять нельзя
+            prep_progress.show()
+            QtWidgets.QApplication.processEvents()
+
             extras = {
                 'tool_radius': tool_radius,
                 'tool_equidistant': tool_eq,
@@ -1927,8 +2179,56 @@ class MainWindow(QtWidgets.QMainWindow):
                 'selected_op_id': self._selected_op_id,
             }
             
-            # Вызываем визуализатор
-            from .viewer_2d import add_toolpaths_to_scene
+            # anc_tangents: генерим пакет в память, парсим .anc, получаем
+            # точную точку касания лид-in для каждого ножа. Viewer использует
+            # эти точки чтобы гарантированно совпадать с реальным G-code.
+            #
+            # ВАЖНО про мульти-заказ: если оператор через клик по подписи
+            # (D3) сделал видимыми несколько заказов, тангенсы нужны для
+            # ВСЕХ них, иначе ножи «дополнительно показанных» заказов
+            # рисуются со старым (иногда кривым) сдвигом. Пробегаем по
+            # `_orders_to_export()` — активный + все `_extra_shown_orders`.
+            #
+            # Ошибка при генерации не должна ломать построение путей —
+            # тогда viewer падает на fallback (свою логику shift'ов).
+            # В режиме «Выделенные» переиспользуем тангенсы прошлого
+            # построения (кэш) — пересчитываем только выделенный нож,
+            # остальные остаются с прежними точками. В других режимах
+            # считаем всё заново (кэш игнорируем).
+            if lead_mode_now == 2 and self._selected_op_id \
+                    and getattr(self, '_tangents_cache', None):
+                merged_tangents = dict(self._tangents_cache)
+            else:
+                merged_tangents = {}
+            try:
+                orders_list = self._orders_to_export()
+                for idx, key in enumerate(orders_list):
+                    # Обновляем текст крутилки — юзер видит по каким заказам идём
+                    prep_progress.setLabelText(
+                        f"Подготовка данных…  ({idx + 1}/{len(orders_list)}: "
+                        f"{key or 'проект'})")
+                    QtWidgets.QApplication.processEvents()
+                    pass_order = (key if key and key != "_default" else None)
+                    # В режиме «Выделенные» с выбранным ножом — считаем
+                    # тангенс ТОЛЬКО для него (быстрый пересчёт, пакет из
+                    # одного ножа вместо всего заказа). Тангенсы остальных
+                    # ножей берутся из ПРОШЛОГО построения (merged_tangents
+                    # переиспользуется в extras при рендере — они не
+                    # изменились, раз мы правим один элемент).
+                    _only = None
+                    if (lead_mode_now == 2 and self._selected_op_id):
+                        _only = self._selected_op_id
+                    try:
+                        part = self.session.compute_anc_tangents(
+                            order_number=pass_order, only_op_id=_only)
+                        merged_tangents.update(part)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            extras['anc_tangents'] = merged_tangents
+            # Кэшируем для быстрого пересчёта выделенного в след. раз
+            self._tangents_cache = dict(merged_tangents)
             
             # Также прогоняем _analyze_layout_lead_side чтобы preferred_lead_side был
             # проставлен (как при экспорте) — иначе визуализация по середине не сработает
@@ -2031,15 +2331,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if new_corners_added > 0:
                 # Обновим таблицу чтобы CORNER появились
                 self._refresh_operations()
-            
-            # Фильтр визуализации по чекбоксам программ
-            show_filter = {
-                'blade': self.params_panel.gen_rough.isChecked() or 
-                         self.params_panel.gen_finish.isChecked(),
-                'corner_2d': self.params_panel.gen_corner.isChecked(),
-                'corner_3d': self.params_panel.gen_corner_3d.isChecked(),
-            }
-            
+
+            # Подготовка закончена, закрываем крутилку и переходим на
+            # процентный прогресс-диалог для основного построения путей.
+            prep_progress.close()
+            prep_progress = None
+
             # Прогресс-диалог. Показывает %+статус во время построения путей.
             # Пути на плотном макете могут строиться 2-10 секунд из-за 
             # автоподбора lead-in/out — юзеру полезно видеть что процесс идёт.
@@ -2049,7 +2346,15 @@ class MainWindow(QtWidgets.QMainWindow):
             progress.setWindowModality(QtCore.Qt.WindowModal)
             progress.setMinimumDuration(500)  # показывать только если > 500мс
             progress.setValue(0)
-            
+
+            # Фильтр видимости программ (как в старом рендере)
+            show_filter_legacy = {
+                'blade': self.params_panel.gen_rough.isChecked() or
+                         self.params_panel.gen_finish.isChecked(),
+                'corner_2d': self.params_panel.gen_corner.isChecked(),
+                'corner_3d': self.params_panel.gen_corner_3d.isChecked(),
+            }
+
             def _on_progress(current, total):
                 # Возврат False = юзер нажал Cancel → прерываем
                 if progress.wasCanceled():
@@ -2060,11 +2365,26 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"Построение путей фрезы...  {current} / {total}")
                 QtWidgets.QApplication.processEvents()
                 return True
-            
+
+            # ОСНОВНОЙ РЕНДЕР — старый, проверенный add_toolpaths_to_scene.
+            # Здесь работают: клики/выделение по ножам, коллизии лидов
+            # (красный цвет), палитра per-op, углы (2D/3D corner), стрелки
+            # направления на путях, show_filter по типам программ.
+            #
+            # Из anc-разработки (v1.5.18-40) в рабочем потоке осталась
+            # ТОЛЬКО передача extras['anc_tangents'] — точки захода из
+            # реального .anc, чтобы визуальная точка совпадала с точкой
+            # в коде (исходная проблема). Плюс auto_avoid=False и
+            # collision=False для op'ов с anc-позицией (внутри
+            # _build_toolpath_geometry).
+            #
+            # Полный anc-рендер (add_anc_blades_to_scene) отключён:
+            # терялись клики, коллизии, углы, корректные стрелки.
+            from .viewer_2d import add_toolpaths_to_scene
             self._toolpath_items = add_toolpaths_to_scene(
                 self.scene, self.session.project, extras,
                 cutting_params=self.session.cutting_params,
-                show_filter=show_filter,
+                show_filter=show_filter_legacy,
                 progress_callback=_on_progress,
             )
             # Кэшируем построенные items под ключом текущего заказа
@@ -2136,10 +2456,287 @@ class MainWindow(QtWidgets.QMainWindow):
                     result.append(key)
         return result or [None]
 
+    def _settings_path(self):
+        """Путь к JSON-файлу настроек. ФИКСИРОВАН относительно модуля
+        (не sys.argv[0], который может меняться), чтобы чтение и запись
+        всегда шли в ОДИН файл."""
+        from pathlib import Path
+        # Каталог пакета camsys (стабильный, не зависит от cwd/argv)
+        try:
+            module_dir = Path(__file__).resolve().parent.parent.parent
+            candidate = module_dir / "camsys_settings.json"
+            return candidate
+        except Exception:
+            return Path.home() / ".camsys_settings.json"
+
+    def _load_settings(self) -> dict:
+        """Читает весь JSON настроек. Пусто/ошибка → {}."""
+        import json
+        try:
+            p = self._settings_path()
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return data if isinstance(data, dict) else {}
+        except Exception:
+            pass
+        return {}
+
+    def _save_settings(self, data: dict):
+        """Пишет весь JSON настроек на диск."""
+        import json
+        try:
+            p = self._settings_path()
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _get_default(self, key, fallback):
+        """Читает дефолтное значение параметра из JSON-настроек.
+        Пусто/ошибка → fallback (заводское значение)."""
+        try:
+            data = self._load_settings()
+            defaults = data.get("defaults", {})
+            v = defaults.get(key, None)
+            if v is None or v == "":
+                return fallback
+            if isinstance(fallback, (int, float)):
+                return type(fallback)(float(v))
+            return str(v)
+        except Exception:
+            return fallback
+
+    def _set_defaults(self, values: dict):
+        """Сохраняет дефолты в JSON (merge с существующими)."""
+        try:
+            data = self._load_settings()
+            defaults = data.get("defaults", {})
+            defaults.update(values)
+            data["defaults"] = defaults
+            self._save_settings(data)
+        except Exception:
+            pass
+
+    def _action_edit_defaults(self):
+        """Диалог правки значений по умолчанию для новых заказов.
+
+        Покрывает: угол ножа, пятка, ABS, высота, лимит длины и все
+        параметры точки входа/выхода (угол/длина/смещение/перекрытие
+        для внутреннего и внешнего). Сохраняются в JSON-файле рядом с программой и
+        применяются к полям при следующем открытии файла / сбросе.
+        """
+        p = self.params_panel
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Значения по умолчанию")
+        form = QtWidgets.QFormLayout(dlg)
+
+        # ── Параметры ножа ──
+        w_angle = QtWidgets.QComboBox()
+        w_angle.addItems(["60", "70", "80", "90"])
+        w_angle.setCurrentText(self._get_default("angle", "70"))
+        form.addRow("Угол:", w_angle)
+
+        w_tip = QtWidgets.QComboBox()
+        w_tip.addItems(["0_6", "0_8", "1_0", "1_2", "1_5"])
+        w_tip.setCurrentText(self._get_default("tip", "0_8"))
+        form.addRow("Пятка:", w_tip)
+
+        def _spin(rng, dec, step, val):
+            s = QtWidgets.QDoubleSpinBox()
+            s.setRange(*rng); s.setDecimals(dec); s.setSingleStep(step)
+            s.setValue(val)
+            return s
+
+        w_top = _spin((0.0, 5.0), 3, 0.001, self._get_default("top", 0.440))
+        form.addRow("Высота:", w_top)
+
+        # ── ABS по высоте ножа (3 параметра) ──
+        # Правило: если высота ножа < границы → ABS=низ, иначе → ABS=верх.
+        # Пример: граница 0.46, низ 0.19, верх 0.25.
+        form.addRow(QtWidgets.QLabel("<b>ABS по высоте ножа</b>"))
+        w_abs_bnd = _spin((0.0, 5.0), 3, 0.01,
+                          self._get_default("abs_boundary", 0.46))
+        form.addRow("Граница высоты:", w_abs_bnd)
+        w_abs_lo = _spin((0.0, 5.0), 3, 0.01,
+                         self._get_default("abs_low", 0.19))
+        form.addRow("ABS (высота < границы):", w_abs_lo)
+        w_abs_hi = _spin((0.0, 5.0), 3, 0.01,
+                         self._get_default("abs_high", 0.25))
+        form.addRow("ABS (высота ≥ границы):", w_abs_hi)
+
+        w_limit = _spin((100, 100000), 0, 500,
+                        self._get_default("limit", 3000.0))
+        form.addRow("Лимит длины:", w_limit)
+
+        form.addRow(QtWidgets.QLabel("<b>Точка входа/выхода</b>"))
+        # Внутренний
+        w_in_ang = _spin((0, 90), 2, 1, self._get_default("lead_in_angle", 45.0))
+        form.addRow("Внутр. угол:", w_in_ang)
+        w_in_len = _spin((0, 100), 2, 0.1, self._get_default("lead_in_length", 1.0))
+        form.addRow("Внутр. длина:", w_in_len)
+        w_in_off = _spin((-100, 100), 2, 0.5, self._get_default("lead_in_offset", -5.0))
+        form.addRow("Внутр. смещение:", w_in_off)
+        w_in_ovl = _spin((0, 100), 2, 0.1, self._get_default("lead_in_overlap", 0.0))
+        form.addRow("Внутр. перекрытие:", w_in_ovl)
+        # Внешний
+        w_out_ang = _spin((0, 90), 2, 1, self._get_default("lead_out_angle", 45.0))
+        form.addRow("Внеш. угол:", w_out_ang)
+        w_out_len = _spin((0, 100), 2, 0.1, self._get_default("lead_out_length", 1.0))
+        form.addRow("Внеш. длина:", w_out_len)
+        w_out_off = _spin((-100, 100), 2, 0.5, self._get_default("lead_out_offset", -5.0))
+        form.addRow("Внеш. смещение:", w_out_off)
+        w_out_ovl = _spin((0, 100), 2, 0.1, self._get_default("lead_out_overlap", 0.0))
+        form.addRow("Внеш. перекрытие:", w_out_ovl)
+
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
+        form.addRow(btns)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        self._set_defaults({
+            "angle": w_angle.currentText(),
+            "tip": w_tip.currentText(),
+            "abs_boundary": w_abs_bnd.value(),
+            "abs_low": w_abs_lo.value(),
+            "abs_high": w_abs_hi.value(),
+            "top": w_top.value(),
+            "limit": w_limit.value(),
+            "lead_in_angle": w_in_ang.value(),
+            "lead_in_length": w_in_len.value(),
+            "lead_in_offset": w_in_off.value(),
+            "lead_in_overlap": w_in_ovl.value(),
+            "lead_out_angle": w_out_ang.value(),
+            "lead_out_length": w_out_len.value(),
+            "lead_out_offset": w_out_off.value(),
+            "lead_out_overlap": w_out_ovl.value(),
+        })
+        # Применяем сразу к текущим полям
+        self._apply_defaults_to_fields()
+        self.statusBar().showMessage("Значения по умолчанию сохранены", 4000)
+
+    def _abs_for_height(self, height: float) -> float:
+        """Вычисляет ABS по высоте ножа согласно правилу-порогу.
+        высота < граница → ABS-низ, иначе → ABS-верх."""
+        bnd = self._get_default("abs_boundary", 0.46)
+        lo = self._get_default("abs_low", 0.19)
+        hi = self._get_default("abs_high", 0.25)
+        return lo if height < bnd else hi
+
+    def _apply_defaults_to_fields(self):
+        """Проставляет сохранённые дефолты в поля панели параметров.
+
+        ABS вычисляется от ВЫСОTЫ по правилу-порогу (не хранится как
+        одно число): высота < границы → ABS-низ, иначе ABS-верх. Поэтому
+        высоту ставим ПЕРВОЙ, затем ABS от неё.
+
+        Каждое поле — в своём try, чтобы сбой на одном (напр. угол не в
+        списке комбо) не помешал применить остальные.
+        """
+        p = self.params_panel
+
+        def _set(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+
+        _set(lambda: p.angle.setCurrentText(self._get_default("angle", "70")))
+        _set(lambda: p.tip.setCurrentText(self._get_default("tip", "0_8")))
+        # Высота ПЕРВОЙ — от неё зависит ABS
+        _top = self._get_default("top", 0.440)
+        _set(lambda: p.top.setValue(_top))
+        # ABS по правилу высоты
+        _abs = self._abs_for_height(_top)
+        _set(lambda: p.bottom.setValue(_abs))
+        _set(lambda: p.max_geom_len.setValue(self._get_default("limit", 3000.0)))
+        _set(lambda: p.lead_in_angle.setValue(self._get_default("lead_in_angle", 45.0)))
+        _set(lambda: p.lead_in_length.setValue(self._get_default("lead_in_length", 1.0)))
+        _set(lambda: p.lead_in_offset.setValue(self._get_default("lead_in_offset", -5.0)))
+        _set(lambda: p.lead_in_overlap.setValue(self._get_default("lead_in_overlap", 0.0)))
+        _set(lambda: p.lead_out_angle.setValue(self._get_default("lead_out_angle", 45.0)))
+        _set(lambda: p.lead_out_length.setValue(self._get_default("lead_out_length", 1.0)))
+        _set(lambda: p.lead_out_offset.setValue(self._get_default("lead_out_offset", -5.0)))
+        _set(lambda: p.lead_out_overlap.setValue(self._get_default("lead_out_overlap", 0.0)))
+
+    def _get_export_base_path(self) -> str:
+        """Возвращает настроенный базовый путь экспорта (UNC-корень
+        `\\\\storage\\Zakaz` или иной). Пусто = подмена выключена,
+        используется путь как есть (диск-маппинг)."""
+        try:
+            data = self._load_settings()
+            return str(data.get("export_base_path", "") or "")
+        except Exception:
+            return ""
+
+    def _set_export_base_path(self, value: str):
+        try:
+            data = self._load_settings()
+            data["export_base_path"] = value or ""
+            self._save_settings(data)
+        except Exception:
+            pass
+
+    def _action_edit_export_base(self):
+        """Диалог правки базового пути экспорта.
+
+        Если задан — конечный путь строится как:
+            <база>/<диапазон>/<номер>/<номер|копия>-NC
+        т.е. заменяется КОРЕНЬ (диск-маппинг вроде «W:\\...» или
+        «\\\\storage\\Zakaz») на указанный, а структура диапазон/заказ/NC
+        сохраняется. Пусто = путь используется как есть (как строит
+        файловая система от .ai)."""
+        current = self._get_export_base_path()
+        text, ok = QtWidgets.QInputDialog.getText(
+            self, "Базовый путь экспорта",
+            "UNC-корень для записи (например \\\\storage\\Zakaz).\n"
+            "Оставьте пустым чтобы использовать путь как есть:",
+            QtWidgets.QLineEdit.Normal, current)
+        if not ok:
+            return
+        self._set_export_base_path(text.strip())
+        self.statusBar().showMessage(
+            f"Базовый путь экспорта: {text.strip() or '(как есть)'}", 5000)
+
+    def _apply_export_base(self, path):
+        """Подменяет корень пути на настроенную базу, сохраняя хвост
+        <диапазон>/<номер>/<...>-NC.
+
+        Берём последние 3 компонента пути (диапазон/заказ/NC-папка) и
+        приклеиваем к настроенной базе. Если база пуста — возвращаем
+        путь без изменений.
+        """
+        base = self._get_export_base_path()
+        if not base or path is None:
+            return path
+        from pathlib import Path, PureWindowsPath
+        p = Path(path)
+        parts = p.parts
+        # Хвост: <диапазон>/<номер>/<NC-папка> = последние 3 компонента
+        tail = parts[-3:] if len(parts) >= 3 else parts
+        # Собираем как Windows-путь (UNC), т.к. цель — сетевое хранилище
+        base_clean = base.rstrip("\\/")
+        return PureWindowsPath(base_clean, *tail)
+
     def _resolve_nc_dir_for_order(self, order_key):
-        """Возвращает Path NC-папки для заказа `order_key` по тому же
-        списку кандидатов, что и основной экспорт (первый найденный, иначе
-        конструирует sibling `<order>-NC`). None если не удалось."""
+        """Возвращает Path NC-папки для заказа `order_key`.
+
+        Целевая структура (подтверждена юзером):
+            <диапазон>/<номер>/<номер|копия>-NC/
+        например 123000-123999/123561/123561_c2-NC/
+
+        Папка ЗАКАЗА — всегда ЧИСТЫЙ номер (123561), одна на все копии.
+        NC-папка внутри неё — с суффиксом копии (123561_c2-NC), чтобы
+        копии не перезаписывали друг друга.
+
+        Сначала ищем уже существующую NC-папку (несколько вариантов
+        расположения — для совместимости со старыми структурами). Если
+        не нашли — конструируем каноническую <range>/<base>/<fname>-NC.
+        None если путь построить нельзя.
+        """
         if not order_key:
             try:
                 return self.session.resolve_nc_dir()
@@ -2147,24 +2744,30 @@ class MainWindow(QtWidgets.QMainWindow):
                 return None
         from pathlib import Path
         from ..io_.stitch import order_key_to_filename
-        fname = order_key_to_filename(order_key)
+        fname = order_key_to_filename(order_key)          # 123561_c2 (с копией)
+        base = str(order_key).split('#', 1)[0]            # 123561 (чистый номер)
         ai_path = Path(self.session.project.source_ai_path or "")
         if not ai_path.exists():
             return None
         stitch_root = ai_path.parent.parent
+        # range_dir = папка-диапазон (123000-123999), на уровень выше папки
+        # заказа. stitch_root.parent — обычно и есть диапазон.
+        range_dir = stitch_root.parent
+        # Кандидаты поиска СУЩЕСТВУЮЩЕЙ папки (порядок = приоритет).
+        # Каноническая структура <range>/<base>/<fname>-NC первая.
         candidates = [
-            stitch_root.parent / f"{fname}-NC",
-            stitch_root.parent / f"{fname}_NC",
-            stitch_root.parent / fname / "NC",
-            stitch_root.parent / fname / f"{fname}-NC",
+            range_dir / base / f"{fname}-NC",     # 123000-999/123561/123561_c2-NC ✓
+            range_dir / base / f"{fname}_NC",
+            range_dir / base / "NC",
+            range_dir / base / f"{base}-NC",      # NC без суффикса копии
+            stitch_root.parent / f"{fname}-NC",   # старый вариант (без папки заказа)
             stitch_root / f"{fname}-NC",
-            stitch_root / f"{fname}_NC",
         ]
         for c in candidates:
             if c.is_dir():
-                return c
-        # Не нашли — sibling
-        return stitch_root.parent / f"{fname}-NC"
+                return self._apply_export_base(c)
+        # Не нашли — создаём КАНОНИЧЕСКИЙ путь: <range>/<base>/<fname>-NC
+        return self._apply_export_base(range_dir / base / f"{fname}-NC")
 
     def _do_export(self):
         if not self.session.has_project():
@@ -2341,6 +2944,68 @@ class MainWindow(QtWidgets.QMainWindow):
             n_ok = 0
             n_err = 0
             cancelled = False
+
+            # СНИМОК ОРИГИНАЛЬНОГО СОСТОЯНИЯ (для восстановления после
+            # батча). Сохраняем: активный заказ, UI-значения, снимок
+            # op.attributes (excluded, lead_override для КАЖДОЙ операции).
+            #
+            # Причина: при батч-экспорте нескольких заказов каждый должен
+            # использовать СВОИ настройки (angle, tip, top, bottom, +
+            # per-op excluded/lead_override), а НЕ настройки активного
+            # заказа. Без снимка после батча активный заказ окажется с
+            # чужими значениями от последнего экспортированного.
+            #
+            # На всякий случай — тоже сохраняем текущие настройки в
+            # `session._order_settings[active_order]` через
+            # `_save_order_settings`, чтобы восстанавливать через тот же
+            # механизм что и обычная смена заказа.
+            original_active_order = getattr(self, '_current_stitch_order', None)
+            if original_active_order:
+                self._save_order_settings(original_active_order)
+            original_op_attrs_snapshot = {}
+            for op in self.session.project.operations:
+                original_op_attrs_snapshot[op.id] = {
+                    'excluded': op.attributes.get('excluded', False),
+                    'lead_override': (dict(op.attributes.get('lead_override'))
+                                      if op.attributes.get('lead_override')
+                                      else None),
+                }
+
+            def _apply_state_for_order(order_key):
+                """Загружает сохранённые UI+op_attrs заказа, обновляет
+                cutting_params. Если сохранений нет — грузит из XML."""
+                if not order_key:
+                    return
+                # Загрузка сохранённых настроек (blockSignals внутри)
+                loaded = self._load_order_settings(order_key)
+                if not loaded:
+                    # Нет сохранённых → пробуем XML
+                    try:
+                        self._apply_spec_xml_for_order(order_key)
+                    except Exception:
+                        pass
+                # UI → cutting_params (для передачи в exporter)
+                params = self.params_panel.get_params_dict()
+                self.session.set_cutting_params_from_dict(params)
+
+            def _restore_original_state():
+                """Восстанавливает состояние до батча."""
+                if original_active_order:
+                    self._load_order_settings(original_active_order)
+                    params = self.params_panel.get_params_dict()
+                    self.session.set_cutting_params_from_dict(params)
+                # Дополнительная страховка на случай если _load_ не всё
+                # покрыл (op'ы без записи в _order_settings, отфильтрованные)
+                for op in self.session.project.operations:
+                    stored = original_op_attrs_snapshot.get(op.id)
+                    if stored is None:
+                        continue
+                    op.attributes['excluded'] = stored['excluded']
+                    if stored['lead_override']:
+                        op.attributes['lead_override'] = stored['lead_override']
+                    else:
+                        op.attributes.pop('lead_override', None)
+
             try:
                 for i, (order_key, nc_dir) in enumerate(plan):
                     if progress.wasCanceled():
@@ -2349,6 +3014,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     disp = order_key or "(проект)"
                     self.session._progress_callback = _make_callback(
                         progress, f"[{i+1}/{len(plan)}] {disp}")
+                    # ── ПРИМЕНЕНИЕ per-order STATE ──
+                    # Загружаем сохранённые для этого заказа UI-значения +
+                    # op_attrs (excluded, lead_override). Если раньше не
+                    # сохранялись — пробуем XML.
+                    _apply_state_for_order(order_key)
                     # Основной пакет
                     try:
                         r_main = self.session.export_package_auto(
@@ -2396,6 +3066,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.session._progress_callback = None
                 progress.setValue(100)
                 progress.close()
+                # ── ВОССТАНОВЛЕНИЕ ОРИГИНАЛЬНОГО СОСТОЯНИЯ ──
+                # Восстанавливаем UI, cutting_params и op.attributes до
+                # состояния перед началом батча. Активный заказ снова
+                # с ЕГО настройками, а не с последнего экспортированного.
+                try:
+                    _restore_original_state()
+                except Exception:
+                    pass
 
             log_text = "\n".join(loglines)
             _write_log(log_text)

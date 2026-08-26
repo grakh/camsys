@@ -1,0 +1,21 @@
+{
+  "defaults": {
+    "angle": "70",
+    "tip": "0_8",
+    "abs": 0.19,
+    "top": 0.44,
+    "limit": 3000.0,
+    "lead_in_angle": 45.0,
+    "lead_in_length": 1.0,
+    "lead_in_offset": -5.0,
+    "lead_in_overlap": 0.0,
+    "lead_out_angle": 45.0,
+    "lead_out_length": 1.0,
+    "lead_out_offset": -5.0,
+    "lead_out_overlap": 0.0,
+    "abs_boundary": 0.46,
+    "abs_low": 0.19,
+    "abs_high": 0.25
+  },
+  "export_base_path": "\\\\storage\\Zakaz"
+}

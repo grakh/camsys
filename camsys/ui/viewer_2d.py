@@ -832,6 +832,27 @@ class ToolpathItem(QtWidgets.QGraphicsPathItem):
         painter.restore()
 
 
+def _end_curvature_radius(polypath, at_start: bool) -> float:
+    """Радиус кривизны на конце фрагмента (мм). Линия = бесконечность
+    (пологая), дуга = её радиус. Смотрим 1-2 крайних сегмента: если конец
+    угла — дуга малого радиуса, значит кривизна крутая и лид сядет плохо.
+
+    at_start=True — начало фрагмента (там будет заход/lead-in);
+    at_start=False — конец (lead-out).
+    """
+    from ..geometry.primitives import Arc as _ArcC
+    if not polypath or not polypath.segments:
+        return float('inf')
+    segs = polypath.segments
+    # КРАЙНИЙ сегмент (там начинается лид). Скругление угла в середине
+    # фрагмента не смотрим — важна кривизна именно на краю (зоне pad),
+    # куда сядет заход/выход.
+    edge = segs[0] if at_start else segs[-1]
+    if isinstance(edge, _ArcC):
+        return edge.radius
+    return float('inf')  # край — линия, пологий
+
+
 def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=None):
     """Прогоняет ту же логику что эмиттер для одного toolpath, и возвращает
     геометрию для визуализации: dict с ключами 'contour', 'lead_in', 'lead_out'.
@@ -879,6 +900,26 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         polypath = extract_subpath_around_indices(
             geom.polypath, first_idx, last_idx, pad_mm=1.5
         )
+        # ── АДАПТИВНОЕ УДЛИНЕНИЕ угла по кривизне концов ──
+        # Если на конце фрагмента (где начнётся заход/выход) кривизна ещё
+        # КРУТАЯ (радиус < порога), поворот лида создаёт тесную петлю и
+        # подрежет лезвие. Продлеваем pad, пока оба конца не выйдут на
+        # ПОЛОГИЙ участок (радиус >= порога) — тогда лид садится на мягкую
+        # кривую. Элементы разные, поэтому удлинение подбирается под каждый.
+        try:
+            _R_MIN = 1.5  # порог радиуса кривизны на концах (мм)
+            _PAD_MAX = 4.0  # предел, чтобы не залезть на соседний угол
+            _pad = 1.5
+            while _pad < _PAD_MAX:
+                _r_start = _end_curvature_radius(polypath, at_start=True)
+                _r_end = _end_curvature_radius(polypath, at_start=False)
+                if _r_start >= _R_MIN and _r_end >= _R_MIN:
+                    break  # оба конца пологие — достаточно
+                _pad = min(_pad + 1.0, _PAD_MAX)
+                polypath = extract_subpath_around_indices(
+                    geom.polypath, first_idx, last_idx, pad_mm=_pad)
+        except Exception:
+            pass
     else:
         polypath = geom.polypath
     
@@ -956,46 +997,79 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
     elif geom.is_closed and tp.side in (ContourSide.OUTSIDE, ContourSide.INSIDE):
         side_name = "OUTSIDE" if tp.side == ContourSide.OUTSIDE else "INSIDE"
         polypath = normalize_for_side(polypath, side_name)
-        
-        # Точка старта в RT углу — единая для INSIDE и OUTSIDE
-        polypath = shift_start_to_corner(polypath, "RT")
-        # Если RT попал на дугу — сдвинуть на начало прямой
-        from camsys.geometry.path_offset import shift_start_to_top_line
-        polypath = shift_start_to_top_line(polypath)
-        
-        # Направление обхода полипаса — фиксируем ДО потенциального
-        # CW-extra-shift'а, т.к. после него seg0 становится правой
-        # стороной (dx=0) и признак `seg0.b[0] > seg0.a[0]` перестаёт
-        # различать направление. Для круглых ножей (Arc-only контур)
-        # используем прямой флаг Arc.ccw.
-        seg0 = polypath.segments[0]
-        from camsys.geometry.primitives import Line as _LineCls, Arc as _ArcCls
-        if isinstance(seg0, _LineCls):
-            _polypath_is_cw = seg0.b[0] > seg0.a[0]
-        elif isinstance(seg0, _ArcCls):
-            _polypath_is_cw = not seg0.ccw
+
+        # ── Приоритетный путь: тангенс из реального .anc ──
+        # options_extras['anc_tangents'] = {op.id: [(tx, ty), ...]} —
+        # СПИСОК тангенсов по проходам (каждый нож обычно 2 прохода —
+        # INSIDE и OUTSIDE — с РАЗНЫМИ точками захода!). Выбираем по
+        # индексу текущего tp внутри op.toolpaths: эмиттер пишет проходы
+        # в том же порядке.
+        anc_tangents = (options_extras or {}).get('anc_tangents', {})
+        _tan_list = anc_tangents.get(op.id)
+        anc_tangent = None
+        if _tan_list:
+            # Совместимость: раньше значение было кортежем (tx, ty)
+            if isinstance(_tan_list, tuple):
+                anc_tangent = _tan_list
+            else:
+                try:
+                    tp_index = op.toolpaths.index(tp)
+                except (ValueError, AttributeError):
+                    tp_index = 0
+                if tp_index < len(_tan_list):
+                    anc_tangent = _tan_list[tp_index]
+                elif _tan_list:
+                    anc_tangent = _tan_list[0]
+        if anc_tangent is not None:
+            from camsys.geometry.path_offset import shift_start_to_point
+            polypath = shift_start_to_point(polypath, anc_tangent)
         else:
-            _polypath_is_cw = False
+            # Fallback: старая цепочка. Используется если .anc недоступен
+            # (не пересчитан после смены параметров, или POSITION-случай).
+            # Точка старта в RT углу — единая для INSIDE и OUTSIDE
+            polypath = shift_start_to_corner(polypath, "RT")
+            # Если RT попал на дугу — сдвинуть на начало прямой
+            from camsys.geometry.path_offset import shift_start_to_top_line
+            polypath = shift_start_to_top_line(polypath)
+        
+        # Если использовали .anc-тангенс — полипас УЖЕ в правильной точке
+        # (эмиттер уже применил все нужные сдвиги при генерации). Пропускаем
+        # весь fallback chain (направление, CW-extra, инверсия offset,
+        # user_offset) — иначе получим двойное применение.
+        if anc_tangent is None:
+            # Направление обхода полипаса — фиксируем ДО потенциального
+            # CW-extra-shift'а, т.к. после него seg0 становится правой
+            # стороной (dx=0) и признак `seg0.b[0] > seg0.a[0]` перестаёт
+            # различать направление. Для круглых ножей (Arc-only контур)
+            # используем прямой флаг Arc.ccw.
+            seg0 = polypath.segments[0]
+            from camsys.geometry.primitives import Line as _LineCls, Arc as _ArcCls
+            if isinstance(seg0, _LineCls):
+                _polypath_is_cw = seg0.b[0] > seg0.a[0]
+            elif isinstance(seg0, _ArcCls):
+                _polypath_is_cw = not seg0.ccw
+            else:
+                _polypath_is_cw = False
 
-        # СИММЕТРИЯ INSIDE/OUTSIDE: оба прохода на RT конец top line
-        # Для CCW (top line R→L) start уже на TR ✓
-        # Для CW  (top line L→R) start на TL → сдвигаем на длину top line
-        # чтобы start стал TR концом.
-        if _polypath_is_cw:
-            import math as _m_sym
-            top_len = _m_sym.hypot(seg0.b[0] - seg0.a[0], seg0.b[1] - seg0.a[1])
-            polypath = shift_start_along_contour(polypath, top_len)
+            # СИММЕТРИЯ INSIDE/OUTSIDE: оба прохода на RT конец top line
+            # Для CCW (top line R→L) start уже на TR ✓
+            # Для CW  (top line L→R) start на TL → сдвигаем на длину top line
+            # чтобы start стал TR концом.
+            if _polypath_is_cw:
+                import math as _m_sym
+                top_len = _m_sym.hypot(seg0.b[0] - seg0.a[0], seg0.b[1] - seg0.a[1])
+                polypath = shift_start_along_contour(polypath, top_len)
 
-        # Инверсия знака offset ПО НАПРАВЛЕНИЮ ПОЛИПАСА (а не по стороне
-        # прохода). Оба прохода одного ножа наследуют одно направление
-        # полипаса, значит должны получать одинаковый эффективный сдвиг
-        # → оба лида окажутся симметрично слева от RT по верху.
-        # Это тот же фикс, что применён в mtx_anderson.py — здесь дублируем
-        # для соответствия визуализации коду .anc.
-        effective_offset = (user_offset if _polypath_is_cw
-                            else -user_offset)
-        if abs(effective_offset) > 1e-9:
-            polypath = shift_start_along_contour(polypath, effective_offset)
+            # Инверсия знака offset ПО НАПРАВЛЕНИЮ ПОЛИПАСА (а не по стороне
+            # прохода). Оба прохода одного ножа наследуют одно направление
+            # полипаса, значит должны получать одинаковый эффективный сдвиг
+            # → оба лида окажутся симметрично слева от RT по верху.
+            # Это тот же фикс, что применён в mtx_anderson.py — здесь дублируем
+            # для соответствия визуализации коду .anc.
+            effective_offset = (user_offset if _polypath_is_cw
+                                else -user_offset)
+            if abs(effective_offset) > 1e-9:
+                polypath = shift_start_along_contour(polypath, effective_offset)
         
         # ВАЖНО: overlap НЕ применяем здесь — он разомкнул бы контур
         # (closed=False), и offset_polypath_uniform не построил бы визуализацию
@@ -1019,6 +1093,7 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
     # нормали по всему контуру — гарантирует согласованность в углах).
     # Для открытых CORNER фрагментов — geometric oriented by center.
     from ..geometry.path_offset import (offset_polypath_toward_center,
+                                         offset_polypath_toward_body,
                                          offset_polypath_uniform,
                                          simplify_for_visualization,
                                          flatten_arcs_to_chords,
@@ -1084,14 +1159,88 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         polypath_for_vis = merge_collinear_lines(polypath_for_vis, angle_tol_deg=1.0)
     
     if is_3d_corner or is_2d_corner:
-        # CORNER: открытый фрагмент → используем geometric (к центру ножа)
-        polypath_offset = offset_polypath_toward_center(
-            polypath_for_vis, corner_tool_offset, center
+        # CORNER: эквидистанта фрезы. Направление (внутрь/наружу тела)
+        # выбирается по ВЫПУКЛОСТИ угла — АБСОЛЮТНЫМ геометрическим
+        # критерием (центр дуги скругления относительно тела), НЕ через
+        # namotku+side (что было корнем давней путаницы: namotka исходного
+        # контура любая, а side — это знак offset, они независимы).
+
+        # ── ВЫПУКЛОСТЬ угла — АБСОЛЮТНЫЙ геометрический критерий ──
+        # Не зависит от namotki/side/arc.ccw (источник давней путаницы).
+        # Признак: где лежит ЦЕНТР дуги скругления относительно тела.
+        #   центр ВНУТРИ контура  → ВЫПУКЛЫЙ угол (скругление торчит наружу)
+        #   центр СНАРУЖИ контура → ВОГНУТЫЙ угол (карман внутрь)
+        # Для 3D (нет дуги) — по стыку линий через знак площади вершины.
+        from ..geometry.primitives import Arc as _Arc
+        from ..geometry.path_offset import _point_in_polypath as _pip_cvx
+        _convex = True
+        _rounding_arc = None
+        for _s in polypath_for_vis.segments:
+            if isinstance(_s, _Arc) and _s.radius < 2.0:
+                _rounding_arc = _s
+                break
+        if _rounding_arc is not None:
+            # 2D: центр дуги скругления внутри тела → выпуклый.
+            try:
+                _cx, _cy = _rounding_arc.center
+                _convex = _pip_cvx((_cx, _cy), geom.polypath)
+            except Exception:
+                _convex = True
+        else:
+            # 3D: знак площади треугольника (до-вершина-после) —
+            # абсолютный поворот в координатах, затем сверяем с телом.
+            try:
+                _mid = len(polypath_for_vis.segments) // 2
+                _s_in = polypath_for_vis.segments[max(0, _mid - 1)]
+                _s_out = polypath_for_vis.segments[min(
+                    len(polypath_for_vis.segments) - 1, _mid)]
+                _pv = _s_in.a       # точка до вершины
+                _vx = _s_in.b       # вершина
+                _pn = _s_out.b      # точка после
+                # пробная точка чуть в сторону биссектрисы внутрь поворота
+                _mx = (_pv[0] + _pn[0]) / 2.0
+                _my = (_pv[1] + _pn[1]) / 2.0
+                # середина хорды до/после; если она внутри тела — вершина
+                # торчит наружу (выпукло), если снаружи — вогнуто.
+                _convex = _pip_cvx((_mx, _my), geom.polypath)
+            except Exception:
+                _convex = True
+
+        # ЗНАК эквидистанты угла: зависит от ВЫПУКЛОСТИ, не только tp.side.
+        # Все corner-операции помечены tp.side=OUTSIDE, но физически:
+        #   ВЫПУКЛЫЙ угол (горб) → рез ИЗНУТРИ → путь ВНУТРИ тела (OUTSIDE)
+        #   ВОГНУТЫЙ угол (линия ушла ВНУТРЬ элемента, внешний контур) →
+        #     это сторона INSIDE → путь и лиды ОТ элемента (СНАРУЖИ).
+        # _convex определён выше абсолютным критерием (центр дуги в теле).
+        #   выпуклый → угол ВНУТРИ тела (_main_side_inside=True)
+        #   вогнутый → угол СНАРУЖИ (_main_side_inside=False)
+        _main_side_inside = _convex
+        try:
+            from ..geometry.path_offset import (
+                offset_polypath_uniform as _ofu2,
+                _point_in_polypath as _pip3,
+                trim_self_intersections as _tsi2,
+                join_polypath_corners as _jpc2)
+            _inward = _main_side_inside
+            _eq_try = _ofu2(polypath_for_vis, corner_tool_offset,
+                            inward=True)
+            _eq_try = _tsi2(_eq_try)
+            _eq_try = _jpc2(_eq_try, tol=0.01)
+            if _eq_try.segments:
+                _mp3 = _eq_try.segments[len(_eq_try.segments)//2].a
+                _in_true = _pip3(_mp3, geom.polypath)
+                _inward = True if (_in_true == _main_side_inside) else False
+        except Exception:
+            _inward = _main_side_inside
+
+        polypath_offset = offset_polypath_uniform(
+            polypath_for_vis, corner_tool_offset,
+            inward=_inward
         )
+        polypath_offset = trim_self_intersections(polypath_offset)
         # После оффсета каждого сегмента в углу остаётся разрыв.
-        # Стыкуем линии через их пересечение — получается острый угол на 
-        # эквидистанте (физически фреза в этой точке заходит и выходит 
-        # под прямым углом, как и должна на острие).
+        # Стыкуем линии через их пересечение — острый угол на
+        # эквидистанте (фреза заходит и выходит под прямым углом).
         polypath_offset = join_polypath_corners(polypath_offset, tol=0.01)
     elif tp.side == ContourSide.INSIDE:
         # ВНЕШНИЙ рез (INSIDE=CCW + G41 → НАРУЖУ от центра, «+»).
@@ -1150,17 +1299,54 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
     # внутри plan_lead_in.
     forced_lead_side = None
     if is_3d_corner or is_2d_corner:
+        # СТОРОНА ЛИДА УГЛА: кончик лида должен быть с ТОЙ ЖЕ стороны от
+        # контура, что и сама ЭКВИДИСТАНТА УГЛА (она уже построена
+        # правильно с _inward). Определяем ВЕКТОРНО, без point_in_polypath
+        # (который врёт на полосах, особенно после удлинения угла, когда
+        # старт лида уходит на пологий участок).
+        #
+        # Берём среднюю точку эквидистанты угла (эталон стороны) и
+        # стартовую точку; сравниваем на какой стороне от касательной
+        # лежит эквидистанта. Лид строим в ТУ ЖЕ сторону.
         if polypath_offset and polypath_offset.segments:
-            bb = polypath_bbox(geom.polypath)
-            cx = (bb[0]+bb[2])/2
-            cy = (bb[1]+bb[3])/2
-            sp_check = polypath_offset.segments[0].a
-            tan_check = polypath_offset.segments[0].tangent_at_start()
-            cross = tan_check[0]*(cy - sp_check[1]) - tan_check[1]*(cx - sp_check[0])
-            forced_lead_side = "left" if cross > 0 else "right"
+            try:
+                from ..geometry.lead_inout import build_lead_in as _bli3
+                _sp = polypath_offset.segments[0].a
+                _tan = polypath_offset.segments[0].tangent_at_start()
+                _td = math.hypot(_tan[0], _tan[1]) or 1.0
+                _tnx, _tny = _tan[0]/_td, _tan[1]/_td
+                # эталон: средняя точка эквидистанты угла относительно её
+                # старта — с какой стороны (left-нормаль) лежит «тело» угла.
+                _mid_off = polypath_offset.segments[
+                    len(polypath_offset.segments)//2].a
+                _evx = _mid_off[0] - _sp[0]
+                _evy = _mid_off[1] - _sp[1]
+                _eq_left = (_evx*(-_tny) + _evy*_tnx) > 0
+                # Прямоугольник (выпуклый угол): лид К ЦЕНТРУ = в ту же
+                # сторону что тело угла (юзер подтвердил). Вогнутый
+                # (внешний): лид НАРУЖУ = противоположно телу угла.
+                _lead_same_as_body = _convex
+                _chosen = None
+                for _side in ('left', 'right'):
+                    _lg = _bli3(start_point=_sp, tangent=_tan, side=_side,
+                                line_length=1.0, arc_radius=0.5,
+                                approach_angle_deg=45, style='line_arc')
+                    _tip = _lg.line.a if _lg.line else _sp
+                    _tvx = _tip[0] - _sp[0]
+                    _tvy = _tip[1] - _sp[1]
+                    _tip_left = (_tvx*(-_tny) + _tvy*_tnx) > 0
+                    _match = (_tip_left == _eq_left) if _lead_same_as_body \
+                        else (_tip_left != _eq_left)
+                    if _match:
+                        _chosen = _side
+                        break
+                forced_lead_side = _chosen or "right"
+            except Exception:
+                forced_lead_side = "right"
         else:
             forced_lead_side = "right"
-    
+    # ОСНОВНОЙ путь (не corner): forced_lead_side=None. Основные лиды
+    # строит auto-подбор — их НЕ трогаем, проблема только в углах.
     # ── LEAD-OUT откладывается на ПОСЛЕ автоподбора + overlap ──
     lead_out_to_build = (tp.exit.enabled 
                          and tp.exit.style in (LeadStyle.LINE_ARC_TANGENTIAL, LeadStyle.LINE)
@@ -1240,13 +1426,21 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
                 forced_side=None,
             )
         
+        _use_anc_position = (options_extras or {}).get(
+            'anc_tangents', {}).get(op.id) is not None
         polypath_offset, lead_in_poly, lead_in_collision, _ = plan_lead_in(
             polypath_offset, req_in,
             contours_lines_cache, contours_bboxes_cache,
             geom.id, effective_tool_offset,
-            auto_avoid=this_op_auto_avoid and project is not None,
+            auto_avoid=(this_op_auto_avoid and project is not None
+                        and not _use_anc_position),
             exit_request=exit_req,
             overlap=pending_overlap)
+        # Если позиция из .anc — эмиттер уже подтвердил её приемлемость,
+        # флаг коллизии от plan_lead_in гасим (иначе виджет красит в красный
+        # соседство контуров, которое эмиттер счёл нормальным).
+        if _use_anc_position:
+            lead_in_collision = False
     
     # ── ПРИМЕНЕНИЕ OVERLAP ПОСЛЕ автоподбора ──
     # Теперь когда позиция старта окончательно подобрана, удлиняем 
@@ -1271,13 +1465,11 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         # центр для углов, иначе авто.
         forced_exit_side = None
         if is_3d_corner or is_2d_corner:
-            bb = polypath_bbox(geom.polypath)
-            cx = (bb[0]+bb[2])/2
-            cy = (bb[1]+bb[3])/2
-            ep_check = polypath_offset.segments[-1].b
-            tan_check = polypath_offset.segments[-1].tangent_at_end()
-            cross = tan_check[0]*(cy - ep_check[1]) - tan_check[1]*(cx - ep_check[0])
-            forced_exit_side = "left" if cross > 0 else "right"
+            # Сторона выхода угла = та же, что вход (единый знак лида угла,
+            # в сторону смещения эквидистанты угла). forced_lead_side уже
+            # вычислен выше векторно.
+            forced_exit_side = forced_lead_side
+        # ОСНОВНОЙ путь: forced_exit_side=None — auto-подбор, не трогаем.
         
         req_out = LeadGeometryRequest(
             is_entry=False,
@@ -1457,4 +1649,622 @@ def add_toolpaths_to_scene(scene: 'CamScene', project, options_extras: dict = No
     if hasattr(scene, '_selected_op_id'):
         scene._selected_op_id = ""
     
+    return items
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  РЕНДЕР ИЗ ПАРСЕННОГО .anc — ПОЛНЫЙ G-CODE VIEWER (v1.5.24+)
+# ─────────────────────────────────────────────────────────────────────
+
+def _add_line_to_path(path: QtGui.QPainterPath, start, end):
+    """Добавляет линию к QPainterPath — от start к end."""
+    if not path.elementCount() or (path.currentPosition().x() != start[0]
+                                    or path.currentPosition().y() != start[1]):
+        path.moveTo(start[0], start[1])
+    path.lineTo(end[0], end[1])
+
+
+def _sample_body_offset(body_movements, distance: float,
+                        samples_per_seg: int = 32):
+    """Сэмплирует body-контур из BladeBlock, применяя офсет на `distance`
+    ВПРАВО от направления движения (=G42 компенсация).
+
+    Возвращает список (x, y) — точки offset-полилинии, готовые для
+    QPainterPath. Для рендера эквидистанты: где реально пойдёт ЦЕНТР
+    ФРЕЗЫ, а не raw-контур ножа.
+
+    Логика офсета:
+      - LINE: сдвиг перпендикулярно направлению на `distance` вправо
+        (right perp of A→B = (dy, -dx)/|AB|).
+      - ARC_CW: тот же центр, новый радиус R − distance (потому что при
+        CW-движении правая сторона обращена к центру).
+      - ARC_CCW: тот же центр, новый радиус R + distance (правая сторона
+        обращена от центра).
+      - Если новый радиус ≤ 0 — арка вырождена (инструмент больше
+        отверстия), пропускаем.
+
+    При `distance <= 0` возвращает raw-контур без офсета.
+    """
+    import math
+    points = []
+    if distance <= 1e-9:
+        # Без офсета — просто сэмплируем контур как есть
+        for m in body_movements:
+            if m.kind == 'line':
+                points.append(m.start)
+                points.append(m.end)
+            elif m.kind in ('arc_cw', 'arc_ccw'):
+                # Просто линия между start и end для no-offset случая
+                points.append(m.start)
+                points.append(m.end)
+        return points
+
+    for m in body_movements:
+        if m.kind == 'line':
+            dx = m.end[0] - m.start[0]
+            dy = m.end[1] - m.start[1]
+            L = math.hypot(dx, dy)
+            if L < 1e-9:
+                continue
+            # RIGHT perpendicular = поворот направления на -90° (CW)
+            # (dx,dy)→(dy,-dx). Нормированный.
+            nx = dy / L
+            ny = -dx / L
+            for k in range(samples_per_seg + 1):
+                t = k / samples_per_seg
+                px = m.start[0] + t * dx + distance * nx
+                py = m.start[1] + t * dy + distance * ny
+                points.append((px, py))
+        elif m.kind in ('arc_cw', 'arc_ccw'):
+            r = m.radius
+            if r is None or r < 1e-6:
+                continue
+            ax, ay = m.start
+            bx, by = m.end
+            chord = math.hypot(bx - ax, by - ay)
+            if chord < 1e-9 or r < chord / 2.0 - 1e-6:
+                continue
+            # Реконструируем центр (см. _add_arc_to_path)
+            mx = (ax + bx) / 2.0
+            my = (ay + by) / 2.0
+            h = math.sqrt(max(0.0, r * r - (chord / 2.0) ** 2))
+            perp_x = -(by - ay) / chord
+            perp_y = (bx - ax) / chord
+            sign = -1.0 if m.kind == 'arc_cw' else 1.0
+            cx = mx + sign * h * perp_x
+            cy = my + sign * h * perp_y
+            # Углы
+            a_start = math.atan2(ay - cy, ax - cx)
+            a_end = math.atan2(by - cy, bx - cx)
+            sweep = a_end - a_start
+            if m.kind == 'arc_cw':
+                if sweep > 0:
+                    sweep -= 2 * math.pi
+            else:
+                if sweep < 0:
+                    sweep += 2 * math.pi
+            # Новый радиус после офсета
+            if m.kind == 'arc_cw':
+                new_r = r - distance  # CW — правая сторона к центру
+            else:
+                new_r = r + distance
+            if new_r < 1e-6:
+                continue
+            for k in range(samples_per_seg + 1):
+                t = k / samples_per_seg
+                angle = a_start + sweep * t
+                px = cx + new_r * math.cos(angle)
+                py = cy + new_r * math.sin(angle)
+                points.append((px, py))
+    return points
+
+
+def _draw_lead_arc(path: QtGui.QPainterPath, arc_start, arc_end,
+                   tangent_point, tangent_direction, radius: float):
+    """Рисует лид-arc с направлением обхода ВЫВЕДЕННЫМ из геометрии.
+
+    G12/G13 в Anderson MTX — макросы, направление вращения (CW/CCW)
+    определяется контекстом компенсации, не самим G-кодом. Хардкодить
+    `arc_cw` для G12 и `arc_ccw` для G13 неправильно: приводит к
+    «выгибанию не в ту сторону» при OUTSIDE-проходе (там body идёт
+    в обратном направлении, tangent направлен в противоположную
+    сторону, лид должен изогнуться в другую сторону).
+
+    Args:
+        arc_start, arc_end: точки начала и конца дуги (как в .anc).
+        tangent_point: точка на контуре где дуга касательна (для лид-in
+            это = arc_end, для лид-out это = arc_start).
+        tangent_direction: (dx, dy) — направление касательной в
+            tangent_point (нормированный вектор, из направления body).
+        radius: радиус дуги (уже реконструированный).
+    """
+    import math
+    # Другая точка (не касательная)
+    if tangent_point == arc_end:
+        other_point = arc_start
+    else:
+        other_point = arc_end
+    tx, ty = tangent_direction
+    tlen = math.hypot(tx, ty)
+    if tlen < 1e-9:
+        _add_line_to_path(path, arc_start, arc_end)
+        return
+    tx, ty = tx / tlen, ty / tlen
+    # На какой стороне D-линии (касательная в tangent_point) находится
+    # other_point. Left-перпендикуляр к D в Y-up = (-Dy, Dx). Знак
+    # (other - tangent) · left_perp говорит куда смотрит other.
+    ox = other_point[0] - tangent_point[0]
+    oy = other_point[1] - tangent_point[1]
+    side = ox * (-ty) + oy * tx  # positive = LEFT, negative = RIGHT
+    if abs(side) < 1e-9:
+        # Точки коллинеарны с касательной — дуги нет, рисуем линию
+        _add_line_to_path(path, arc_start, arc_end)
+        return
+    # Центр дуги лежит на перпендикуляре к D в tangent_point, на
+    # ТОЙ ЖЕ стороне что и other_point (иначе окружность бы не
+    # проходила через other).
+    if side > 0:
+        # LEFT of D
+        nx, ny = -ty, tx
+    else:
+        # RIGHT of D
+        nx, ny = ty, -tx
+    cx = tangent_point[0] + radius * nx
+    cy = tangent_point[1] + radius * ny
+    # Углы от центра до start и end дуги
+    a_start = math.atan2(arc_start[1] - cy, arc_start[0] - cx)
+    a_end = math.atan2(arc_end[1] - cy, arc_end[0] - cx)
+    # Sweep нормализуем в (-π, π] — это КОРОТКАЯ дуга (лид всегда
+    # короткая, обычно 30-60°).
+    sweep = a_end - a_start
+    while sweep > math.pi:
+        sweep -= 2 * math.pi
+    while sweep <= -math.pi:
+        sweep += 2 * math.pi
+    # Отрисовываем полилинией
+    if not path.elementCount() or (path.currentPosition().x() != arc_start[0]
+                                    or path.currentPosition().y() != arc_start[1]):
+        path.moveTo(arc_start[0], arc_start[1])
+    N = 32
+    for i in range(1, N + 1):
+        t = i / float(N)
+        angle = a_start + sweep * t
+        if i == N:
+            path.lineTo(arc_end[0], arc_end[1])
+        else:
+            path.lineTo(cx + radius * math.cos(angle),
+                        cy + radius * math.sin(angle))
+
+
+def _add_arc_to_path(path: QtGui.QPainterPath, start, end, radius: float,
+                     cw: bool):
+    """Добавляет дугу к QPainterPath через полилинейную аппроксимацию
+    (32 сегмента). Гарантированно рисует КОРОТКУЮ дугу нужного
+    направления вращения.
+
+    Прошлая реализация через arcTo давала почти полные круги из-за
+    неправильного выбора стороны центра — итерация `for sign in (+1,-1)`
+    всегда брала первый вариант и возвращалась. Для CW-дуг это давало
+    центр на противоположной стороне хорды → sweep уходил вдолгую
+    (~360°) вместо коротких 44°, viewer рисовал полные окружности.
+
+    Полилинейная аппроксимация избавляет от толкования Qt arcTo с
+    учётом Y-flip сцены — точка на дуге считается через центр и
+    угол, добавляется через lineTo. Проще и без багов.
+    """
+    import math
+    ax, ay = start
+    bx, by = end
+    chord = math.hypot(bx - ax, by - ay)
+    if chord < 1e-9:
+        return
+    if radius < chord / 2.0 - 1e-6:
+        # Радиус слишком мал для этой хорды — падаем на линию
+        _add_line_to_path(path, start, end)
+        return
+    # Центр дуги: на перпендикуляре к хорде через её середину, на
+    # расстоянии h от неё.
+    mx = (ax + bx) / 2.0
+    my = (ay + by) / 2.0
+    h = math.sqrt(max(0.0, radius * radius - (chord / 2.0) * (chord / 2.0)))
+    # Единичная перпендикулярная к хорде (вращение хорды на +90° по
+    # математическому направлению = ВЛЕВО от A→B):
+    perp_x = -(by - ay) / chord
+    perp_y = (bx - ax) / chord
+    # Для CW-дуги (G2) центр СПРАВА от направления движения A→B,
+    # т.е. −perp. Для CCW (G3) — слева, +perp.
+    sign = -1.0 if cw else 1.0
+    cx = mx + sign * h * perp_x
+    cy = my + sign * h * perp_y
+    # Углы от центра до концов
+    a1 = math.atan2(ay - cy, ax - cx)
+    a2 = math.atan2(by - cy, bx - cx)
+    # Sweep нормализуем: для CW должен быть отрицательным, для CCW
+    # положительным. Разница углов в диапазоне (-π, π]:
+    sweep = a2 - a1
+    while sweep > math.pi:
+        sweep -= 2.0 * math.pi
+    while sweep <= -math.pi:
+        sweep += 2.0 * math.pi
+    # Дополнительная страховка: если знак sweep'а не соответствует
+    # направлению обхода — прибавляем/вычитаем 2π. На корректно
+    # выбранном центре так не должно случаться, но защищаемся от
+    # численных углов near-π.
+    if cw and sweep > 0:
+        sweep -= 2.0 * math.pi
+    elif (not cw) and sweep < 0:
+        sweep += 2.0 * math.pi
+    # Рисуем полилинией — 32 сегмента, для мелких лид-дуг ~1мм это
+    # ~0.5° на сегмент, визуально гладко.
+    if not path.elementCount() or (path.currentPosition().x() != ax
+                                    or path.currentPosition().y() != ay):
+        path.moveTo(ax, ay)
+    N = 32
+    for i in range(1, N + 1):
+        t = i / float(N)
+        angle = a1 + sweep * t
+        if i == N:
+            # Последняя точка — точно на end (избегаем накопленной ошибки)
+            path.lineTo(bx, by)
+        else:
+            px = cx + radius * math.cos(angle)
+            py = cy + radius * math.sin(angle)
+            path.lineTo(px, py)
+
+
+def add_anc_blades_to_scene(scene: 'CamScene', blades, cutting_params=None,
+                            extras: dict = None, show_filter: dict = None):
+    """Рисует BladeBlock'и (из session.compute_anc_blades) прямо в сцене.
+
+    Полностью заменяет `add_toolpaths_to_scene` — рендер ТОЛЬКО из
+    распарсенных .anc-движений, никакой независимой геометрии в viewer'е.
+    Гарантирует визуальное совпадение с реальной G-code программой.
+
+    Body-контур рисуется через ЭКВИДИСТАНТУ (offset на tool_equidistant
+    вправо от направления обхода), а не raw-контур из .anc. Это
+    показывает где реально пойдёт ЦЕНТР ФРЕЗЫ после G41/G42 компенсации
+    в станке.
+
+    Цветовая схема:
+      - body (эквидистанта): зелёный
+      - lead_in: пурпурный
+      - lead_out: розовый
+
+    Args:
+        scene: CamScene.
+        blades: список BladeBlock из session.compute_anc_blades().
+        cutting_params: legacy — не используется, оставлен для совместимости.
+        extras: dict с 'tool_equidistant' — величина офсета для эквидистанты.
+
+    Returns:
+        Список QGraphicsPathItem — созданные items.
+    """
+    from ..geometry.anc_movement_parser import (
+        reconstruct_lead_arc_radius, Movement)
+
+    # Пены для каждой роли
+    # (per-knife pen'ы создаются ниже в цикле — цвет из PALETTE по op_index)
+
+    items = []
+    # Радиус эквидистанты — из extras (передаётся main_window'ом,
+    # уже включает tip + tan(angle) для реального центра фрезы).
+    tool_radius = 0.0
+    if extras is not None:
+        v = extras.get('tool_equidistant', 0)
+        if v and v > 0:
+            tool_radius = v / 2.0
+
+    # Палитра цветов для per-knife раскраски — совпадает с ToolpathItem'ной
+    # палитрой из старого рендера, чтобы соседние ножи было легко различать.
+    PALETTE = [
+        '#ff6666', '#66ff66', '#6699ff', '#ffcc33', '#ff66cc', '#66ffff',
+        '#cc99ff', '#ffff66', '#ff9966', '#99ff99', '#9999ff', '#ffaa00',
+        '#ff3399', '#33ffcc', '#9966ff', '#ccff66',
+    ]
+    # Индексируем PROGRAM'ы (не op'ы) для назначения цветов.
+    # Программа = группа блоков из одного файла: `_all_R.anc` → 'rough',
+    # каждый `_N_M.anc` → уникальный ключ ('finish_1', 'finish_2', ...),
+    # `_corner.anc` → 'corner_2d'.
+    # Все блоки одной программы получают одинаковый цвет.
+    # Стабильная сортировка ключей — цвета не «прыгают» между запусками.
+    program_keys = sorted({getattr(b, 'program', getattr(b, 'kind', 'rough'))
+                           for b in blades})
+    program_color_index = {k: i for i, k in enumerate(program_keys)}
+
+    # Фильтр по show_filter (по чекбоксам «Черновая»/«Чистовая»/
+    # «2D углы»/«3D углы» из UI). Если None — показываем всё.
+    if show_filter is not None:
+        blades = [b for b in blades
+                  if show_filter.get(getattr(b, 'kind', 'rough'), True)]
+
+    def _body_length_and_arrows(body_mvs, fractions=(0.25, 0.5, 0.75)):
+        """Возвращает список (point, tangent) для стрелок направления
+        в fractions долях длины body-пути.
+
+        body_mvs: список Movement с role='body'.
+        fractions: доли длины пути где ставить стрелки (0..1).
+        """
+        import math as _mfn
+        # Кэшируем длину каждого сегмента + суммарную длину
+        seg_lens = []
+        total = 0.0
+        for m in body_mvs:
+            if m.kind == 'line':
+                L = _mfn.hypot(m.end[0] - m.start[0], m.end[1] - m.start[1])
+            elif m.kind in ('arc_cw', 'arc_ccw'):
+                r = m.radius or 0
+                if r < 1e-6:
+                    L = _mfn.hypot(m.end[0] - m.start[0],
+                                   m.end[1] - m.start[1])
+                else:
+                    # Длина дуги = R * sweep angle
+                    chord = _mfn.hypot(m.end[0] - m.start[0],
+                                       m.end[1] - m.start[1])
+                    if chord >= 2 * r:
+                        sweep = _mfn.pi
+                    else:
+                        sweep = 2 * _mfn.asin(chord / (2 * r))
+                    L = r * sweep
+            else:
+                L = 0.0
+            seg_lens.append(L)
+            total += L
+        if total < 1e-6:
+            return []
+        # Для каждой доли найти точку и касательную
+        result = []
+        for f in fractions:
+            target = total * f
+            acc = 0.0
+            for i, (m, L) in enumerate(zip(body_mvs, seg_lens)):
+                if acc + L >= target - 1e-9:
+                    local_t = ((target - acc) / L) if L > 1e-9 else 0.0
+                    if m.kind == 'line':
+                        px = m.start[0] + local_t * (m.end[0] - m.start[0])
+                        py = m.start[1] + local_t * (m.end[1] - m.start[1])
+                        dx = m.end[0] - m.start[0]
+                        dy = m.end[1] - m.start[1]
+                        tL = _mfn.hypot(dx, dy)
+                        if tL > 1e-9:
+                            result.append(((px, py), (dx / tL, dy / tL)))
+                    elif m.kind in ('arc_cw', 'arc_ccw') and (m.radius or 0) > 1e-6:
+                        # На дуге: точка в arc.start + local_t * sweep
+                        r = m.radius
+                        ax, ay = m.start
+                        bx, by = m.end
+                        chord = _mfn.hypot(bx - ax, by - ay)
+                        mx, my = (ax + bx) / 2.0, (ay + by) / 2.0
+                        h = _mfn.sqrt(max(0.0, r * r - (chord / 2.0) ** 2))
+                        perp_x = -(by - ay) / chord if chord > 1e-9 else 0
+                        perp_y = (bx - ax) / chord if chord > 1e-9 else 0
+                        sign = -1.0 if m.kind == 'arc_cw' else 1.0
+                        cx = mx + sign * h * perp_x
+                        cy = my + sign * h * perp_y
+                        a_start = _mfn.atan2(ay - cy, ax - cx)
+                        a_end = _mfn.atan2(by - cy, bx - cx)
+                        sweep = a_end - a_start
+                        if m.kind == 'arc_cw' and sweep > 0:
+                            sweep -= 2 * _mfn.pi
+                        elif m.kind == 'arc_ccw' and sweep < 0:
+                            sweep += 2 * _mfn.pi
+                        angle = a_start + sweep * local_t
+                        px = cx + r * _mfn.cos(angle)
+                        py = cy + r * _mfn.sin(angle)
+                        # Касательная: перпендикуляр к радиусу, в направлении
+                        # движения по дуге. Для CW: rotate radius CW 90°.
+                        # Для CCW: rotate CCW 90°.
+                        rx = px - cx
+                        ry = py - cy
+                        if m.kind == 'arc_cw':
+                            tx, ty = ry, -rx  # CW rotation
+                        else:
+                            tx, ty = -ry, rx  # CCW rotation
+                        tL = _mfn.hypot(tx, ty)
+                        if tL > 1e-9:
+                            result.append(((px, py), (tx / tL, ty / tL)))
+                    else:
+                        # Дегенеративный случай — используем chord direction
+                        dx = m.end[0] - m.start[0]
+                        dy = m.end[1] - m.start[1]
+                        tL = _mfn.hypot(dx, dy)
+                        if tL > 1e-9:
+                            px = m.start[0] + local_t * dx
+                            py = m.start[1] + local_t * dy
+                            result.append(((px, py), (dx / tL, dy / tL)))
+                    break
+                acc += L
+        return result
+
+    for b in blades:
+        # Разделяем движения по ролям — по одному пути на роль
+        paths_by_role = {
+            'body': QtGui.QPainterPath(),
+            'lead_in': QtGui.QPainterPath(),
+            'lead_out': QtGui.QPainterPath(),
+        }
+        # Собираем body-движения в отдельный список — рисуем их через
+        # ОФСЕТ (эквидистанту) вместо raw-контура. Это и есть Вариант B:
+        # viewer показывает где реально пойдёт ЦЕНТР ФРЕЗЫ после
+        # применения G41/G42 компенсации в станке.
+        body_movements = [m for m in b.movements if m.role == 'body']
+        # Первый и последний body — для реконструкции лид-дуг и bridge'ей
+        body_first = body_movements[0] if body_movements else None
+        body_last = body_movements[-1] if body_movements else None
+
+        # Строим offset body path (эквидистанта)
+        if body_movements:
+            offset_pts = _sample_body_offset(body_movements, tool_radius)
+            if offset_pts:
+                body_path = paths_by_role['body']
+                body_path.moveTo(offset_pts[0][0], offset_pts[0][1])
+                for px, py in offset_pts[1:]:
+                    body_path.lineTo(px, py)
+
+        # ── ЛИД-IN: параллельный сдвиг всего лида на tool_radius ──
+        # Проще некуда: все raw-точки лида (approach → ramp_end → arc_end)
+        # сдвигаются на tool_radius * right_perp(body_direction). Линии
+        # остаются параллельны raw, arc — того же радиуса.
+        lead_in_arc = next((m for m in b.movements if m.role == 'lead_in'), None)
+        approach_mv = next((m for m in b.movements if m.role == 'approach'), None)
+        if (lead_in_arc is not None and body_first is not None
+                and approach_mv is not None):
+            # Ramp_end из raw последней line-сегмента перед arc'ом
+            ramp_end = None
+            for m in b.movements:
+                if m is approach_mv or m.role == 'plunge':
+                    continue
+                if m is lead_in_arc:
+                    break
+                if m.role == 'other' and m.kind == 'line':
+                    ramp_end = m.end
+            if ramp_end is None:
+                ramp_end = lead_in_arc.start
+            # Body direction
+            import math as _m_li
+            body_dx = body_first.end[0] - body_first.start[0]
+            body_dy = body_first.end[1] - body_first.start[1]
+            bL = _m_li.hypot(body_dx, body_dy)
+            body_dir = ((body_dx / bL, body_dy / bL) if bL > 1e-9 else (1.0, 0.0))
+            # Shift vector = tool_radius * right_perp(body_dir) = t*(Dy, -Dx)
+            shift_x = tool_radius * body_dir[1]
+            shift_y = -tool_radius * body_dir[0]
+            # Смещённые точки
+            off_approach = (approach_mv.end[0] + shift_x,
+                            approach_mv.end[1] + shift_y)
+            off_ramp_end = (ramp_end[0] + shift_x, ramp_end[1] + shift_y)
+            off_tangent = (lead_in_arc.end[0] + shift_x,
+                           lead_in_arc.end[1] + shift_y)
+            # Arc R из raw arc (или reconstruct)
+            r = lead_in_arc.radius or reconstruct_lead_arc_radius(
+                lead_in_arc, body_first)
+            # Отрисовка: line + arc
+            path = paths_by_role['lead_in']
+            path.moveTo(off_approach[0], off_approach[1])
+            path.lineTo(off_ramp_end[0], off_ramp_end[1])
+            if r is not None and r >= 1e-6:
+                _draw_lead_arc(path, off_ramp_end, off_tangent,
+                               tangent_point=off_tangent,
+                               tangent_direction=body_dir,
+                               radius=r)
+            else:
+                path.lineTo(off_tangent[0], off_tangent[1])
+
+        # ── ЛИД-OUT: параллельный сдвиг всего лида на tool_radius ──
+        # Симметрично лид-in. Arc.start (первая точка lead_out) → offset,
+        # затем линии lead_out тоже сдвигаются.
+        lead_out_mvs = [m for m in b.movements if m.role == 'lead_out']
+        if lead_out_mvs and body_last is not None:
+            import math as _m_lo
+            body_dx = body_last.end[0] - body_last.start[0]
+            body_dy = body_last.end[1] - body_last.start[1]
+            bL = _m_lo.hypot(body_dx, body_dy)
+            body_dir = ((body_dx / bL, body_dy / bL) if bL > 1e-9 else (1.0, 0.0))
+            shift_x = tool_radius * body_dir[1]
+            shift_y = -tool_radius * body_dir[0]
+            first_out = lead_out_mvs[0]
+            off_tangent = (first_out.start[0] + shift_x,
+                           first_out.start[1] + shift_y)
+            path = paths_by_role['lead_out']
+            path.moveTo(off_tangent[0], off_tangent[1])
+            # Arc первый (если есть) — смещённый
+            first_arc = None
+            for m in lead_out_mvs:
+                if m.kind in ('arc_cw', 'arc_ccw'):
+                    first_arc = m
+                    break
+            if first_arc is not None:
+                r = first_arc.radius
+                if r is None:
+                    fake_next = Movement(role='body', kind='line',
+                                         start=body_last.end,
+                                         end=body_last.start)
+                    r = reconstruct_lead_arc_radius(first_arc, fake_next)
+                if r is not None and r >= 1e-6:
+                    off_arc_end = (first_arc.end[0] + shift_x,
+                                   first_arc.end[1] + shift_y)
+                    _draw_lead_arc(path, off_tangent, off_arc_end,
+                                   tangent_point=off_tangent,
+                                   tangent_direction=body_dir,
+                                   radius=r)
+                    prev_end = off_arc_end
+                else:
+                    prev_end = off_tangent
+            else:
+                prev_end = off_tangent
+            # Оставшиеся lead_out сегменты (после первого arc'а) — линии
+            saw_first_arc = False
+            for m in lead_out_mvs:
+                if m.kind in ('arc_cw', 'arc_ccw') and not saw_first_arc:
+                    saw_first_arc = True
+                    continue
+                if m.kind == 'line':
+                    off_end = (m.end[0] + shift_x, m.end[1] + shift_y)
+                    path.lineTo(off_end[0], off_end[1])
+
+        # Создаём items с per-PROGRAM цветом (не per-knife!).
+        # Все блоки одной программы (rough/finish_N/corner_2d) → один цвет.
+        prog_key = getattr(b, 'program', getattr(b, 'kind', 'rough'))
+        knife_color_str = PALETTE[
+            program_color_index.get(prog_key, 0) % len(PALETTE)]
+        knife_color = QtGui.QColor(knife_color_str)
+        pen_body = QtGui.QPen(knife_color, 0)
+        pen_body.setCosmetic(True)
+        pen_body.setWidthF(1.5)
+        lead_color = QtGui.QColor(knife_color)
+        lead_color.setAlphaF(0.7)
+        pen_lead = QtGui.QPen(lead_color, 0)
+        pen_lead.setCosmetic(True)
+        pen_lead.setWidthF(1.2)
+
+        for role, path in paths_by_role.items():
+            if path.isEmpty():
+                continue
+            item = QtWidgets.QGraphicsPathItem(path)
+            if role == 'body':
+                item.setPen(pen_body)
+            else:
+                item.setPen(pen_lead)
+            item.setZValue(5.0)
+            if getattr(b, 'op_id', None):
+                item.setData(0, b.op_id)
+            scene.addItem(item)
+            items.append(item)
+
+        # ── СТРЕЛКИ НАПРАВЛЕНИЯ ХОДА ──
+        # На body ножа 3 маленькие стрелки: 25%, 50%, 75% длины пути.
+        # Показывают направление движения фрезы. Копия старого рендера.
+        body_mvs = [m for m in b.movements if m.role == 'body']
+        arrows = _body_length_and_arrows(body_mvs, fractions=(0.25, 0.5, 0.75))
+        import math as _m_arr
+        # Размер стрелки ~0.8мм в мировых координатах (визуально ~8px
+        # при типовом зуме, косметически)
+        arrow_size = 0.8
+        for (pt, tan) in arrows:
+            tx, ty = tan
+            # Треугольник: tip впереди, крылья сзади
+            tip = (pt[0] + tx * arrow_size * 0.5,
+                   pt[1] + ty * arrow_size * 0.5)
+            back_x = pt[0] - tx * arrow_size * 0.5
+            back_y = pt[1] - ty * arrow_size * 0.5
+            # Перпендикуляр для крыльев
+            nx, ny = -ty, tx
+            left = (back_x + nx * arrow_size * 0.35,
+                    back_y + ny * arrow_size * 0.35)
+            right = (back_x - nx * arrow_size * 0.35,
+                     back_y - ny * arrow_size * 0.35)
+            arrow_path = QtGui.QPainterPath()
+            arrow_path.moveTo(tip[0], tip[1])
+            arrow_path.lineTo(left[0], left[1])
+            arrow_path.lineTo(right[0], right[1])
+            arrow_path.closeSubpath()
+            arrow_item = QtWidgets.QGraphicsPathItem(arrow_path)
+            arrow_pen = QtGui.QPen(knife_color, 0)
+            arrow_pen.setCosmetic(True)
+            arrow_item.setPen(arrow_pen)
+            arrow_item.setBrush(QtGui.QBrush(knife_color))
+            arrow_item.setZValue(6.0)
+            if getattr(b, 'op_id', None):
+                arrow_item.setData(0, b.op_id)
+            scene.addItem(arrow_item)
+            items.append(arrow_item)
     return items

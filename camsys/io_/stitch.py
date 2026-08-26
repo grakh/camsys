@@ -258,17 +258,26 @@ def _compute_pdf_to_ai_scale(ai_path: Path, project) -> Optional[float]:
 
 
 def _match_orders_to_regions(regions: List[BBox], text_items: List[TextItem],
-                             orders: List[str], scale: float, 
-                             page_h: float) -> Dict[int, str]:
+                             orders: List[str], scale: float,
+                             page_h: float,
+                             filename_orders: Optional[List[str]] = None
+                             ) -> Dict[int, str]:
     """Сопоставляет каждый регион номеру заказа через PDF-текст.
-    
+
     Args:
         regions: список bbox'ов регионов (в .ai-координатах)
         text_items: все текстовые фрагменты из PDF
-        orders: список номеров заказов из имени файла
+        orders: список номеров-кандидатов для поиска в тексте
         scale: PDF-точек на .ai-мм
         page_h: высота PDF-страницы (для Y-flip)
-    
+        filename_orders: номера из ИМЕНИ файла в порядке следования.
+            Используются в ЭТАПЕ 3: если какой-то регион не получил
+            номер из текста (метка не распозналась / склеилась в мусор
+            вроде «4096214»), ему присваивается недостающий номер из
+            имени по позиционному порядку. Гарантирует, что регион
+            получит правильный номер даже когда его печатная метка
+            нечитаема.
+
     Returns:
         {region_index: order_number}
     """
@@ -321,6 +330,29 @@ def _match_orders_to_regions(regions: List[BBox], text_items: List[TextItem],
         if best_idx is not None:
             result[best_idx] = it.text
 
+    # ЭТАП 3: остаточные номера из ИМЕНИ → неназначенные регионы.
+    # Если печатная метка региона не распозналась (0 текста, или
+    # склеилась в мусорное число, отфильтрованное на входе), регион
+    # остаётся без номера. Раздаём ему недостающие номера из имени
+    # файла по позиционному порядку — сверху-вниз, слева-направо
+    # (как обычно нумеруются заказы в сшивке).
+    if filename_orders:
+        assigned = set(result.values())
+        leftover = [o for o in filename_orders if o not in assigned]
+        unassigned_regions = [idx for idx in range(len(regions))
+                              if idx not in result]
+        # Сортируем неназначенные регионы по позиции: сверху(бОльший Y)
+        # вниз, при равенстве — слева направо. bbox = (x0,y0,x1,y1).
+        def _region_sort_key(idx):
+            x0, y0, x1, y1 = regions[idx]
+            cx = (x0 + x1) / 2.0
+            cy = (y0 + y1) / 2.0
+            # Y убывающий (верх раньше) → -cy; X возрастающий
+            return (-round(cy, 1), round(cx, 1))
+        unassigned_regions.sort(key=_region_sort_key)
+        for idx, order_num in zip(unassigned_regions, leftover):
+            result[idx] = order_num
+
     return result
 
 
@@ -370,11 +402,59 @@ def analyze_stitch(ai_path: Path, project) -> Optional[StitchInfo]:
     
     if scale and page_size and info.regions:
         text_items = extract_text_items(ai_path)
+        # Источник номеров — PDF-текст сшивки, НО с приоритетом тех,
+        # что подтверждены именем файла.
+        #
+        # Раньше брали любой 5-7-значный текст. Проблема (41584): на
+        # макете есть посторонняя метка «4096214» (7 цифр — артикул/
+        # штрихкод), которой НЕТ среди заказов имени
+        # (123308/123303/123310/123297). Она проходила фильтр и
+        # «выигрывала» матч по близости к региону — регион получал
+        # неправильный номер 4096214 вместо 123303.
+        #
+        # Фикс: сначала берём кандидатов, ПОДТВЕРЖДЁННЫХ именем файла
+        # (info.orders). Только если таких не нашлось вообще (имя пустое
+        # или совсем не совпало) — откатываемся к любым 5-7-значным
+        # (прежнее поведение для случаев вроде 41316, где имя неполное).
+        _fname_orders = set(info.orders or [])
+        all_candidates = set()
+        for it in text_items:
+            t = it.text.strip()
+            if t.isdigit() and 5 <= len(t) <= 7:
+                all_candidates.add(t)
+        confirmed = all_candidates & _fname_orders
+        if confirmed:
+            # Есть пересечение с именем — используем ТОЛЬКО подтверждённые.
+            # Плюс добавляем номера из имени, которых нет в тексте вообще
+            # (регион без печатной метки получит номер из имени по позиции).
+            candidates = set(_fname_orders)
+        else:
+            # Ни один текст не совпал с именем — прежнее поведение
+            # (случай неполного/расходящегося имени, напр. 41316).
+            candidates = all_candidates
         matches = _match_orders_to_regions(
-            region_bboxes, text_items, info.orders, scale, page_size[1]
+            region_bboxes, text_items, sorted(candidates),
+            scale, page_size[1],
+            filename_orders=list(info.orders or [])
         )
         for region_idx, order_num in matches.items():
             info.regions[region_idx].order_number = order_num
+
+    # FALLBACK: если PDF-текст/scale недоступны (номера в кривых, а не
+    # текстом — частый случай), но имя файла содержит номера заказов —
+    # раздаём их регионам по позиционному порядку (сверху-вниз,
+    # слева-направо). Без этого регионы остались бы вовсе без номеров.
+    if info.regions and info.orders:
+        _need_fallback = all(r.order_number is None for r in info.regions)
+        if _need_fallback:
+            _order_by_pos = list(range(len(info.regions)))
+
+            def _reg_key(idx):
+                x0, y0, x1, y1 = info.regions[idx].bbox
+                return (-round((y0 + y1) / 2.0, 1), round((x0 + x1) / 2.0, 1))
+            _order_by_pos.sort(key=_reg_key)
+            for idx, order_num in zip(_order_by_pos, info.orders):
+                info.regions[idx].order_number = order_num
     
     # 4. Распределение ножей и реперов по регионам
     knife_layer = project.get_layer_by_name("Knife")

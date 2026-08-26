@@ -54,6 +54,148 @@ def angle_between(t1: Tuple[float, float], t2: Tuple[float, float]) -> float:
 from dataclasses import dataclass
 
 
+def corner_needs_rework(polypath: Polypath, tool_radius_mm: float,
+                        vertex_index: int) -> bool:
+    """Физический критерий: нужен ли угол в вершине обработки.
+
+    Критерий — НЕ градусы, а поведение ЭКВИДИСТАНТЫ фрезы:
+    угол требует доработки, если фреза радиуса tool_radius_mm,
+    катясь по контуру, НЕ может дойти до вершины — её эквидистанта
+    в этом месте образует остриё (внешний угол) или самопересекается
+    (внутренний угол), оставляя непрорезанный клин.
+
+    Работает для ЛЮБОГО угла (25°, 90°, 120° — не важно): решает
+    геометрия фрезы, а не значение угла. Свободная форма с плавным
+    на вид углом 120° может требовать 3D, если фреза туда не входит;
+    и наоборот.
+
+    Механика: берём два сегмента, сходящихся в вершине. Строим их
+    эквидистанты (параллельный сдвиг на tool_radius в сторону тела).
+    Если эквидистанты в районе вершины РАСХОДЯТСЯ так, что между ними
+    остаётся зона, куда фреза не достаёт (остриё снаружи) — угол
+    «острый» для фрезы. Численно: сравниваем направление обхода до и
+    после вершины и проверяем, покрывает ли дуга скругления радиусом
+    tool_radius переход между сегментами.
+
+    Args:
+        polypath: контур ножа
+        tool_radius_mm: радиус фрезы (равен tool_equidistant/2)
+        vertex_index: индекс вершины (стыка сегментов i и i+1)
+
+    Returns:
+        True если фреза оставляет клин (угол нужно дорабатывать).
+    """
+    segs = polypath.segments
+    n = len(segs)
+    if n < 2:
+        return False
+    i = vertex_index % n
+    j = (i + 1) % n
+    if j == 0 and not polypath.closed:
+        return False
+    s1 = segs[i]
+    s2 = segs[j]
+
+    # Касательные на входе в вершину и на выходе.
+    try:
+        t1 = s1.tangent_at_end()
+        t2 = s2.tangent_at_start()
+    except Exception:
+        return False
+    d1 = math.hypot(t1[0], t1[1])
+    d2 = math.hypot(t2[0], t2[1])
+    if d1 < 1e-9 or d2 < 1e-9:
+        return False
+    t1 = (t1[0] / d1, t1[1] / d1)
+    t2 = (t2[0] / d2, t2[1] / d2)
+
+    # Поворот направления в вершине (знаковый): + влево (CCW), - вправо.
+    cross = t1[0] * t2[1] - t1[1] * t2[0]
+    dot = t1[0] * t2[0] + t1[1] * t2[1]
+    turn = math.degrees(math.atan2(cross, dot))  # -180..180
+
+    # Локальный радиус скругления в вершине: если один из сегментов —
+    # дуга, её радиус = радиус скругления угла.
+    corner_radius = None
+    for s in (s1, s2):
+        if isinstance(s, Arc):
+            corner_radius = min(corner_radius, s.radius) if corner_radius \
+                else s.radius
+
+    # СЛУЧАЙ 1: скругление дугой (2D-кандидат).
+    # Скругление касательно к соседней линии → turn в стыке МАЛ, но это
+    # НЕ значит что угол проходим. Критерий чисто по радиусу: если
+    # радиус скругления < радиуса фрезы, фреза не входит в дугу и
+    # оставляет материал → угол нужно дорабатывать. Проверяем ДО
+    # раннего выхода по turn (иначе плавные касательные скругления
+    # пропускались).
+    if corner_radius is not None:
+        return corner_radius < tool_radius_mm - 1e-6
+
+    # СЛУЧАЙ 2: стык двух линий (3D-кандидат) — смотрим на turn.
+    # Если переход почти прямой (|turn| мало) — угла нет, фреза идёт
+    # свободно. Порог 5° отсекает биарк-шум и плавные стыки.
+    if abs(turn) < 5.0:
+        return False
+    # Острый стык линий без скругления: радиус скругления = 0 < фрезы
+    # → всегда оставляет клин. Нужна обработка.
+    return True
+
+
+def classify_corner(polypath: Polypath, vertex_index: int,
+                    small_arc_max_mm: float = 2.0) -> str:
+    """Классифицирует угол: '2D' (скругление дугой малого R) или
+    '3D' (острый стык без скругления).
+
+    2D = в вершине есть ДУГА (скругление) радиусом < small_arc_max_mm.
+    3D = стык двух ЛИНИЙ (или дуг большого R) без скругления —
+    настоящее остриё, лезвие должно зайти в вершину.
+    """
+    segs = polypath.segments
+    n = len(segs)
+    i = vertex_index % n
+    j = (i + 1) % n
+    s1 = segs[i]
+    s2 = segs[j]
+    # Есть ли скругляющая дуга малого радиуса в стыке?
+    for s in (s1, s2):
+        if isinstance(s, Arc) and s.radius < small_arc_max_mm:
+            return '2D'
+    return '3D'
+
+
+def detect_corners_by_equidistant(polypath: Polypath,
+                                  tool_radius_mm: float
+                                  ) -> Tuple[bool, bool]:
+    """Единый детектор углов по эквидистанте фрезы.
+
+    Проходит все вершины контура, для каждой проверяет физический
+    критерий `corner_needs_rework` (фреза оставляет клин), и если да —
+    классифицирует 2D/3D.
+
+    Returns:
+        (has_2d, has_3d): нужны ли 2D-программа и/или 3D-программа.
+    """
+    if not polypath or len(polypath.segments) < 2:
+        return (False, False)
+    n = len(polypath.segments)
+    vertices = list(range(n - 1))
+    if polypath.closed:
+        vertices.append(n - 1)  # стык последнего с первым
+    has_2d = False
+    has_3d = False
+    for vi in vertices:
+        if corner_needs_rework(polypath, tool_radius_mm, vi):
+            kind = classify_corner(polypath, vi)
+            if kind == '2D':
+                has_2d = True
+            else:
+                has_3d = True
+        if has_2d and has_3d:
+            break
+    return (has_2d, has_3d)
+
+
 @dataclass
 class SharpCorner:
     """Найденный острый угол на контуре."""
@@ -243,7 +385,7 @@ def _arc_swept_deg(arc: Arc) -> float:
 
 def detect_geometric_corners(polypath: Polypath,
                              radius_threshold_mm: float = 0.7,
-                             min_swept_deg: float = 60.0,
+                             min_swept_deg: float = 40.0,
                              max_swept_deg: float = 180.0,
                              ) -> List[GeometricCorner]:
     """Находит РЕАЛЬНЫЕ острые углы (тугие скругления), отсеивая биарк-шум.
@@ -279,15 +421,53 @@ def detect_geometric_corners(polypath: Polypath,
     if not polypath or not polypath.segments:
         return []
     
+    # ── Предварительная группировка биарк-дуг ──
+    # Реальное скругление R0.3 в .ai часто разбито на несколько мелких
+    # дуг одного радиуса (напр. 6×15°), и каждая по отдельности не
+    # проходит min_swept_deg. Суммируем swept последовательных дуг
+    # СХОЖЕГО радиуса (< порога) — если суммарный разворот >= min_swept,
+    # это одно скругление. Помечаем индексы таких дуг как «в группе».
+    n_segs = len(polypath.segments)
+    in_group = [False] * n_segs
+    i = 0
+    while i < n_segs:
+        seg = polypath.segments[i]
+        if isinstance(seg, Arc) and seg.radius < radius_threshold_mm:
+            # собираем цепочку последовательных дуг похожего радиуса
+            j = i
+            total_swept = 0.0
+            r0 = seg.radius
+            while j < n_segs:
+                sj = polypath.segments[j]
+                if not isinstance(sj, Arc):
+                    break
+                if abs(sj.radius - r0) > 0.15:  # радиус заметно другой
+                    break
+                if sj.radius >= radius_threshold_mm:
+                    break
+                total_swept += _arc_swept_deg(sj)
+                j += 1
+            # если группа из НЕСКОЛЬКИХ дуг даёт заметный суммарный
+            # разворот — помечаем все как часть скругления
+            if j - i >= 2 and min_swept_deg <= total_swept <= max_swept_deg:
+                for k in range(i, j):
+                    in_group[k] = True
+            i = j if j > i else i + 1
+        else:
+            i += 1
+
     corners: List[GeometricCorner] = []
     for i, seg in enumerate(polypath.segments):
         if not isinstance(seg, Arc):
             continue
         if seg.radius >= radius_threshold_mm:
             continue
-        # Отсев биарк-шума: настоящий угол разворачивается значительно
+        # Отсев биарк-шума: настоящий угол разворачивается значительно.
+        # ЛИБО одиночная дуга >= min_swept, ЛИБО дуга входит в группу
+        # последовательных дуг с суммарным разворотом >= min_swept
+        # (скругление R0.3, разбитое на мелкие дуги).
         swept = _arc_swept_deg(seg)
-        if swept < min_swept_deg:
+        if swept < min_swept_deg and not in_group[i]:
             continue
         # Отсев ложных углов: реальный тугой угол не может развернуть 
         # > 180° (это будет обход вокруг выпуклости, а не угол)
@@ -496,12 +676,21 @@ def detect_pointed_corners(polypath: Polypath,
         t1 = s1.tangent_at_end()
         t2 = s2.tangent_at_start()
         
-        # Угол между касательными в градусах
+        # Угол ПОВОРОТА направления между касательными в градусах.
         a = angle_between(t1, t2)
-        # Внутренний угол излома (180° = плавно, 0° = разворот)
+        # Внутренний угол излома: 180° = плавно (нет угла),
+        # 90° = прямой угол, 0° = игла-разворот.
         interior = 180.0 - a
         
-        if a >= sharp_threshold_deg:  # касательные расходятся достаточно
+        # «Острый угол для 3D» = поворот касательных ≥ порога, т.е. в
+        # стыке ЕСТЬ заметный излом без скругления. Прямой угол 90°
+        # (поворот 90°) — ЭТО острый угол для 3D: лезвие должно зайти в
+        # самую вершину, обычным резом с эквидистантой туда не попасть.
+        # Скруглённые углы (соседняя дуга малого R) отсеиваются выше как
+        # 2D-задача. Порог по умолчанию 30° отсекает лишь плавные
+        # переходы (почти прямая линия), но ловит все реальные углы
+        # включая прямые.
+        if a >= sharp_threshold_deg:
             cross = t1[0]*t2[1] - t1[1]*t2[0]
             turn_sign = 1 if cross > 0 else -1
             result.append(SharpAngularCorner(
