@@ -1251,14 +1251,43 @@ class CamSession:
     # ─────────────────────────────────────────────────────────────────────
     
     def save_state_to_json(self, path: str) -> None:
-        """Сохраняет cutting_params + post_name в JSON.
+        """Сохраняет cutting_params + post_name + состояние операций.
         
-        Геометрию НЕ сохраняем — она восстанавливается из .ai.
+        Геометрию НЕ сохраняем — она восстанавливается из .ai, а вот ручные
+        решения оператора (отключённые ножи/пути, ручные заходы) сохраняем,
+        чтобы повтор заказа поднимался ровно в том же виде.
         """
+        ops_state = {}
+        try:
+            for op in (self.project.operations if self.project else []):
+                st = {}
+                if op.attributes.get('excluded'):
+                    st['excluded'] = True
+                if op.attributes.get('lead_override'):
+                    st['lead_override'] = op.attributes['lead_override']
+                if not getattr(op, 'enabled', True):
+                    st['disabled'] = True
+                if st:
+                    # Ключ стабильный между импортами: имя + вид операции
+                    # (op.id генерируется заново при повторном импорте .ai).
+                    _k = "%s|%s" % (getattr(op, 'name', ''),
+                                    getattr(op.kind, 'name', str(op.kind)))
+                    ops_state[_k] = st
+        except Exception:
+            ops_state = {}
         data = {
             'source_ai_path': self.project.source_ai_path if self.project else None,
             'cutting_params': self.get_cutting_params_dict(),
             'post_name': self.post_name,
+            'ops_state': ops_state,
+            # Список заказов макета и их персональные настройки — чтобы при
+            # загрузке дропбокс заказов поднялся как был.
+            'order_settings': getattr(self, '_order_settings', {}) or {},
+            # Заказы, у которых были построены пути (сами траектории не
+            # храним — они зависят от версии алгоритма; при загрузке
+            # пересчитываем эти заказы, результат тот же).
+            'orders_with_paths': list(
+                getattr(self, '_orders_with_paths', []) or []),
         }
         Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False),
                               encoding='utf-8')
@@ -1275,3 +1304,38 @@ class CamSession:
         
         if 'post_name' in data:
             self.post_name = data['post_name']
+
+        # Настройки заказов (дропбокс + per-order параметры)
+        self._orders_with_paths = list(data.get('orders_with_paths') or [])
+        _os_ = data.get('order_settings')
+        if _os_:
+            try:
+                if not hasattr(self, '_order_settings') or \
+                        self._order_settings is None:
+                    self._order_settings = {}
+                self._order_settings.update(_os_)
+            except Exception:
+                pass
+
+        # Восстанавливаем ручные решения оператора (макет): отключённые ножи
+        # и пути, ручные заходы. Операции пересоздаются из .ai с теми же id,
+        # поэтому сопоставляем по id; отсутствующие просто пропускаем.
+        ops_state = data.get('ops_state') or {}
+        if ops_state and self.project:
+            try:
+                if not self.project.operations:
+                    self.create_blade_operations()
+                for op in self.project.operations:
+                    _k = "%s|%s" % (getattr(op, 'name', ''),
+                                    getattr(op.kind, 'name', str(op.kind)))
+                    st = ops_state.get(_k) or ops_state.get(op.id)
+                    if not st:
+                        continue
+                    if st.get('excluded'):
+                        op.attributes['excluded'] = True
+                    if st.get('lead_override'):
+                        op.attributes['lead_override'] = st['lead_override']
+                    if st.get('disabled'):
+                        op.enabled = False
+            except Exception:
+                pass

@@ -350,6 +350,7 @@ class CuttingParamsPanel(QtWidgets.QWidget):
     """
     
     paramsChanged = QtCore.Signal()
+    rapidsVisibilityChanged = QtCore.Signal(bool)  # показ перебегов
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -389,8 +390,9 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         knife_form = QtWidgets.QFormLayout(knife_group)
         
         self.angle = QtWidgets.QComboBox()
-        self.angle.addItems(["60", "70", "80", "90"])
-        self.angle.setCurrentText("70")
+        self.angle.addItems(["—", "60", "70", "80", "90"])
+        self.angle.setCurrentText("—")  # не задано, пока не пришло из XML
+        self.angle.setStyleSheet("background-color: #ffd6ec;")
         knife_form.addRow("Угол:", self.angle)
         
         self.tip = QtWidgets.QComboBox()
@@ -400,7 +402,8 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         
         self.top = QtWidgets.QDoubleSpinBox()
         self.top.setRange(0.0, 5.0); self.top.setDecimals(3)
-        self.top.setSingleStep(0.001); self.top.setValue(0.440)
+        self.top.setSingleStep(0.001); self.top.setValue(0.0)  # не задано
+        self.top.setStyleSheet("background-color: #ffd6ec;")
         self.top.setToolTip("Высота ножа над поверхностью материала")
         knife_form.addRow("Высота:", self.top)
         
@@ -419,8 +422,12 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         self.dir_horiz = QtWidgets.QRadioButton("→ Горизонтально")
         self.dir_vert = QtWidgets.QRadioButton("↑↑ Вертикально")
         self.dir_horiz.setChecked(True)
-        dir_layout.addWidget(self.dir_horiz)
-        dir_layout.addWidget(self.dir_vert)
+        # Радиокнопки направления — в одну строку (место есть)
+        _dir_row = QtWidgets.QHBoxLayout()
+        _dir_row.addWidget(self.dir_horiz)
+        _dir_row.addWidget(self.dir_vert)
+        _dir_row.addStretch(1)
+        dir_layout.addLayout(_dir_row)
         
         self.use_reverse = QtWidgets.QCheckBox("Включить реверс")
         self.use_reverse.setChecked(True)
@@ -625,8 +632,10 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         # Добавляем группы В ОТДЕЛЬНОСТИ (не вкладываем режим в lead_group), 
         # чтобы можно было `lead_group.setEnabled(False)` в Auto-режиме — 
         # блокировать все поля разом, не трогая радио.
-        layout.addWidget(lead_group)
+        # «Режим применения» — НАД «Точкой входа/выхода»: режим определяет,
+        # к чему применяются поля ниже, логичнее выбирать его первым.
         layout.addWidget(lead_mode_group)
+        layout.addWidget(lead_group)
         
         # ── ЧТО ГЕНЕРИРОВАТЬ ──
         gen_group = QtWidgets.QGroupBox("Генерировать файлы")
@@ -664,6 +673,14 @@ class CuttingParamsPanel(QtWidgets.QWidget):
             "биарк-веера, чтобы эквидистанта (offset) не самопересекалась.\n"
             "Применяется и в превью, и в .anc. Требует shapely.")
         gen_layout.addWidget(self.gen_smooth)
+
+        # Отображение холостых перемещений (перебегов) между проходами
+        self.show_rapids = QtWidgets.QCheckBox("Показывать перебеги станка")
+        self.show_rapids.setChecked(False)
+        self.show_rapids.setToolTip(
+            "Холостые перемещения между проходами (серый пунктир). "
+            "Видно, много ли станок ездит вхолостую.")
+        gen_layout.addWidget(self.show_rapids)
         
         layout.addWidget(gen_group)
         
@@ -702,6 +719,8 @@ class CuttingParamsPanel(QtWidgets.QWidget):
                   self.gen_rough, self.gen_reverse, self.gen_finish,
                   self.gen_sv, self.gen_corner, self.gen_corner_3d]:
             w.toggled.connect(self._on_changed)
+        # Перебеги — ТОЛЬКО видимость, без пересчёта путей
+        self.show_rapids.toggled.connect(self.rapidsVisibilityChanged)
     
     def _on_changed(self):
         self.paramsChanged.emit()
@@ -733,9 +752,11 @@ class CuttingParamsPanel(QtWidgets.QWidget):
             w.blockSignals(True)
         try:
             # ── Параметры ножа ──
-            self.angle.setCurrentText("70")
+            self.angle.setCurrentText("—")  # не задано (придёт из XML)
+            self.angle.setStyleSheet("background-color: #ffd6ec;")
             self.tip.setCurrentText("0_8")
-            self.top.setValue(0.440)
+            self.top.setValue(0.0)  # не задано
+            self.top.setStyleSheet("background-color: #ffd6ec;")
             self.bottom.setValue(0.250)
             
             # ── Направление ──
@@ -784,11 +805,21 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         # Пятка из текста '1_2' → 1.2
         tip_str = self.tip.currentText().replace('_', '.')
         tip_value = float(tip_str)
-        
+
+        # Угол/высота могут быть «не заданы» (не пришли из XML). НЕ падаем
+        # здесь (метод зовётся и на живом UI) — возвращаем 0; блокировку
+        # экспорта делает action_export через params_are_valid().
+        _angle_txt = self.angle.currentText().strip().replace(',', '.')
+        try:
+            _angle_val = float(_angle_txt)
+        except (ValueError, TypeError):
+            _angle_val = 0.0
+        _top_val = self.top.value()
+
         return {
-            'knife_angle': float(self.angle.currentText()),
+            'knife_angle': _angle_val,
             'tip_diameter': tip_value,
-            'top': self.top.value(),
+            'top': _top_val,
             'bottom': self.bottom.value(),
             'direction': 'horizontal' if self.dir_horiz.isChecked() else 'vertical',
             'enable_reverse': self.use_reverse.isChecked(),
@@ -1023,6 +1054,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.params_panel = CuttingParamsPanel()
         self.params_panel.btn_export.clicked.connect(self.action_export)
         self.params_panel.btn_show_paths.clicked.connect(self.action_toggle_paths)
+        self.params_panel.rapidsVisibilityChanged.connect(
+            self._on_rapids_visibility)
         
         # Связка радио-режимов «Авто/Все/Выделенные» с возможностью 
         # выделения ножей на канвасе. Селект работает только в режиме 
@@ -1404,6 +1437,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # 5. Если не было сохранённых настроек — грузим из XML
         if not loaded:
             self._apply_spec_xml_for_order(order)
+
+        # 5a. Перепроверяем наличие острых углов ДЛЯ ЭТОГО заказа: у разных
+        # заказов в макете ножи разные (фигурные / прямоугольники / круги),
+        # поэтому галки «Острые углы» должны переключаться при смене заказа,
+        # а не оставаться от предыдущего.
+        try:
+            self._auto_detect_corner_programs()
+        except Exception:
+            pass
         
         # Статус
         if stitch:
@@ -1450,8 +1492,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     belongs = op.attributes.get('fiducial_id') in allowed_fids
                 if belongs:
                     op_attrs[op.id] = {
+                        'name': getattr(op, 'name', ''),
                         'excluded': op.attributes.get('excluded', False),
                         'lead_override': dict(op.attributes.get('lead_override', {})),
+                        # Ручной выбор стороны захода на конкретном элементе
+                        'preferred_lead_side': op.attributes.get(
+                            'preferred_lead_side'),
                     }
         self.session._order_settings[order] = {
             'ui': ui,
@@ -1473,13 +1519,36 @@ class MainWindow(QtWidgets.QMainWindow):
             w.blockSignals(True)
         try:
             ui = settings.get('ui', {})
-            if 'angle' in ui: p.angle.setCurrentText(ui['angle'])
+            if 'angle' in ui:
+                p.angle.setCurrentText(ui['angle'])
+                # Значение восстановлено из сборки — снимаем подсветку
+                # «не задано» (иначе поле остаётся розовым, хотя заполнено).
+                try:
+                    if str(ui['angle']).strip() not in ('', '—'):
+                        p.angle.setStyleSheet("")
+                except Exception:
+                    pass
             if 'tip' in ui: p.tip.setCurrentText(ui['tip'])
-            if 'top' in ui: p.top.setValue(ui['top'])
+            if 'top' in ui:
+                p.top.setValue(ui['top'])
+                try:
+                    if float(ui['top']) > 0:
+                        p.top.setStyleSheet("")
+                except Exception:
+                    pass
             if 'bottom' in ui: p.bottom.setValue(ui['bottom'])
             if 'direction_horiz' in ui:
                 p.dir_horiz.setChecked(ui['direction_horiz'])
                 p.dir_vert.setChecked(not ui['direction_horiz'])
+                # Порядок обхода должен соответствовать направлению заказа:
+                # слева-направо → строками, снизу-вверх → столбцами.
+                try:
+                    self.session.sort_by_grid(
+                        direction="LB",
+                        grouping=("rows" if ui['direction_horiz']
+                                  else "columns"))
+                except Exception:
+                    pass
             if 'use_reverse' in ui: p.use_reverse.setChecked(ui['use_reverse'])
             if 'max_geom_len' in ui: p.max_geom_len.setValue(ui['max_geom_len'])
             if 'fiducial_x' in ui: p.fiducial_x.setValue(ui['fiducial_x'])
@@ -1488,15 +1557,55 @@ class MainWindow(QtWidgets.QMainWindow):
                 w.blockSignals(False)
         # Восстановить op.attributes для этого заказа
         op_attrs = settings.get('op_attrs', {})
+        # После перезагрузки .ai (сборка из файла) id операций генерируются
+        # заново, поэтому по id ничего не находилось и индивидуальные
+        # смещения/исключения терялись. Держим запасной индекс по имени.
+        _by_name = {}
+        try:
+            for _oid, _st in op_attrs.items():
+                _nm = _st.get('name') if isinstance(_st, dict) else None
+                if _nm:
+                    _by_name[_nm] = _st
+        except Exception:
+            _by_name = {}
+        # Ограничиваем применение ножами ЭТОГО заказа: при копиях макета
+        # имена операций повторяются («Blade Knife_1» есть в каждой копии),
+        # и сопоставление по имени иначе попадало в чужую копию.
+        _allowed = None
+        try:
+            _st2 = getattr(self.session, '_stitch_info', None)
+            _rg = _st2.get_region_by_order(order) if _st2 else None
+            if _rg is not None:
+                _allowed = set(_rg.knife_ids or []) | set(
+                    getattr(_rg, 'fiducial_ids', []) or [])
+        except Exception:
+            _allowed = None
         for op in self.session.project.operations:
-            if op.id in op_attrs:
-                stored = op_attrs[op.id]
+            if _allowed is not None:
+                _own = set(op.geometry_ids or [])
+                _pg = op.attributes.get('parent_geom_id')
+                if _pg:
+                    _own.add(_pg)
+                _fd = op.attributes.get('fiducial_id')
+                if _fd:
+                    _own.add(_fd)
+                if _own and not (_own & _allowed):
+                    continue
+            stored = op_attrs.get(op.id)
+            if stored is None:
+                stored = _by_name.get(getattr(op, 'name', None))
+            if stored is not None:
                 op.attributes['excluded'] = stored.get('excluded', False)
                 lo = stored.get('lead_override')
                 if lo:
                     op.attributes['lead_override'] = dict(lo)
                 else:
                     op.attributes.pop('lead_override', None)
+                _pls = stored.get('preferred_lead_side')
+                if _pls:
+                    op.attributes['preferred_lead_side'] = _pls
+                else:
+                    op.attributes.pop('preferred_lead_side', None)
         return True
     
     def _apply_stitch_filter(self, region):
@@ -1533,7 +1642,18 @@ class MainWindow(QtWidgets.QMainWindow):
             extra = getattr(self, '_extra_shown_orders', set())
             for order_name, items in self._order_toolpath_items.items():
                 visible = (order_name == current) or (order_name in extra)
+                _rap_on = (self.params_panel.show_rapids.isChecked()
+                           if hasattr(self.params_panel, 'show_rapids')
+                           else False)
                 for item in items:
+                    # Перебеги подчиняются своей галке, иначе всплывали при
+                    # показе заказа даже с выключенной галкой.
+                    try:
+                        if item.data(0) == 'rapid':
+                            item.setVisible(visible and _rap_on)
+                            continue
+                    except Exception:
+                        pass
                     item.setVisible(visible)
             current_items = self._order_toolpath_items.get(current, [])
             if current_items:
@@ -1647,7 +1767,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 widget.setStyleSheet("")  # снимаем розовое, значение из XML
                 applied.append(f"{widget_key}={value}")
             else:
-                # Значения из XML нет — подсвечиваем, чтобы юзер обратил внимание
+                # Значения из XML нет — НЕ оставляем тихий дефолт.
+                # Чистим в «не задано» (пусто/0) и подсвечиваем, чтобы точно
+                # было видно, что значение не подтянулось (иначе уедет в
+                # работу с дефолтом — это хуже).
+                widget.blockSignals(True)
+                if isinstance(widget, QtWidgets.QComboBox):
+                    if widget.findText("—") < 0:
+                        widget.insertItem(0, "—")
+                    widget.setCurrentText("—")
+                else:
+                    widget.setValue(0.0)
+                widget.blockSignals(False)
                 widget.setStyleSheet(pink_style)
         
         # Сообщение в статус-бар
@@ -1695,9 +1826,26 @@ class MainWindow(QtWidgets.QMainWindow):
         if knife is None:
             return
 
+        # Детектируем ТОЛЬКО по ножам текущего заказа: раньше шли по всем
+        # геометриям макета, и если углы были хоть у одного ножа, галка
+        # вставала для всех заказов (в т.ч. там, где ножи круглые).
+        _geoms = list(knife.geometries)
+        try:
+            _cur = getattr(self, '_current_stitch_order', None)
+            _st = getattr(self.session, '_stitch_info', None)
+            if _cur and _cur != "_default" and _st is not None:
+                _r = _st.get_region_by_order(_cur)
+                _ids = set(getattr(_r, 'knife_ids', []) or []) if _r else None
+                if _ids:
+                    _sel = [g for g in knife.geometries if g.id in _ids]
+                    if _sel:
+                        _geoms = _sel
+        except Exception:
+            _geoms = list(knife.geometries)
+
         any_2d = False
         any_3d = False
-        for g in knife.geometries:
+        for g in _geoms:
             if not g.polypath:
                 continue
             has2d, has3d = detect_corners_by_equidistant(
@@ -1844,13 +1992,38 @@ class MainWindow(QtWidgets.QMainWindow):
         
         act_toggle = menu.addAction(
             "Включить нож" if is_excluded else "Отключить нож")
+        # Отключить ТОЛЬКО этот путь (выделенную операцию), не весь нож.
+        # Практично для точечного отключения отдельного угла/прохода.
+        act_toggle_path = menu.addAction(
+            "Включить путь" if is_excluded else "Отключить путь (выделенный)")
         act_reset = menu.addAction("Сбросить переопределение")
         act_reset.setEnabled(has_override)
+        # Диагностика угла — показать вычисленные вьювером признаки
+        diag = op.attributes.get('_diag')
+        act_diag = None
+        if diag is not None:
+            act_diag = menu.addAction("Диагностика угла…")
+        diag_off = op.attributes.get('_diag_offset')
+        act_diag_off = None
+        if diag_off:
+            act_diag_off = menu.addAction("Диагностика смещения…")
         
         # Показываем меню у курсора
         chosen = menu.exec(QtGui.QCursor.pos())
         
-        if chosen is act_toggle:
+        if chosen is act_toggle_path:
+            # Тоггл excluded ТОЛЬКО на этой операции — без синхронизации
+            # с ножом (в отличие от «Отключить нож» для BLADE).
+            new_excluded = not is_excluded
+            op.attributes['excluded'] = new_excluded
+            new_state = "исключён" if new_excluded else "активен"
+            self.statusBar().showMessage(
+                f"{op_name} (путь) → {new_state}", 3000)
+            self._refresh_operations()
+            self.scene.refresh_fiducial_state(self.session.project)
+            if self.params_panel.btn_show_paths.isChecked():
+                self.action_toggle_paths(True)
+        elif chosen is act_toggle:
             new_excluded = not is_excluded
             op.attributes['excluded'] = new_excluded
             new_state = "исключён" if new_excluded else "активен"
@@ -1880,6 +2053,30 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"{op_name} → override сброшен", 3000)
             if self.params_panel.btn_show_paths.isChecked():
                 self.action_toggle_paths(True)
+        elif act_diag is not None and chosen is act_diag:
+            d = op.attributes.get('_diag', {})
+            lines = [f"{op_name}", ""]
+            for k in ('apex', 'corner_radius', 'rounding_R', 'rounding_center',
+                      'convex', 'inward', 'forced_lead_side'):
+                lines.append(f"{k} = {d.get(k)}")
+            QtWidgets.QMessageBox.information(
+                self, "Диагностика угла", "\n".join(str(x) for x in lines))
+        elif act_diag_off is not None and chosen is act_diag_off:
+            d = op.attributes.get('_diag_offset', {})
+            lines = [f"{op_name}", ""]
+            for side in ('OUTSIDE', 'INSIDE', 'LEFT', 'RIGHT'):
+                if side in d:
+                    s = d[side]
+                    field = ("Внутренний" if side in ('OUTSIDE', 'RIGHT')
+                             else "Внешний")
+                    lines.append(f"[{side} = {field}]")
+                    lines.append(f"  offset = {s.get('user_offset')}")
+                    lines.append(f"  из .anc = {s.get('from_anc')}  "
+                                 f"tangent = {s.get('anc_tangent')}")
+                    lines.append(f"  старт = {s.get('start')}")
+                    lines.append("")
+            QtWidgets.QMessageBox.information(
+                self, "Диагностика смещения", "\n".join(str(x) for x in lines))
     
     def _on_lead_mode_changed(self, mode_id: int, checked: bool):
         """Обработчик переключения радио-режима lead'а.
@@ -2006,6 +2203,46 @@ class MainWindow(QtWidgets.QMainWindow):
         # Кнопка остаётся checked, сигнал не дёргаем.
         self.action_toggle_paths(True)
     
+    def _on_rapids_visibility(self, visible: bool):
+        """Показ/скрытие перебегов станка БЕЗ пересчёта путей.
+
+        Перебеги строятся всегда и помечены data(0)=='rapid' — здесь просто
+        переключаем им видимость, чтобы галка работала мгновенно.
+        """
+        try:
+            scene = self.viewer.scene()
+            n = 0
+            # Какие ножи (операции) сейчас видимы — перебег показываем
+            # только если видны ОБА его конца, иначе он висел бы в воздухе.
+            _vis_ops = set()
+            for it in scene.items():
+                try:
+                    if it.data(0) == 'rapid':
+                        continue
+                    _oid = getattr(it, 'op_id', None)
+                    if _oid and it.isVisible():
+                        _vis_ops.add(_oid)
+                except Exception:
+                    continue
+            for it in scene.items():
+                try:
+                    if it.data(0) != 'rapid':
+                        continue
+                    _a, _b = it.data(1), it.data(2)
+                    _ok = True
+                    if _vis_ops:
+                        _ok = ((_a in _vis_ops or not _a) and
+                               (_b in _vis_ops or not _b))
+                    it.setVisible(visible and _ok)
+                    n += 1
+                except Exception:
+                    continue
+            if n == 0 and visible:
+                self.statusBar().showMessage(
+                    "Перебеги появятся после построения путей", 3000)
+        except Exception:
+            pass
+
     def action_toggle_paths(self, checked: bool = True):
         """Кнопка «Построение путей» — строит/обновляет пути для 
         АКТИВНОГО заказа.
@@ -2076,7 +2313,11 @@ class MainWindow(QtWidgets.QMainWindow):
             # после ручных правок и переключения в «Авто» + «Пересчитать»
             # ножи считаются алгоритмом заново, даже если override
             # где-то залежался (в op.attributes или в _order_settings).
-            self._clear_lead_overrides()
+            # ИСКЛЮЧЕНИЕ: при загрузке сборки ручные заходы только что
+            # восстановлены из файла — стирать их нельзя (иначе
+            # индивидуальные смещения возвращались «по умолчанию»).
+            if not getattr(self, '_restoring_saved_state', False):
+                self._clear_lead_overrides()
         
         try:
             # Применим текущие параметры к session
@@ -2239,7 +2480,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 tip_diameter=params.get('tip_diameter', 0.8),
                 top=params.get('top', 0.45),
                 bottom=params.get('bottom', 0.2),
-                generate_corner=params.get('generate_corner', True),
+                generate_corner=params.get('generate_corner', False),
                 generate_corner_3d=params.get('generate_corner_3d', False),
             )
             exp = PackageExporter(self.session.project, macro)
@@ -2353,6 +2594,9 @@ class MainWindow(QtWidgets.QMainWindow):
                          self.params_panel.gen_finish.isChecked(),
                 'corner_2d': self.params_panel.gen_corner.isChecked(),
                 'corner_3d': self.params_panel.gen_corner_3d.isChecked(),
+                'rapids': (self.params_panel.show_rapids.isChecked()
+                           if hasattr(self.params_panel, 'show_rapids')
+                           else False),
             }
 
             def _on_progress(current, total):
@@ -2411,6 +2655,32 @@ class MainWindow(QtWidgets.QMainWindow):
         # Снимаем подсветку автоподбора с полей лидов (юзер начал экспорт)
         try:
             self.params_panel.clear_auto_lead_highlight()
+        except Exception:
+            pass
+        # Защита: угол/высота должны быть заданы (подтянуты из XML или
+        # введены вручную). Иначе — явный отказ, чтобы не уехать в работу
+        # с неверным значением по-тихому.
+        try:
+            _pp = self.params_panel
+            _ang_txt = _pp.angle.currentText().strip().replace(',', '.')
+            _ang_ok = False
+            try:
+                _ang_ok = float(_ang_txt) > 0
+            except (ValueError, TypeError):
+                _ang_ok = False
+            _top_ok = _pp.top.value() > 0
+            if not _ang_ok or not _top_ok:
+                miss = []
+                if not _ang_ok:
+                    miss.append("угол заточки")
+                if not _top_ok:
+                    miss.append("высота ножа")
+                QtWidgets.QMessageBox.warning(
+                    self, "Не заданы параметры ножа",
+                    "Не заданы (розовые поля): " + ", ".join(miss) + ".\n\n"
+                    "Подтяните из XML спецификации или введите вручную — "
+                    "экспорт с умолчанием запрещён.")
+                return
         except Exception:
             pass
         # Весь экспорт обёрнут в защиту: под .pyw (без консоли) любое
@@ -2644,14 +2914,21 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-        _set(lambda: p.angle.setCurrentText(self._get_default("angle", "70")))
+        # Угол и высота НЕ берём из дефолтов — только из XML спецификации.
+        # Ставим «не задано» + розовое, чтобы было видно (иначе уедет в
+        # работу с дефолтом).
+        def _mark_unset_angle():
+            p.angle.setCurrentText("—")
+            p.angle.setStyleSheet("background-color: #ffd6ec;")
+        def _mark_unset_top():
+            p.top.setValue(0.0)
+            p.top.setStyleSheet("background-color: #ffd6ec;")
+        _set(_mark_unset_angle)
         _set(lambda: p.tip.setCurrentText(self._get_default("tip", "0_8")))
-        # Высота ПЕРВОЙ — от неё зависит ABS
-        _top = self._get_default("top", 0.440)
-        _set(lambda: p.top.setValue(_top))
-        # ABS по правилу высоты
-        _abs = self._abs_for_height(_top)
-        _set(lambda: p.bottom.setValue(_abs))
+        _set(_mark_unset_top)
+        # ABS по умолчанию (высота ещё не задана — берём ABS-низ как базу;
+        # реальное значение проставится когда придёт высота из XML)
+        _set(lambda: p.bottom.setValue(self._get_default("abs_low", 0.19)))
         _set(lambda: p.max_geom_len.setValue(self._get_default("limit", 3000.0)))
         _set(lambda: p.lead_in_angle.setValue(self._get_default("lead_in_angle", 45.0)))
         _set(lambda: p.lead_in_length.setValue(self._get_default("lead_in_length", 1.0)))
@@ -3133,26 +3410,157 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Нет проекта", 
                                           "Нечего сохранять")
             return
+        # По умолчанию предлагаем папку CAD первого ножа (рядом с исходным
+        # .ai) и имя по номеру заказа — чтобы сохранённая сборка лежала
+        # вместе с макетом и легко находилась при повторе.
+        _default = self._last_dir
+        try:
+            from pathlib import Path as _P
+            _ai = getattr(self.session.project, 'source_ai_path', None)
+            if _ai:
+                _aip = _P(_ai)
+                _dir = _aip.parent
+                _cad = _dir / "CAD"
+                if _cad.is_dir():
+                    _dir = _cad
+                elif _dir.name.upper() != "CAD":
+                    for _p in _dir.parents:
+                        _c = _p / "CAD"
+                        if _c.is_dir():
+                            _dir = _c
+                            break
+                _default = str(_dir / (_aip.stem + ".json"))
+        except Exception:
+            _default = self._last_dir
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Сохранить настройки", self._last_dir,
+            self, "Сохранить сборку (настройки + макет)", _default,
             "JSON (*.json)")
         if not path:
             return
         # Применить текущие параметры
         params = self.params_panel.get_params_dict()
         self.session.set_cutting_params_from_dict(params)
+        # Настройки АКТИВНОГО заказа снимаются в словарь только при
+        # переключении на другой — при сохранении сборки его правки
+        # (направление, смещения, исключения) иначе не попадали в файл.
+        try:
+            _cur = getattr(self, '_current_stitch_order', None)
+            if _cur:
+                self._save_order_settings(_cur)
+        except Exception:
+            pass
+        # Заказы, у которых пути были построены — чтобы при загрузке
+        # восстановить их все, а не только активный.
+        try:
+            _with = [k for k, v in getattr(
+                self, '_order_toolpath_items', {}).items() if v]
+            self.session._orders_with_paths = _with
+        except Exception:
+            pass
         self.session.save_state_to_json(path)
         self.statusBar().showMessage(f"Сохранено: {path}", 3000)
     
     def action_load_state(self):
+        # Стартовый каталог — БАЗОВЫЙ путь из настроек (при загрузке мы ещё
+        # не знаем, какой заказ грузим, поэтому привязка к текущему .ai тут
+        # не имеет смысла).
+        _start = self._last_dir
+        try:
+            _base = self._get_export_base_path()
+            if _base:
+                _start = _base
+        except Exception:
+            pass
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Загрузить настройки", self._last_dir,
+            self, "Загрузить сборку (настройки + макет)", _start,
             "JSON (*.json)")
         if not path:
             return
         try:
+            self._restoring_saved_state = True
             self.session.load_state_from_json(path)
+            # load_state_from_json грузит .ai напрямую, минуя цепочку
+            # открытия файла — поэтому разбор сшивки (список заказов),
+            # детекция углов и операции не выполнялись, и дропбокс «№»
+            # оставался пустым. Выполняем их здесь.
+            try:
+                _ai = getattr(self.session.project, 'source_ai_path', None)
+                if _ai:
+                    self.session._last_ai_path = _ai
+                    self._opened_a_file = True
+                    if not self.session.project.operations:
+                        self.session.create_blade_operations()
+                        try:
+                            # Порядок обхода по восстановленному направлению:
+                            # горизонтально (слева-направо) → строками,
+                            # вертикально (снизу-вверх) → столбцами.
+                            # Раньше звался дефолт (всегда столбцы), из-за
+                            # чего пересчёт шёл «задом наперёд».
+                            _hz = True
+                            try:
+                                _hz = self.params_panel.dir_horiz.isChecked()
+                            except Exception:
+                                pass
+                            self.session.sort_by_grid(
+                                direction="LB",
+                                grouping="rows" if _hz else "columns")
+                        except Exception:
+                            pass
+                    self._auto_set_fiducial_x()
+                    self._analyze_and_setup_stitch(_ai)
+                    self._auto_detect_corner_programs()
+            except Exception as _e:
+                self.statusBar().showMessage(f"Разбор макета: {_e}", 5000)
             self._refresh_all()
+            # Пути не сохраняются в файле (только геометрия + решения
+            # оператора) — строим их сразу, чтобы сборка открылась в рабочем
+            # виде. ОТЛОЖЕННО: к моменту вызова должны быть готовы сцена и
+            # активный заказ (_refresh_all ставит их асинхронно).
+            def _build_paths():
+                try:
+                    _orders = list(getattr(
+                        self.session, '_orders_with_paths', []) or [])
+                    _cur = getattr(self, '_current_stitch_order', None)
+                    if not _orders:
+                        self.action_toggle_paths()
+                    else:
+                        # Строим пути для КАЖДОГО заказа, у которого они были
+                        # на момент сохранения (сами траектории не хранятся,
+                        # но результат тот же), потом возвращаемся на текущий.
+                        _combo = getattr(self.params_panel, 'stitch_combo',
+                                         None)
+                        def _idx_of(key):
+                            # В комбобоксе текст вида «124173 (копия 1)
+                            # (60 ножей)», а ключ заказа лежит в userData —
+                            # по тексту findText не находил, и второй заказ
+                            # молча пропускался.
+                            if _combo is None:
+                                return -1
+                            for _i in range(_combo.count()):
+                                if str(_combo.itemData(_i)) == str(key):
+                                    return _i
+                            return -1
+                        for _o in _orders:
+                            try:
+                                _idx = _idx_of(_o)
+                                if _idx < 0:
+                                    continue
+                                _combo.setCurrentIndex(_idx)
+                                QtWidgets.QApplication.processEvents()
+                                self.action_toggle_paths()
+                                QtWidgets.QApplication.processEvents()
+                            except Exception:
+                                continue
+                        if _cur:
+                            _i = _idx_of(_cur)
+                            if _i >= 0:
+                                _combo.setCurrentIndex(_i)
+                except Exception as _e:
+                    self.statusBar().showMessage(
+                        f"Пути не построены: {_e}", 5000)
+                finally:
+                    self._restoring_saved_state = False
+            QtCore.QTimer.singleShot(300, _build_paths)
             self.statusBar().showMessage(f"Загружено: {path}", 3000)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Ошибка", str(e))
@@ -3252,7 +3660,15 @@ class MainWindow(QtWidgets.QMainWindow):
         cached = getattr(self, '_order_toolpath_items', {})
         for key, items in cached.items():
             visible = (key == current) or (key in self._extra_shown_orders)
+            _rap_on = (self.params_panel.show_rapids.isChecked()
+                       if hasattr(self.params_panel, 'show_rapids') else False)
             for it in items:
+                try:
+                    if it.data(0) == 'rapid':
+                        it.setVisible(visible and _rap_on)
+                        continue
+                except Exception:
+                    pass
                 it.setVisible(visible)
         # Перерисуем подписи чтобы отразить новое состояние
         self._refresh_stitch_labels()

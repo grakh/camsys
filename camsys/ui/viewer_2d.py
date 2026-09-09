@@ -585,10 +585,11 @@ class CamView(QtWidgets.QGraphicsView):
     def wheelEvent(self, event: QtGui.QWheelEvent):
         """Колесо мыши — зум с центром под курсором.
 
-        AnchorUnderMouse у QGraphicsView в паре с scale(1,-1) ведёт себя
-        неустойчиво (сцена «уплывает» при интенсивной прокрутке), поэтому
-        компенсируем сдвиг вручную: замеряем сцену-точку под курсором до и
-        после scale, разницу возвращаем translate'ом.
+        Компенсируем сдвиг вручную: замеряем сцену-точку под курсором до и
+        после scale, разницу возвращаем translate'ом. Для этого якорь
+        трансформации должен быть NoAnchor — иначе AnchorUnderMouse тоже
+        пытается держать точку и в паре со scale(1,-1) картинка «уплывает»
+        к началу координат (два механизма конфликтуют).
         """
         angle = event.angleDelta().y()
         if angle == 0:
@@ -599,6 +600,7 @@ class CamView(QtWidgets.QGraphicsView):
             pos_view = event.position().toPoint()
         except AttributeError:  # старые Qt: pos()
             pos_view = event.pos()
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.NoAnchor)
         old_scene = self.mapToScene(pos_view)
         self.scale(factor, factor)
         new_scene = self.mapToScene(pos_view)
@@ -897,8 +899,12 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
     elif is_2d_corner:
         first_idx = op.attributes['corner_first_idx']
         last_idx = op.attributes['corner_last_idx']
+        # Базовый pad 3.0мм (было 1.5): лид начинается ДАЛЬШЕ от
+        # скругления → переход угол→заход/выход более ПОЛОГИЙ, поворот
+        # лида не жмётся к острию.
+        _base_pad = 3.0
         polypath = extract_subpath_around_indices(
-            geom.polypath, first_idx, last_idx, pad_mm=1.5
+            geom.polypath, first_idx, last_idx, pad_mm=_base_pad
         )
         # ── АДАПТИВНОЕ УДЛИНЕНИЕ угла по кривизне концов ──
         # Если на конце фрагмента (где начнётся заход/выход) кривизна ещё
@@ -908,8 +914,8 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         # кривую. Элементы разные, поэтому удлинение подбирается под каждый.
         try:
             _R_MIN = 1.5  # порог радиуса кривизны на концах (мм)
-            _PAD_MAX = 4.0  # предел, чтобы не залезть на соседний угол
-            _pad = 1.5
+            _PAD_MAX = 5.0  # предел, чтобы не залезть на соседний угол
+            _pad = _base_pad
             while _pad < _PAD_MAX:
                 _r_start = _end_curvature_radius(polypath, at_start=True)
                 _r_end = _end_curvature_radius(polypath, at_start=False)
@@ -998,78 +1004,59 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         side_name = "OUTSIDE" if tp.side == ContourSide.OUTSIDE else "INSIDE"
         polypath = normalize_for_side(polypath, side_name)
 
-        # ── Приоритетный путь: тангенс из реального .anc ──
-        # options_extras['anc_tangents'] = {op.id: [(tx, ty), ...]} —
-        # СПИСОК тангенсов по проходам (каждый нож обычно 2 прохода —
-        # INSIDE и OUTSIDE — с РАЗНЫМИ точками захода!). Выбираем по
-        # индексу текущего tp внутри op.toolpaths: эмиттер пишет проходы
-        # в том же порядке.
-        anc_tangents = (options_extras or {}).get('anc_tangents', {})
-        _tan_list = anc_tangents.get(op.id)
+        # ── ПОЗИЦИЯ СТАРТА: считаем ТЕМ ЖЕ, ЧЕМ ЭМИТТЕР ──
+        # Раньше брали тангенс из .anc (compute_anc_tangents). Но на сшитой
+        # раскладке его парсинг у угла давал OUTSIDE неверную точку (уезжал
+        # на другую грань → внутр/внешн расходились). Теперь эмиттер и вьювер
+        # считают старт ОДНОЙ функцией (shift_start_from_diagonal_zero), так
+        # что anc-тангенс не нужен: собственный расчёт вьювера = .anc, но без
+        # ошибок парсинга. Позиционирование делает diagonal-zero блок ниже.
         anc_tangent = None
-        if _tan_list:
-            # Совместимость: раньше значение было кортежем (tx, ty)
-            if isinstance(_tan_list, tuple):
-                anc_tangent = _tan_list
-            else:
-                try:
-                    tp_index = op.toolpaths.index(tp)
-                except (ValueError, AttributeError):
-                    tp_index = 0
-                if tp_index < len(_tan_list):
-                    anc_tangent = _tan_list[tp_index]
-                elif _tan_list:
-                    anc_tangent = _tan_list[0]
-        if anc_tangent is not None:
-            from camsys.geometry.path_offset import shift_start_to_point
-            polypath = shift_start_to_point(polypath, anc_tangent)
-        else:
-            # Fallback: старая цепочка. Используется если .anc недоступен
-            # (не пересчитан после смены параметров, или POSITION-случай).
-            # Точка старта в RT углу — единая для INSIDE и OUTSIDE
-            polypath = shift_start_to_corner(polypath, "RT")
-            # Если RT попал на дугу — сдвинуть на начало прямой
-            from camsys.geometry.path_offset import shift_start_to_top_line
-            polypath = shift_start_to_top_line(polypath)
         
         # Если использовали .anc-тангенс — полипас УЖЕ в правильной точке
         # (эмиттер уже применил все нужные сдвиги при генерации). Пропускаем
         # весь fallback chain (направление, CW-extra, инверсия offset,
         # user_offset) — иначе получим двойное применение.
         if anc_tangent is None:
-            # Направление обхода полипаса — фиксируем ДО потенциального
-            # CW-extra-shift'а, т.к. после него seg0 становится правой
-            # стороной (dx=0) и признак `seg0.b[0] > seg0.a[0]` перестаёт
-            # различать направление. Для круглых ножей (Arc-only контур)
-            # используем прямой флаг Arc.ccw.
-            seg0 = polypath.segments[0]
-            from camsys.geometry.primitives import Line as _LineCls, Arc as _ArcCls
-            if isinstance(seg0, _LineCls):
-                _polypath_is_cw = seg0.b[0] > seg0.a[0]
-            elif isinstance(seg0, _ArcCls):
-                _polypath_is_cw = not seg0.ccw
-            else:
-                _polypath_is_cw = False
-
-            # СИММЕТРИЯ INSIDE/OUTSIDE: оба прохода на RT конец top line
-            # Для CCW (top line R→L) start уже на TR ✓
-            # Для CW  (top line L→R) start на TL → сдвигаем на длину top line
-            # чтобы start стал TR концом.
-            if _polypath_is_cw:
-                import math as _m_sym
-                top_len = _m_sym.hypot(seg0.b[0] - seg0.a[0], seg0.b[1] - seg0.a[1])
-                polypath = shift_start_along_contour(polypath, top_len)
-
-            # Инверсия знака offset ПО НАПРАВЛЕНИЮ ПОЛИПАСА (а не по стороне
-            # прохода). Оба прохода одного ножа наследуют одно направление
-            # полипаса, значит должны получать одинаковый эффективный сдвиг
-            # → оба лида окажутся симметрично слева от RT по верху.
-            # Это тот же фикс, что применён в mtx_anderson.py — здесь дублируем
-            # для соответствия визуализации коду .anc.
-            effective_offset = (user_offset if _polypath_is_cw
-                                else -user_offset)
-            if abs(effective_offset) > 1e-9:
-                polypath = shift_start_along_contour(polypath, effective_offset)
+            # Смещение вдоль ВЕРХНЕЙ грани от верхне-правого угла контура
+            # (как в эмиттере): 0 = угол, <0 = влево по верху, >0 = зажим у
+            # угла. Единая точка для обоих проходов, не заворачивает вниз по
+            # стороне (как делал сдвиг по периметру → каша на прямоугольниках).
+            from ..geometry.path_offset import shift_start_from_diagonal_zero as _ssdz
+            polypath = _ssdz(polypath, user_offset)
+        
+        # ── ДИАГНОСТИКА СМЕЩЕНИЯ (правый клик «Диагностика смещения») ──
+        # Пишем на op по стороне прохода: какой offset пришёл, взялась ли
+        # точка из .anc (тангенс) и куда встал старт. Юзер сравнивает −5/0/5/2.
+        try:
+            _dg = op.attributes.setdefault('_diag_offset', {})
+            _st = polypath.segments[0].a if polypath.segments else (0, 0)
+            _dg[tp.side.name] = {
+                'user_offset': round(user_offset, 3),
+                'from_anc': anc_tangent is not None,
+                'anc_tangent': ([round(anc_tangent[0], 2), round(anc_tangent[1], 2)]
+                                if anc_tangent is not None else None),
+                'start': [round(_st[0], 2), round(_st[1], 2)],
+            }
+            # + в лог-файл (~/camsys_offset_diag.log) — удобно собрать по
+            # нескольким значениям offset без кликанья по диалогам.
+            import os as _os, datetime as _dt
+            _logp = _os.path.join(_os.path.expanduser("~"),
+                                  "camsys_offset_diag.log")
+            _field = ("Внутр" if tp.side.name in ("OUTSIDE", "RIGHT")
+                      else "Внешн")
+            _tanx = ([round(anc_tangent[0], 2), round(anc_tangent[1], 2)]
+                     if anc_tangent is not None else None)
+            with open(_logp, "a", encoding="utf-8") as _lf:
+                _lf.write(
+                    "%s | %-16s | %-7s(%s) | offset=%-6s | from_anc=%-5s "
+                    "tangent=%-16s | start=%s\n" % (
+                        _dt.datetime.now().strftime("%H:%M:%S"),
+                        getattr(op, 'name', '?'), tp.side.name, _field,
+                        round(user_offset, 3), anc_tangent is not None,
+                        _tanx, [round(_st[0], 2), round(_st[1], 2)]))
+        except Exception:
+            pass
         
         # ВАЖНО: overlap НЕ применяем здесь — он разомкнул бы контур
         # (closed=False), и offset_polypath_uniform не построил бы визуализацию
@@ -1098,7 +1085,8 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
                                          simplify_for_visualization,
                                          flatten_arcs_to_chords,
                                          join_polypath_corners,
-                                         trim_self_intersections)
+                                         trim_self_intersections,
+                                         despike_polypath)
     
     bb = polypath_bbox(geom.polypath)
     center = ((bb[0]+bb[2])/2, (bb[1]+bb[3])/2)
@@ -1158,6 +1146,7 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         from ..geometry.path_offset import merge_collinear_lines
         polypath_for_vis = merge_collinear_lines(polypath_for_vis, angle_tol_deg=1.0)
     
+    _corner_mid_ref = None
     if is_3d_corner or is_2d_corner:
         # CORNER: эквидистанта фрезы. Направление (внутрь/наружу тела)
         # выбирается по ВЫПУКЛОСТИ угла — АБСОЛЮТНЫМ геометрическим
@@ -1177,8 +1166,13 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         _rounding_arc = None
         for _s in polypath_for_vis.segments:
             if isinstance(_s, _Arc) and _s.radius < 2.0:
-                _rounding_arc = _s
-                break
+                # Берём САМУЮ ТЕСНУЮ дугу (мин. радиус) — это и есть
+                # скругление угла. «Первая попавшаяся <2мм» подхватывала
+                # крупную дугу фланга (R~1.5-1.9) у некоторых углов, её
+                # центр падал внутрь тела → ложный convex=True → эквидистанта
+                # уходила не в ту сторону (123308 geom1 c1/c3).
+                if _rounding_arc is None or _s.radius < _rounding_arc.radius:
+                    _rounding_arc = _s
         if _rounding_arc is not None:
             # 2D: центр дуги скругления внутри тела → выпуклый.
             try:
@@ -1242,6 +1236,21 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         # Стыкуем линии через их пересечение — острый угол на
         # эквидистанте (фреза заходит и выходит под прямым углом).
         polypath_offset = join_polypath_corners(polypath_offset, tol=0.01)
+        # Эталон стороны «тела» угла фиксируем ДО despike: despike меняет
+        # число сегментов, поэтому segments[len//2] ПОСЛЕ него укажет на
+        # другую точку и может развернуть сторону лида (регрессия). Старт и
+        # касательную на конце despike сохраняет, а середину фиксируем тут.
+        _corner_mid_ref = polypath_offset.segments[
+            len(polypath_offset.segments) // 2].a
+        # ── УБИРАЕМ ПЕТЛИ В ТОЧКАХ ИЗЛОМА ──
+        # Пооссегментный оффсет сырого биарк-фрагмента даёт микро-петли на
+        # стыках offset-дуг (сегмент k+1 стартует «позади» конца k).
+        # trim_self_intersections их не ловит (считает по хордам дуг), а
+        # join не перекрывает зазоры 0.02–0.04мм. despike плотно сэмплирует
+        # путь и вырезает самопересечения, сохраняя концы (к ним крепятся
+        # lead-in/out). Это ТОЛЬКО визуальная эквидистанта — в .anc угол
+        # пишется сырым фрагментом + G42, петель там нет.
+        polypath_offset = despike_polypath(polypath_offset)
     elif tp.side == ContourSide.INSIDE:
         # ВНЕШНИЙ рез (INSIDE=CCW + G41 → НАРУЖУ от центра, «+»).
         polypath_offset = offset_polypath_uniform(
@@ -1311,40 +1320,59 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         if polypath_offset and polypath_offset.segments:
             try:
                 from ..geometry.lead_inout import build_lead_in as _bli3
+                from ..geometry.path_offset import _point_in_polypath as _pip_lead
                 _sp = polypath_offset.segments[0].a
                 _tan = polypath_offset.segments[0].tangent_at_start()
-                _td = math.hypot(_tan[0], _tan[1]) or 1.0
-                _tnx, _tny = _tan[0]/_td, _tan[1]/_td
-                # эталон: средняя точка эквидистанты угла относительно её
-                # старта — с какой стороны (left-нормаль) лежит «тело» угла.
-                _mid_off = polypath_offset.segments[
-                    len(polypath_offset.segments)//2].a
-                _evx = _mid_off[0] - _sp[0]
-                _evy = _mid_off[1] - _sp[1]
-                _eq_left = (_evx*(-_tny) + _evy*_tnx) > 0
-                # Прямоугольник (выпуклый угол): лид К ЦЕНТРУ = в ту же
-                # сторону что тело угла (юзер подтвердил). Вогнутый
-                # (внешний): лид НАРУЖУ = противоположно телу угла.
-                _lead_same_as_body = _convex
+                # ЗНАК ЛИДА = ЗНАК ЭКВИДИСТАНТЫ, устойчиво.
+                # Эквидистанта смещена от программного контура в сторону
+                # inward. Лид должен идти в ТУ ЖЕ сторону (дальше от детали).
+                # Определяем сторону эквидистанты как «внутри/снаружи
+                # замкнутого контура ножа» по её СЕРЕДИНЕ (хорошо разнесённая
+                # точка — устойчиво, в отличие от вектора у самого старта,
+                # который у пограничных углов почти нулевой и переворачивался).
+                # Затем строим обе пробы лида и берём ту, чей кончик на той же
+                # стороне контура (внутри/снаружи), что и эквидистанта.
+                _mid_off = _corner_mid_ref if _corner_mid_ref is not None \
+                    else polypath_offset.segments[
+                        len(polypath_offset.segments)//2].a
+                _eq_inside = _pip_lead(_mid_off, geom.polypath)
                 _chosen = None
+                _fallback = None
                 for _side in ('left', 'right'):
                     _lg = _bli3(start_point=_sp, tangent=_tan, side=_side,
                                 line_length=1.0, arc_radius=0.5,
                                 approach_angle_deg=45, style='line_arc')
                     _tip = _lg.line.a if _lg.line else _sp
-                    _tvx = _tip[0] - _sp[0]
-                    _tvy = _tip[1] - _sp[1]
-                    _tip_left = (_tvx*(-_tny) + _tvy*_tnx) > 0
-                    _match = (_tip_left == _eq_left) if _lead_same_as_body \
-                        else (_tip_left != _eq_left)
-                    if _match:
+                    if _fallback is None:
+                        _fallback = _side
+                    if _pip_lead(_tip, geom.polypath) == _eq_inside:
                         _chosen = _side
                         break
-                forced_lead_side = _chosen or "right"
+                forced_lead_side = _chosen or _fallback or "right"
             except Exception:
                 forced_lead_side = "right"
         else:
             forced_lead_side = "right"
+        # ── ДИАГНОСТИКА (для правого клика «Диагностика угла») ──
+        # Пишем вычисленные признаки прямо на op, чтобы юзер мог их
+        # прочитать в приложении и прислать — так видно, где превью
+        # расходится с ожиданием без гадания.
+        try:
+            _rr = _rounding_arc.radius if _rounding_arc is not None else None
+            _rc = _rounding_arc.center if _rounding_arc is not None else None
+            op.attributes['_diag'] = {
+                'convex': _convex,
+                'inward': _inward,
+                'forced_lead_side': forced_lead_side,
+                'rounding_R': (round(_rr, 3) if _rr is not None else None),
+                'rounding_center': ([round(_rc[0], 2), round(_rc[1], 2)]
+                                    if _rc is not None else None),
+                'corner_radius': op.attributes.get('corner_radius'),
+                'apex': [round(op.attributes.get('corner_apex', (0, 0))[0], 1),
+                         round(op.attributes.get('corner_apex', (0, 0))[1], 1)],
+            }
+        except Exception:
+            pass
     # ОСНОВНОЙ путь (не corner): forced_lead_side=None. Основные лиды
     # строит auto-подбор — их НЕ трогаем, проблема только в углах.
     # ── LEAD-OUT откладывается на ПОСЛЕ автоподбора + overlap ──
@@ -1384,6 +1412,16 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
     # (Legacy: если auto_avoid_all задан из старого кода — respect его)
     if not auto_avoid_all and lead_mode == 0:
         this_op_auto_avoid = False
+    # РУЧНАЯ НАСТРОЙКА ЭЛЕМЕНТА ПОБЕЖДАЕТ АВТО-ПОДБОР.
+    # Если у операции есть lead_override (оператор задал заход вручную) —
+    # авто-подбор не двигает лид, иначе ручные заходы «возвращались к
+    # умолчанию» после пересчёта/загрузки сборки. В эмиттере такая защита
+    # (_has_user_override) уже была, во вьювере — не было.
+    try:
+        if op.attributes.get('lead_override'):
+            this_op_auto_avoid = False
+    except Exception:
+        pass
     
     # Кеш контуров для коллизий — строится ОДИН раз, переиспользуется для 
     # lead-in и lead-out.
@@ -1426,22 +1464,26 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
                 forced_side=None,
             )
         
-        _use_anc_position = (options_extras or {}).get(
-            'anc_tangents', {}).get(op.id) is not None
         polypath_offset, lead_in_poly, lead_in_collision, _ = plan_lead_in(
             polypath_offset, req_in,
             contours_lines_cache, contours_bboxes_cache,
             geom.id, effective_tool_offset,
-            auto_avoid=(this_op_auto_avoid and project is not None
-                        and not _use_anc_position),
+            auto_avoid=(this_op_auto_avoid and project is not None),
+            safety_factor=1.2,
             exit_request=exit_req,
             overlap=pending_overlap)
-        # Если позиция из .anc — эмиттер уже подтвердил её приемлемость,
-        # флаг коллизии от plan_lead_in гасим (иначе виджет красит в красный
-        # соседство контуров, которое эмиттер счёл нормальным).
-        if _use_anc_position:
-            lead_in_collision = False
-    
+        # ── СОХРАНЯЕМ ТОЧКУ ЗАХОДА ДЛЯ ЭМИТТЕРА ──
+        # Эмиттер возьмёт её как старт контура (см. mtx_anderson), чтобы
+        # .anc давал те же заходы, что видны в превью: логичнее и меньше
+        # холостых перемещений станка. Эмиттер проверяет валидность re-root
+        # и откатывается на свой авто-подбор, если контур поехал.
+        try:
+            if polypath_offset and polypath_offset.segments:
+                _e = polypath_offset.segments[0].a
+                op.attributes.setdefault('_lead_entry', {})[tp.side.name] = [
+                    float(_e[0]), float(_e[1])]
+        except Exception:
+            pass
     # ── ПРИМЕНЕНИЕ OVERLAP ПОСЛЕ автоподбора ──
     # Теперь когда позиция старта окончательно подобрана, удлиняем 
     # программную осевую и offset на src.overlap мм.
@@ -1554,6 +1596,7 @@ def add_toolpaths_to_scene(scene: 'CamScene', project, options_extras: dict = No
                 excluded_geom_ids.add(gid)
     
     items = []
+    _rapid_pts = []  # [(вход, выход)] по порядку — для перебегов станка
     # Считаем общее число операций для показа прогресса
     total_ops = sum(1 for op in project.operations 
                     if op.kind in (OperationKind.BLADE_FORMING, OperationKind.CORNER_REWORK)
@@ -1635,6 +1678,25 @@ def add_toolpaths_to_scene(scene: 'CamScene', project, options_extras: dict = No
                                     op_id=op.id)
                 scene.addItem(item)
                 items.append(item)
+
+            # Точки входа/выхода прохода — для отрисовки перебегов станка
+            # (холостых перемещений между проходами) в порядке обработки.
+            try:
+                _li = geo.get('lead_in')
+                _lo = geo.get('lead_out')
+                _c = geo.get('contour')
+                _p_in = (_li.segments[0].a if (_li and _li.segments)
+                         else (_c.segments[0].a if (_c and _c.segments)
+                               else None))
+                _p_out = (_lo.segments[-1].b if (_lo and _lo.segments)
+                          else (_c.segments[-1].b if (_c and _c.segments)
+                                else None))
+                if _p_in is not None and _p_out is not None:
+                    # запоминаем op_id — перебег привязан к своему ножу и
+                    # прячется вместе с ним (иначе висел бы в воздухе)
+                    _rapid_pts.append((_p_in, _p_out, op.id))
+            except Exception:
+                pass
         
         # Прогресс после обработки всех toolpath'ов операции
         processed += 1
@@ -1648,7 +1710,54 @@ def add_toolpaths_to_scene(scene: 'CamScene', project, options_extras: dict = No
     # op'а уже применён и остался.
     if hasattr(scene, '_selected_op_id'):
         scene._selected_op_id = ""
-    
+
+    # ── ПЕРЕБЕГИ СТАНКА (холостые перемещения) ──
+    # Линия от выхода предыдущего прохода ко входу следующего. Рисуются
+    # только по галке (show_filter['rapids']), по умолчанию выключены.
+    try:
+        # Строим ВСЕГДА (чтобы галка работала как переключатель видимости,
+        # без пересчёта путей), а показываем по флагу.
+        _rap_visible = bool((show_filter or {}).get('rapids'))
+        if len(_rapid_pts) > 1:
+            from PySide6 import QtGui as _QG, QtCore as _QC
+            import math as _m_rap
+            _pen = _QG.QPen(_QG.QColor(200, 200, 60))  # жёлто-серый, видно
+            _pen.setStyle(_QC.Qt.DashLine)
+            _pen.setWidth(0)
+            _pen.setCosmetic(True)
+            for _i in range(len(_rapid_pts) - 1):
+                _a = _rapid_pts[_i][1]      # выход текущего
+                _b = _rapid_pts[_i + 1][0]  # вход следующего
+                _op_a = _rapid_pts[_i][2]
+                _op_b = _rapid_pts[_i + 1][2]
+                _ln = scene.addLine(_a[0], _a[1], _b[0], _b[1], _pen)
+                _ln.setZValue(12)  # ПОВЕРХ путей (у путей 5-8)
+                _ln.setData(0, 'rapid')
+                _ln.setData(1, _op_a)
+                _ln.setData(2, _op_b)
+                _ln.setVisible(_rap_visible)
+                items.append(_ln)
+                # Стрелка направления (откуда → куда) в середине перебега
+                _dx, _dy = _b[0]-_a[0], _b[1]-_a[1]
+                _L = _m_rap.hypot(_dx, _dy)
+                if _L < 1e-6:
+                    continue
+                _ux, _uy = _dx/_L, _dy/_L
+                _mx, _my = (_a[0]+_b[0])/2.0, (_a[1]+_b[1])/2.0
+                _sz = min(1.0, max(0.3, _L*0.03))  # наконечник (в 2р меньше)
+                for _sgn in (1, -1):
+                    _px = _mx - _ux*_sz + (-_uy)*_sz*0.45*_sgn
+                    _py = _my - _uy*_sz + (_ux)*_sz*0.45*_sgn
+                    _al = scene.addLine(_px, _py, _mx, _my, _pen)
+                    _al.setZValue(12)
+                    _al.setData(0, 'rapid')
+                    _al.setData(1, _op_a)
+                    _al.setData(2, _op_b)
+                    _al.setVisible(_rap_visible)
+                    items.append(_al)
+    except Exception:
+        pass
+
     return items
 
 

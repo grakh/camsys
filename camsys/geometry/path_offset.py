@@ -485,6 +485,199 @@ def shift_start_to_point(polypath: Polypath,
     return shift_start_along_contour(polypath, total)
 
 
+def _point_on_arc_span(arc, pt, tol: float = 1e-6) -> bool:
+    """Точка pt лежит в угловом секторе дуги (грубо, для отбора)."""
+    import math as _m
+    cx, cy = arc.center
+    a0 = _m.atan2(arc.a[1] - cy, arc.a[0] - cx)
+    a1 = _m.atan2(arc.b[1] - cy, arc.b[0] - cx)
+    ap = _m.atan2(pt[1] - cy, pt[0] - cx)
+    if arc.ccw:
+        if a1 < a0:
+            a1 += 2 * _m.pi
+        while ap < a0:
+            ap += 2 * _m.pi
+        return a0 - tol <= ap <= a1 + tol
+    else:
+        if a1 > a0:
+            a1 -= 2 * _m.pi
+        while ap > a0:
+            ap -= 2 * _m.pi
+        return a1 - tol <= ap <= a0 + tol
+
+
+def shift_start_from_diagonal_zero(polypath: Polypath,
+                                   offset: float) -> Polypath:
+    """Смещение старта по alphacam-модели: 0 = точка, где ДИАГОНАЛЬ из
+    верхне-правого угла bbox к центру пересекает контур (на скруглённом
+    углу — его 45°-точка, однозначная для ОБОИХ проходов). От неё:
+    offset<0 = влево по ВЕРХНЕЙ грани, offset>0 = вниз по ПРАВОЙ грани.
+
+    Снимает неоднозначность вершины (в самой вершине два прохода выбирали
+    разные грани и расходились). Диагональная точка не на вершине, поэтому
+    оба прохода садятся в одну точку и совпадают.
+    """
+    if not polypath or not polypath.segments:
+        return polypath
+    import math as _m
+    xs = [c for s in polypath.segments for c in (s.a[0], s.b[0])]
+    ys = [c for s in polypath.segments for c in (s.a[1], s.b[1])]
+    minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
+    P = (maxx, maxy)  # верхне-правый угол bbox
+    C = ((minx + maxx) / 2.0, (miny + maxy) / 2.0)  # центр
+    dx, dy = C[0] - P[0], C[1] - P[1]
+    L = _m.hypot(dx, dy) or 1.0
+    dx, dy = dx / L, dy / L
+    # первое пересечение луча (P → центр) с контуром
+    best = None  # (t, point)
+    for s in polypath.segments:
+        if isinstance(s, Arc):
+            cx, cy = s.center
+            fx, fy = P[0] - cx, P[1] - cy
+            B = 2 * (fx * dx + fy * dy)
+            Cc = fx * fx + fy * fy - s.radius**2
+            disc = B * B - 4 * Cc
+            if disc < 0:
+                continue
+            sd = _m.sqrt(disc)
+            for t in ((-B - sd) / 2.0, (-B + sd) / 2.0):
+                if t > 1e-6:
+                    pt = (P[0] + t * dx, P[1] + t * dy)
+                    if _point_on_arc_span(s, pt) and (
+                            best is None or t < best[0]):
+                        best = (t, pt)
+        else:
+            ax, ay = s.a; bx, by = s.b
+            ex, ey = bx - ax, by - ay
+            den = dx * ey - dy * ex
+            if abs(den) < 1e-12:
+                continue
+            t = ((ax - P[0]) * ey - (ay - P[1]) * ex) / den
+            u = ((ax - P[0]) * dy - (ay - P[1]) * dx) / den
+            if t > 1e-6 and -1e-6 <= u <= 1 + 1e-6 and (
+                    best is None or t < best[0]):
+                best = (t, (P[0] + t * dx, P[1] + t * dy))
+    zero_pt = best[1] if best else P
+    pp = shift_start_to_point(polypath, zero_pt)
+    if abs(offset) < 1e-9:
+        return pp
+    base = pp.segments[0].a
+    # off<0 → X уменьшается (влево по верху); off>0 → Y уменьшается (вниз)
+    chosen = None
+    chosen_score = None
+    for sgn in (1.0, -1.0):
+        cand = shift_start_along_contour(pp, sgn * abs(offset))
+        s0 = cand.segments[0].a
+        score = (base[0] - s0[0]) if offset < 0 else (base[1] - s0[1])
+        if chosen_score is None or score > chosen_score:
+            chosen_score = score
+            chosen = cand
+    return chosen if chosen is not None else pp
+
+
+def shift_start_to_top_x(polypath: Polypath, offset_from_rt: float,
+                         top_tol: float = 2.0) -> Polypath:
+    """Сдвигает старт вдоль ВЕРХНЕЙ грани на offset_from_rt от верхне-правого
+    угла КОНТУРА (0 = угол, <0 = влево).
+
+    Для смещения лида «по координате от угла»: 0 = правый-верхний угол,
+    отрицательное = влево вдоль верха. В отличие от shift_start_along_contour
+    (двигает по периметру и заворачивает за угол вниз по стороне — каша на
+    прямоугольниках), здесь старт всегда остаётся на ВЕРХНЕЙ грани, а X
+    зажимается в её пределах (target_x правее угла → угол; левее конца
+    верха → конец верха).
+    """
+    if not polypath or not polypath.segments:
+        return polypath
+    import math as _m
+    ymax = max(max(s.a[1], s.b[1]) for s in polypath.segments)
+    top_pts = []
+    for s in polypath.segments:
+        for p in (s.a, s.b):
+            if p[1] > ymax - top_tol:
+                top_pts.append(p)
+    if not top_pts:
+        return polypath
+    top_min_x = min(p[0] for p in top_pts)
+    top_max_x = max(p[0] for p in top_pts)   # верхне-правый угол контура
+
+    # ── ПОЛОЖИТЕЛЬНЫЙ offset: вниз по ПРАВОЙ грани (так было исторически) ──
+    if offset_from_rt > 1e-9:
+        xmax = max(max(s.a[0], s.b[0]) for s in polypath.segments)
+        right_pts = [p for s in polypath.segments for p in (s.a, s.b)
+                     if p[0] > xmax - top_tol]
+        if right_pts:
+            right_ymax = max(p[1] for p in right_pts)  # верх правой грани
+            right_ymin = min(p[1] for p in right_pts)
+            ty = max(right_ymin, min(right_ymax - offset_from_rt, right_ymax))
+            best_r = None  # (x, point) — берём самую правую точку на ty
+            for s in polypath.segments:
+                if max(s.a[0], s.b[0]) <= xmax - top_tol:
+                    continue
+                if isinstance(s, Arc):
+                    cx, cy = s.center
+                    dy2 = s.radius**2 - (ty - cy)**2
+                    if dy2 < 0:
+                        continue
+                    for xx in (cx + _m.sqrt(dy2), cx - _m.sqrt(dy2)):
+                        if xx <= xmax - top_tol:
+                            continue
+                        pt = (xx, ty)
+                        if _point_on_arc_span(s, pt) and (
+                                best_r is None or xx > best_r[0]):
+                            best_r = (xx, pt)
+                else:
+                    ax, ay = s.a; bx, by = s.b
+                    lo, hi = min(ay, by), max(ay, by)
+                    if lo - 1e-6 <= ty <= hi + 1e-6 and abs(by - ay) > 1e-12:
+                        t = (ty - ay) / (by - ay)
+                        xx = ax + t * (bx - ax)
+                        if xx <= xmax - top_tol:
+                            continue
+                        if best_r is None or xx > best_r[0]:
+                            best_r = (xx, (xx, ty))
+            if best_r is not None:
+                return shift_start_to_point(polypath, best_r[1])
+        # если правой грани не нашли — падаем в угол
+        return shift_start_to_point(polypath, max(top_pts, key=lambda p: p[0]))
+
+    tx = max(top_min_x, min(top_max_x + offset_from_rt, top_max_x))
+    # У самого угла (offset≈0) — ставим точно в верхне-правую точку.
+    if tx >= top_max_x - 1e-6:
+        _rt = max(top_pts, key=lambda p: p[0])
+        return shift_start_to_point(polypath, _rt)
+
+    best = None  # (y, point)
+    for s in polypath.segments:
+        if max(s.a[1], s.b[1]) <= ymax - top_tol:
+            continue
+        if isinstance(s, Arc):
+            cx, cy = s.center
+            dx2 = s.radius**2 - (tx - cx)**2
+            if dx2 < 0:
+                continue
+            for yy in (cy + _m.sqrt(dx2), cy - _m.sqrt(dx2)):
+                if yy <= ymax - top_tol:
+                    continue  # точка не у верха
+                pt = (tx, yy)
+                if _point_on_arc_span(s, pt):
+                    if best is None or yy > best[0]:
+                        best = (yy, pt)
+        else:
+            ax, ay = s.a; bx, by = s.b
+            lo, hi = min(ax, bx), max(ax, bx)
+            if lo - 1e-6 <= tx <= hi + 1e-6 and abs(bx - ax) > 1e-12:
+                t = (tx - ax) / (bx - ax)
+                yy = ay + t * (by - ay)
+                if yy <= ymax - top_tol:
+                    continue  # точка не у верха (напр. правая вертикаль)
+                if best is None or yy > best[0]:
+                    best = (yy, (tx, yy))
+    if best is None:
+        return polypath
+    return shift_start_to_point(polypath, best[1])
+
+
 def shift_start_to_top_line(polypath: Polypath) -> Polypath:
     """Сдвигает старт к началу САМОЙ ВЕРХНЕЙ прямой стороны контура.
     
@@ -1391,8 +1584,17 @@ def find_equidistant_kinks(equidistant: Polypath,
                        for px, py in seen_pts):
                     continue
                 seen_pts.append((ix, iy))
+                # касательные эквидистанты в точке петли — направление
+                # для лида (заход по s1, выход по s2).
+                try:
+                    _tin = s1.tangent_at_end()
+                    _tout = s2.tangent_at_start()
+                except Exception:
+                    _tin = _tout = (1.0, 0.0)
                 result.append({'point': (ix, iy), 'type': 'loop',
-                               'kind': None})
+                               'kind': None,
+                               'seg_i': i, 'seg_j': j,
+                               'tan_in': _tin, 'tan_out': _tout})
 
     # ── 2. ОСТРИЯ (cusp): резкий разворот направления в вершине ──
     verts = list(range(n - 1))
@@ -1420,7 +1622,9 @@ def find_equidistant_kinks(equidistant: Polypath,
                    for px, py in seen_pts):
                 continue
             seen_pts.append(pt)
-            result.append({'point': pt, 'type': 'cusp', 'kind': None})
+            result.append({'point': pt, 'type': 'cusp', 'kind': None,
+                           'seg_i': vi, 'seg_j': (vi + 1) % n,
+                           'tan_in': t1, 'tan_out': t2})
 
     # ── 3. Классификация 2D/3D по исходной геометрии рядом с изломом ──
     if source_polypath and source_polypath.segments:
@@ -1577,6 +1781,151 @@ def trim_self_intersections(polypath: Polypath, max_loop_segs: int = 6) -> Polyp
         
         segs = new_segs
     
+    return Polypath(segments=segs, closed=polypath.closed)
+
+
+def _ang_in_sweep(seg, px, py, edge_tol: float = 1e-7) -> bool:
+    """Точка (px,py) лежит на дуге seg СТРОГО внутри её сектора (не на концах)?"""
+    cx, cy = seg.center
+    a0 = math.atan2(seg.a[1] - cy, seg.a[0] - cx)
+    a1 = math.atan2(seg.b[1] - cy, seg.b[0] - cx)
+    if seg.ccw and a1 < a0:
+        a1 += 2 * math.pi
+    if (not seg.ccw) and a1 > a0:
+        a1 -= 2 * math.pi
+    ap = math.atan2(py - cy, px - cx)
+    if seg.ccw:
+        while ap < a0:
+            ap += 2 * math.pi
+        while ap > a0 + 2 * math.pi:
+            ap -= 2 * math.pi
+        return a0 + edge_tol < ap < a1 - edge_tol
+    else:
+        while ap > a0:
+            ap -= 2 * math.pi
+        while ap < a0 - 2 * math.pi:
+            ap += 2 * math.pi
+        return a1 + edge_tol < ap < a0 - edge_tol
+
+
+def _seg_true_hits(s1, s2):
+    """Точки ИСТИННОГО пересечения двух сегментов (Line/Arc), строго ВНУТРИ
+    обоих (общие концы исключены). Работает с реальной геометрией дуг
+    (arc-arc через пересечение окружностей, line-arc через квадратное
+    уравнение), а не с хордами — поэтому ловит петли из-за кривизны."""
+    hits = []
+    is1a = isinstance(s1, Arc); is2a = isinstance(s2, Arc)
+    if not is1a and not is2a:
+        x1, y1 = s1.a; x2, y2 = s1.b; x3, y3 = s2.a; x4, y4 = s2.b
+        d = (x2 - x1) * (y4 - y3) - (y2 - y1) * (x4 - x3)
+        if abs(d) < 1e-15:
+            return hits
+        t = ((x3 - x1) * (y4 - y3) - (y3 - y1) * (x4 - x3)) / d
+        u = ((x3 - x1) * (y2 - y1) - (y3 - y1) * (x2 - x1)) / d
+        if 1e-7 < t < 1 - 1e-7 and 1e-7 < u < 1 - 1e-7:
+            hits.append((x1 + t * (x2 - x1), y1 + t * (y2 - y1)))
+        return hits
+    if is1a and is2a:
+        c1 = s1.center; r1 = s1.radius; c2 = s2.center; r2 = s2.radius
+        dx = c2[0] - c1[0]; dy = c2[1] - c1[1]
+        d = math.hypot(dx, dy)
+        if d < 1e-12 or d > r1 + r2 or d < abs(r1 - r2):
+            return hits
+        a = (r1 * r1 - r2 * r2 + d * d) / (2 * d)
+        h2 = r1 * r1 - a * a
+        if h2 < 0:
+            return hits
+        h = math.sqrt(max(0.0, h2))
+        xm = c1[0] + a * dx / d; ym = c1[1] + a * dy / d
+        for sgn in (1, -1):
+            px = xm + sgn * h * (-dy) / d
+            py = ym + sgn * h * (dx) / d
+            if _ang_in_sweep(s1, px, py) and _ang_in_sweep(s2, px, py):
+                hits.append((px, py))
+        return hits
+    # line-arc
+    line, arc = (s1, s2) if not is1a else (s2, s1)
+    ax, ay = line.a; bx, by = line.b
+    cx, cy = arc.center; r = arc.radius
+    dx = bx - ax; dy = by - ay
+    fx = ax - cx; fy = ay - cy
+    A = dx * dx + dy * dy
+    B = 2 * (fx * dx + fy * dy)
+    Cc = fx * fx + fy * fy - r * r
+    disc = B * B - 4 * A * Cc
+    if A < 1e-18 or disc < 0:
+        return hits
+    sd = math.sqrt(disc)
+    for t in ((-B - sd) / (2 * A), (-B + sd) / (2 * A)):
+        if 1e-7 < t < 1 - 1e-7:
+            px = ax + t * dx; py = ay + t * dy
+            if _ang_in_sweep(arc, px, py):
+                hits.append((px, py))
+    return hits
+
+
+def _truncate_to_point(seg, X, keep_start: bool):
+    """Обрезает сегмент до точки X (X лежит на сегменте). Для Arc центр/ccw/
+    радиус сохраняются, меняется только один конец."""
+    if isinstance(seg, Arc):
+        if keep_start:
+            return Arc(a=seg.a, b=X, center=seg.center, ccw=seg.ccw)
+        return Arc(a=X, b=seg.b, center=seg.center, ccw=seg.ccw)
+    if keep_start:
+        return Line(a=seg.a, b=X)
+    return Line(a=X, b=seg.b)
+
+
+def despike_polypath(polypath: Polypath, max_pass: int = 80,
+                     seg_window: int = 10) -> Polypath:
+    """Убирает петли/шипы самопересечения на пути, СОХРАНЯЯ его концы.
+
+    Зачем отдельно от trim_self_intersections: тот ищет пересечения по
+    ХОРДАМ дуг и не видит петли, возникающие из-за самой КРИВИЗНЫ. На
+    corner-эквидистанте viewer'а (пооссегментный оффсет сырого биарк-
+    фрагмента) на стыках соседних offset-дуг и на остриях образуются
+    микро-петли: сегмент k+1 стартует на 0.02–0.04мм «позади» конца k,
+    плюс попадаются вырожденные дуги (R≈0, длина 0). Здесь используется
+    ИСТИННОЕ пересечение дуг (arc-arc / line-arc), а не сэмплинг — поэтому
+    ловятся даже крошечные петли на остриях, которые полилинейный подход
+    пропускает.
+
+    Алгоритм: ищем пару сегментов (в пределах seg_window по индексу — петли
+    локальны), у которых есть истинное внутреннее пересечение X; обрезаем
+    первый сегмент до X, второй — от X, выбрасываем сегменты между ними;
+    повторяем. Обрезаются только ВНУТРЕННИЕ концы, поэтому первая и
+    последняя точки пути неизменны (к ним привязаны lead-in/lead-out).
+
+    ВАЖНО: это чисто визуальный артефакт РЕНДЕРА пути фрезы. В .anc угол
+    пишется сырым фрагментом + G42 (машинная компенсация), станок сам
+    считает эквидистанту без петель — эмиссия .anc НЕ затрагивается.
+
+    seg_window ограничивает поиск локальными парами, что делает проход
+    линейным по числу сегментов (быстро даже на крупных углах).
+    """
+    if not polypath or len(polypath.segments) < 3:
+        return polypath
+    segs = list(polypath.segments)
+    for _ in range(max_pass):
+        n = len(segs)
+        found = None
+        for i in range(n):
+            jmax = min(n, i + 1 + seg_window)
+            for j in range(i + 1, jmax):
+                if polypath.closed and i == 0 and j == n - 1:
+                    continue
+                hs = _seg_true_hits(segs[i], segs[j])
+                if hs:
+                    found = (i, j, hs[0])
+                    break
+            if found:
+                break
+        if not found:
+            break
+        i, j, X = found
+        si = _truncate_to_point(segs[i], X, keep_start=True)
+        sj = _truncate_to_point(segs[j], X, keep_start=False)
+        segs = segs[:i] + [si, sj] + segs[j + 1:]
     return Polypath(segments=segs, closed=polypath.closed)
 
 

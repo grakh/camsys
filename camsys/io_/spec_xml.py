@@ -40,13 +40,25 @@ def find_spec_xml(ai_path: Path) -> Optional[Path]:
     if not xml_dir.is_dir():
         return None
     
-    # Ищем specification_*.xml (case-insensitive)
+    # Ищем specification_*.xml (case-insensitive). Если их НЕСКОЛЬКО —
+    # предпочитаем тот, чей номер совпадает с номером папки заказа, а не
+    # «первый попавшийся» (иначе подтягивался чужой заказ).
+    matches = []
     for candidate in xml_dir.iterdir():
         name_lower = candidate.name.lower()
-        if (name_lower.startswith("specification_") 
+        if (name_lower.startswith("specification_")
                 and name_lower.endswith(".xml")):
-            return candidate
-    return None
+            matches.append(candidate)
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+    order_token = ''.join(ch for ch in order_dir.name if ch.isdigit())
+    if order_token:
+        for m in matches:
+            if order_token in m.name:
+                return m
+    return matches[0]
 
 
 def read_spec_xml(xml_path: Path) -> dict:

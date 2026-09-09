@@ -502,37 +502,7 @@ class MtxAndersonGVM(PostProcessor):
         # ВАЖНО: для CORNER_REWORK фрагмента это пропускаем — фрагмент уже
         # начинается с нужной точки.
         if not is_corner_rework and geom.is_closed:
-            from ..geometry.path_offset import (
-                shift_start_to_corner, shift_start_to_top_line,
-                shift_start_along_contour, shift_start_to_point)
-            from ..geometry.direction import normalize_for_side as _nfs
-            # ── ЕДИНАЯ ТОЧКА СТАРТА ДЛЯ ОБОИХ ПРОХОДОВ ──
-            # Target-точка вычисляется ОДИН раз на референсной CCW-намотке
-            # (независимой от направления текущего прохода), затем оба
-            # прохода ставятся в неё через shift_start_to_point.
-            #
-            # Раньше цепочка была направление-зависимой:
-            #   corner("RT") → top_line → CW-extra-shift (на длину seg0).
-            # На прямоугольниках CW и CCW сходились в RT. Но на формах,
-            # где верхняя грань РАЗОРВАНА дугой на две линии («гантель»
-            # из 41000: левая линия + круг + правая линия), CW-extra-shift
-            # сдвигал на длину ЛЕВОЙ линии и попадал к центру (52.07), а
-            # CCW-проход вставал на правую (174.4) — два прохода одного
-            # ножа заходили в РАЗНЫХ местах при одинаковых полях (-5/-5).
-            _ref = _nfs(geom.polypath, "INSIDE")   # INSIDE = CCW намотка
-            _ref = shift_start_to_corner(_ref, "RT")
-            _ref = shift_start_to_top_line(_ref)
-            _target_pt = _ref.segments[0].a
-            polypath = shift_start_to_point(polypath, _target_pt)
-
-            # Направление полипаса (для инверсии offset ниже) — через
-            # shoelace-сумму по вершинам: надёжно для любой формы, не
-            # зависит от того, каким оказался первый сегмент после разреза
-            # в _target_pt (он может быть коротким остатком линии/дуги).
-            _sh = 0.0
-            for _s in polypath.segments:
-                _sh += (_s.b[0] - _s.a[0]) * (_s.b[1] + _s.a[1])
-            _polypath_is_cw = _sh > 0
+            from ..geometry.path_offset import shift_start_to_top_x
         
         # ── СМЕЩЕНИЕ ТОЧКИ СТАРТА ВДОЛЬ КОНТУРА ──
         # Поле «Смещение по» из диалога Cutting / start_offset в EntryExitConfig.
@@ -563,26 +533,13 @@ class MtxAndersonGVM(PostProcessor):
             _override_offset = _ov.get('offset', _override_offset)
             _override_overlap = _ov.get('overlap', _override_overlap)
         
-        if (not is_corner_rework and geom.is_closed and tp.entry.enabled 
-                and abs(_override_offset) > 1e-9):
-            # Инвертируем знак offset ПО НАПРАВЛЕНИЮ ПОЛИПАСА (сохранённому
-            # выше в _polypath_is_cw), а не по стороне прохода. Оба прохода
-            # одного ножа наследуют одно направление полипаса, значит должны
-            # получать одинаковый эффективный знак сдвига — тогда оба лида
-            # окажутся симметрично влево от RT по верху ножа.
-            #
-            # Раньше инверсия была `if tp.side == INSIDE`, что работало
-            # только при предпосылке «OUTSIDE=CW, INSIDE=CCW». На реальных
-            # CCW-ножах (пример: 122425 из 41287) это давало асимметрию:
-            # INSIDE попадал куда надо, OUTSIDE уезжал вниз по правой
-            # стороне на -5мм от RT.
-            #
-            # ВАЖНО: направление определяем до CW-extra-shift'а, потому что
-            # после него seg0 становится правой стороной (dx=0), и признак
-            # `seg0.b[0] > seg0.a[0]` перестаёт различать направление.
-            effective_offset = (_override_offset if _polypath_is_cw
-                                else -_override_offset)
-            polypath = shift_start_along_contour(polypath, effective_offset)
+        if (not is_corner_rework and geom.is_closed and tp.entry.enabled):
+            # СМЕЩЕНИЕ ВДОЛЬ ВЕРХНЕЙ ГРАНИ от верхне-правого угла контура:
+            # 0 = угол, <0 = влево по верху, >0 = зажим у угла. Единая точка
+            # для обоих проходов → внутр/внешн выровнены. Не заворачивает за
+            # угол вниз по стороне (как делал сдвиг по периметру → каша).
+            from ..geometry.path_offset import shift_start_from_diagonal_zero
+            polypath = shift_start_from_diagonal_zero(polypath, _override_offset)
         
         # ── OVERLAP откладывается до ПОСЛЕ автоподбора ──
         # Если применить overlap здесь, polypath перестанет быть замкнутым 
@@ -1053,6 +1010,36 @@ class MtxAndersonGVM(PostProcessor):
             except Exception:
                 _proj_lead_mode = 0
             _no_avoid = _has_user_override or (_proj_lead_mode == 1)
+            # ── ЗАХОД ИЗ ПРЕВЬЮ (единый источник) ──
+            # Вьювер сохраняет вычисленную точку захода на op. Ставим старт
+            # контура туда и свой авто-подбор выключаем → .anc = превью
+            # (логичнее и меньше холостых перемещений станка).
+            # ЗАЩИТА (после v1.6.29): re-root проверяем на валидность —
+            # контур должен остаться замкнутым, с тем же числом сегментов
+            # (±2) и той же длиной (±1%). Иначе откатываемся к обычному
+            # авто-подбору (в v1.6.29 битый re-root давал вырожденный лид →
+            # паразитные окружности). Касательную в новой точке строит сам
+            # plan_lead_in по полипасу — отдельно её задавать не нужно.
+            _entry_pt = (op.attributes.get('_lead_entry', {})
+                         .get(tp.side.name))
+            if _entry_pt and polypath.closed:
+                try:
+                    from ..geometry.path_offset import shift_start_to_point
+                    _before_n = len(polypath.segments)
+                    _before_len = sum(s.length() for s in polypath.segments)
+                    _cand = shift_start_to_point(
+                        polypath, (float(_entry_pt[0]), float(_entry_pt[1])))
+                    _ok = (_cand and _cand.segments and _cand.closed
+                           and abs(len(_cand.segments) - _before_n) <= 2)
+                    if _ok:
+                        _after_len = sum(s.length() for s in _cand.segments)
+                        _ok = abs(_after_len - _before_len) <= max(
+                            0.01, _before_len * 0.01)
+                    if _ok:
+                        polypath = _cand
+                        _no_avoid = True
+                except Exception:
+                    pass
             polypath, _lead_in_poly, _coll, lead_in_geom = plan_lead_in(
                 polypath, req_in,
                 contours_lines_cache, contours_bboxes_cache,
@@ -1236,6 +1223,53 @@ class MtxAndersonGVM(PostProcessor):
         #   ;60,21 — круговое движение G3 по контуру
         # Номера взяты из шаблона AEC GVM MTX V2_13.amp (общие случаи $40,20 /
         # $50,21 / $60,21). Не влияют на исполнение, но нужны другим прогам.
+        # ── ДРОБЛЕНИЕ ДУГ >90° (перед самой эмиссией) ──
+        # R-дуга (G2/G3 X Y R) однозначна только при развороте <180°: станок
+        # по знаку R берёт МЕНЬШУЮ дугу. Дуга >180° (круг из 2 полудуг,
+        # Knife_56: 214°) выводилась как её малое дополнение → полукруг/эллипс,
+        # брак. Дробим на квадранты ≤90° — R всегда однозначен. ВАЖНО: здесь,
+        # у самого цикла, т.к. выше segments перезаписывается из polypath после
+        # автоподбора лида (иначе split терялся).
+        import math as _msplit
+        _split_segs = []
+        for _sg in segments:
+            if isinstance(_sg, Arc):
+                _cx, _cy = _sg.center
+                _a0 = _msplit.atan2(_sg.a[1]-_cy, _sg.a[0]-_cx)
+                _a1 = _msplit.atan2(_sg.b[1]-_cy, _sg.b[0]-_cx)
+                if _sg.ccw:
+                    _sw = _a1 - _a0
+                    while _sw <= 1e-9:
+                        _sw += 2*_msplit.pi
+                else:
+                    _sw = _a0 - _a1
+                    while _sw <= 1e-9:
+                        _sw += 2*_msplit.pi
+                if _sw > _msplit.pi/2 + 1e-3:  # >90°
+                    # ЗАЩИТА: у вырожденной дуги (начало≈конец после offset/
+                    # despike) sweep вычисляется как 360°, и дробление
+                    # «раздувает» её в ПОЛНЫЙ КРУГ из 4-5 дуг с одинаковым R
+                    # (паразитная окружность в .anc). Такие не дробим.
+                    if _msplit.hypot(_sg.b[0]-_sg.a[0],
+                                     _sg.b[1]-_sg.a[1]) < 1e-4:
+                        _split_segs.append(_sg)
+                        continue
+                    _n = int(_msplit.ceil(_sw / (_msplit.pi/2)))
+                    _step = _sw / _n * (1.0 if _sg.ccw else -1.0)
+                    _prev = _sg.a
+                    for _k in range(1, _n):
+                        _ang = _a0 + _step*_k
+                        _pt = (_cx + _sg.radius*_msplit.cos(_ang),
+                               _cy + _sg.radius*_msplit.sin(_ang))
+                        _split_segs.append(Arc(a=_prev, b=_pt,
+                                              center=_sg.center, ccw=_sg.ccw))
+                        _prev = _pt
+                    _split_segs.append(Arc(a=_prev, b=_sg.b,
+                                          center=_sg.center, ccw=_sg.ccw))
+                    continue
+            _split_segs.append(_sg)
+        segments = _split_segs
+
         for seg in segments:
             if isinstance(seg, Line):
                 end = seg.b
