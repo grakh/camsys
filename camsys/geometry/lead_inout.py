@@ -540,7 +540,8 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
                     prefer: str = 'right',
                     neighbours=None,
                     margin_mm: float = 0.05,
-                    attach_eps: float = 0.02):
+                    attach_eps: float = 0.02,
+                    path_is_cutter: bool = False):
     """Подбирает лид доработки так, чтобы фреза НЕ доставала до геометрии.
 
     Два условия (v1.7.40):
@@ -558,6 +559,11 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
     уходит вдоль пути и не перелезает через стенку. Сторона реза
     меняется в последнюю очередь — слева по ходу стоит металл, который
     этот проход не снимает.
+
+    `path_is_cutter` — переданный лид УЖЕ является путём фрезы (так его
+    строит вьювер: от эквидистанты). Тогда смещать его второй раз не надо
+    и зазор считается прямо до стенок. Пост передаёт осевую и оставляет
+    False.
 
     Returns:
         (сторона, множитель длины, угол захода, зазор в мм).
@@ -615,6 +621,8 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
 
     def cutter(lpts):
         """Путь ФРЕЗЫ: осевая, смещённая вправо по ходу (G42)."""
+        if path_is_cutter:
+            return lpts
         out = []
         for i in range(len(lpts) - 1):
             x0, y0 = lpts[i]
@@ -657,7 +665,7 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
                 d = math.hypot(q[0] - p[0], q[1] - p[1])
                 if d < worst:
                     worst = d
-        clr = worst - cut_half_width
+        clr = worst - (0.0 if path_is_cutter else cut_half_width)
         return clr if clr >= margin_mm else None
 
     other = 'left' if prefer == 'right' else 'right'
