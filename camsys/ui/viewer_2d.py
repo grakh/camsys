@@ -1423,8 +1423,17 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
                 if (_go is not None and _go.is_closed
                         and _go.polypath is not None and _go is not geom):
                     _nb_view.append(_go.polypath)
-            _sp_v = polypath_offset.segments[0].a
-            _tan_v = polypath_offset.segments[0].tangent_at_start()
+            # Подбору скармливаем ОСЕВУЮ, как и в посте (v1.7.43).
+            # Раньше сюда шла эквидистанта — путь, уже смещённый на
+            # полуширину реза, — а fit_rework_lead смещает его ещё раз,
+            # чтобы получить путь фрезы. Мерилась кривая на 0.55 мм
+            # дальше настоящей, пересечений она не находила, и лид не
+            # укорачивался: ровно те места (59,93 и 93,239), где в
+            # программе он укорачивался, в картинке оставались длинными.
+            _axis_v = polypath_for_vis if (
+                polypath_for_vis and polypath_for_vis.segments) else polypath
+            _sp_v = _axis_v.segments[0].a
+            _tan_v = _axis_v.segments[0].tangent_at_start()
             forced_lead_side, _shrink_v, _ang_v, _clr_v = _plsc_view(
                 _sp_v, _tan_v, geom.polypath,
                 effective_tool_offset,

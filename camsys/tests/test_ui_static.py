@@ -384,7 +384,7 @@ def test_corner_lead_side_is_pinned_to_cut_side():
     assert '_probe_len' not in source and '_probe_rad' not in source, \
         "остались пробы лида для выбора стороны"
     i = source.index('СТОРОНА ЛИДА ДОРАБОТКИ')
-    blk = source[i:i + 2000]
+    blk = source[i:i + 3000]
     assert 'fit_rework_lead' in blk, \
         "вьювер подбирает лид не тем же кодом, что пост"
     assert 'neighbours=' in blk, \
@@ -508,3 +508,26 @@ def test_reverse_is_controlled_only_by_generation_flag():
     src = open(os.path.join(UI_DIR, 'main_window.py'), encoding='utf-8').read()
     assert 'use_reverse' not in src, 'мёртвая галка реверса вернулась в UI'
     assert 'self.gen_reverse' in src, 'настоящая галка реверса пропала'
+
+
+def test_viewer_fits_lead_on_axis_not_on_equidistant():
+    """Подбор лида во вьювере считается по ОСЕВОЙ, как и в посте.
+
+    Регрессия v1.7.43: вьювер передавал в `fit_rework_lead` стартовую
+    точку эквидистанты (`polypath_offset`) — пути, уже смещённого на
+    полуширину реза. А функция смещает переданный путь ЕЩЁ раз, чтобы
+    получить путь фрезы: мерилась кривая на 0.55 мм дальше настоящей,
+    пересечений она не находила, и лид не укорачивался.
+
+    Из-за этого ровно в тех местах, где программа лид укорачивала
+    (59,93 и 93,239), картинка показывала его прежней длины.
+    """
+    source = open(os.path.join(UI_DIR, 'viewer_2d.py'), encoding='utf-8').read()
+    i = source.index('fit_rework_lead')
+    blk = source[i:i + 1800]
+    assert '_axis_v' in blk, 'вьювер не берёт осевую для подбора лида'
+    assert 'polypath_offset.segments[0].a' not in blk, (
+        'в подбор лида снова уходит эквидистанта вместо осевой')
+    # Инструмент для замера — полуширина реза, а не полная
+    assert 'effective_tool_offset' in blk, (
+        'в подбор не передана полуширина реза')
