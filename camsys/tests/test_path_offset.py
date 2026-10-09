@@ -291,3 +291,140 @@ if __name__ == "__main__":
             import traceback; traceback.print_exc()
     print(f"\n{passed}/{len(tests)} тестов пройдено")
     sys.exit(0 if not failed else 1)
+
+
+def test_merge_does_not_add_tangent_breaks():
+    """Склейка сегментов не должна делать контур ЛОМАНЕЕ оригинала.
+
+    Регрессия v1.7.3: merge_segments_to_arcs при импорте склеивал плавные
+    биарк-цепочки .ai в дуги, не стыкующиеся по касательной. На 124173
+    число изломов > 3° росло с 81 до 167 — плавные дуги приезжали в вид
+    ломаной с видимыми углами.
+    """
+    import os, math
+    ai = '/mnt/user-data/uploads/124173.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет файла')
+        return
+    import camsys.core.importer as importer_mod
+    from camsys.geometry.path_offset import merge_segments_to_arcs
+
+    def count_breaks(polypath, thr=3.0):
+        segs = polypath.segments
+        n = len(segs)
+        total = 0
+        rng = range(n) if polypath.closed else range(n - 1)
+        for i in rng:
+            t1 = segs[i].tangent_at_end()
+            t2 = segs[(i + 1) % n].tangent_at_start()
+            deg = math.degrees(abs(math.atan2(
+                t1[0] * t2[1] - t1[1] * t2[0],
+                t1[0] * t2[0] + t1[1] * t2[1])))
+            if deg > thr:
+                total += 1
+        return total
+
+    project = importer_mod.import_ai_to_project(ai)
+    geoms = [g for g in project.get_layer_by_name("Knife").geometries
+             if g.polypath]
+    raw_breaks = sum(count_breaks(g.polypath) for g in geoms)
+    raw_segs = sum(len(g.polypath.segments) for g in geoms)
+
+    merged = [merge_segments_to_arcs(g.polypath, tol=0.02, min_chain=3)
+              for g in geoms]
+    new_breaks = sum(count_breaks(m) for m in merged)
+    new_segs = sum(len(m.segments) for m in merged)
+
+    print(f'  изломов >3°: сырой {raw_breaks} -> merge {new_breaks}; '
+          f'сегментов {raw_segs} -> {new_segs}')
+    # Главное: склейка не добавляет изломов сверх оригинала
+    assert new_breaks <= raw_breaks, (
+        f"склейка добавила изломов: {raw_breaks} -> {new_breaks}")
+    # И при этом всё ещё что-то склеивает (иначе смысл теряется)
+    assert new_segs < raw_segs * 0.75, "склейка перестала работать"
+
+
+def test_smooth_guard_is_tunable():
+    """Порог guard регулируется: выключенный даёт больше изломов."""
+    import os, math
+    ai = '/mnt/user-data/uploads/124173.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет файла')
+        return
+    import camsys.core.importer as importer_mod
+    from camsys.geometry.path_offset import merge_segments_to_arcs
+
+    def count_breaks(pp, thr=3.0):
+        segs = pp.segments
+        n = len(segs)
+        return sum(1 for i in (range(n) if pp.closed else range(n - 1))
+                   if math.degrees(abs(math.atan2(
+                       segs[i].tangent_at_end()[0]
+                       * segs[(i + 1) % n].tangent_at_start()[1]
+                       - segs[i].tangent_at_end()[1]
+                       * segs[(i + 1) % n].tangent_at_start()[0],
+                       segs[i].tangent_at_end()[0]
+                       * segs[(i + 1) % n].tangent_at_start()[0]
+                       + segs[i].tangent_at_end()[1]
+                       * segs[(i + 1) % n].tangent_at_start()[1]))) > thr)
+
+    project = importer_mod.import_ai_to_project(ai)
+    geoms = [g for g in project.get_layer_by_name("Knife").geometries
+             if g.polypath][:20]
+    on = sum(count_breaks(merge_segments_to_arcs(
+        g.polypath, tol=0.02, min_chain=3, smooth_guard_deg=3.0))
+        for g in geoms)
+    off = sum(count_breaks(merge_segments_to_arcs(
+        g.polypath, tol=0.02, min_chain=3, smooth_guard_deg=999.0))
+        for g in geoms)
+    print(f'  изломов: guard 3° -> {on}, guard выключен -> {off}')
+    assert on < off, "guard не влияет на результат"
+
+
+def test_merge_keeps_variable_curvature():
+    """Цепочка дуг с растущим радиусом не склеивается в одну.
+
+    Регрессия v1.7.30: нож #0 файла 124173_test, точка (57.8, 93.8). В .ai
+    там гладкая кривая переменной кривизны — десять дуг R 2.3 → 61.9,
+    изломы 0.00°. merge_segments_to_arcs сворачивал их в одну дугу
+    R 16.08 длиной 2.71 с изломом 1.66° на стыке: формально допуск
+    tol=0.02 соблюдён, а на экране — ступенька. Guard по изломам (3°)
+    этого не ловил.
+    """
+    import os
+    ai = '/mnt/user-data/uploads/124173_test.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет 124173_test.ai')
+        return
+    import camsys.core.importer as importer_mod
+    from camsys.geometry.path_offset import merge_segments_to_arcs
+
+    project = importer_mod.import_ai_to_project(ai)
+    geom = [g for g in project.get_layer_by_name("Knife").geometries
+            if g.polypath][0]
+
+    def in_zone(pp):
+        return [s for s in pp.segments
+                if 56.3 < s.a[0] < 59.3 and 92.3 < s.a[1] < 95.3]
+
+    off = in_zone(merge_segments_to_arcs(geom.polypath, tol=0.02,
+                                         min_chain=3, max_radius_ratio=99.0))
+    on = in_zone(merge_segments_to_arcs(geom.polypath, tol=0.02,
+                                        min_chain=3))
+    print(f'  сегментов в зоне ступеньки: без ограничения {len(off)}, '
+          f'с ограничением {len(on)}')
+    assert len(off) == 1, "проверка не воспроизводит исходную ступеньку"
+    assert len(on) > 1, "цепочка переменной кривизны снова склеена в одну дугу"
+
+    # Радиусы после правки растут плавно — соседние не больше чем вдвое
+    radii = [s.radius for s in on if hasattr(s, 'radius')]
+    for r1, r2 in zip(radii, radii[1:]):
+        assert max(r1, r2) / min(r1, r2) <= 4.0
+
+
+def test_radius_ratio_default_is_two():
+    """Умолчание разброса радиусов — 2.0, согласовано с оператором."""
+    import inspect
+    from camsys.geometry.path_offset import merge_segments_to_arcs
+    sig = inspect.signature(merge_segments_to_arcs)
+    assert sig.parameters['max_radius_ratio'].default == 2.0

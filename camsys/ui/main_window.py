@@ -429,10 +429,11 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         _dir_row.addStretch(1)
         dir_layout.addLayout(_dir_row)
         
-        self.use_reverse = QtWidgets.QCheckBox("Включить реверс")
-        self.use_reverse.setChecked(True)
-        dir_layout.addWidget(self.use_reverse)
-        
+        # Галки «Включить реверс» здесь больше нет (v1.7.42): её значение
+        # никуда не шло — ни пост, ни экспортёр, ни сортировка операций
+        # его не читали. Реверсной программой управляет «Реверс черновая
+        # (_revers_R.anc)» в блоке генерации, и снятая галка направления
+        # файл всё равно не отменяла — то есть вводила в заблуждение.
         layout.addWidget(dir_group)
         
         # ── ГРУППИРОВКА В ПРОГРАММЫ ──
@@ -528,11 +529,21 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         self.lead_out_length.setValue(1.0); self.lead_out_length.setSingleStep(0.1)
         lead_grid.addWidget(self.lead_out_length, 2, 3)
         
+        # ── ЗНАК «СМЕЩЕНИЯ» В GUI (v1.7.13) ──
+        # Внутри и в .anc смещение хранится как было: отрицательное =
+        # влево по верхней стороне. В поле показывается с ОБРАТНЫМ знаком
+        # — так привычнее оператору. Инверсия живёт ТОЛЬКО здесь, в двух
+        # хелперах ниже; ни экспорт, ни JSON заказа, ни настройки её не
+        # видят.
+        #
+        # ВАЖНО: обращаться к полям только через lead_*_offset_value() и
+        # set_lead_*_offset_value(). Прямой .value()/.setValue() вернёт
+        # значение с экранным знаком и даст ошибку в два раза по смыслу.
         # Смещение
         lead_grid.addWidget(QtWidgets.QLabel("Смещение:"), 3, 0)
         self.lead_in_offset = QtWidgets.QDoubleSpinBox()
         self.lead_in_offset.setRange(-100, 100); self.lead_in_offset.setDecimals(2)
-        self.lead_in_offset.setValue(-5); self.lead_in_offset.setSingleStep(0.5)
+        self.lead_in_offset.setValue(5); self.lead_in_offset.setSingleStep(0.5)
         # Флаг «юзер вручную менял offset». Стартовое значение -5 ставим
         # программно (setValue), поэтому _lead_in_user_set остаётся False
         # до фактического действия юзера.
@@ -541,20 +552,20 @@ class CuttingParamsPanel(QtWidgets.QWidget):
             lambda v: setattr(self, '_lead_in_user_set', True))
         self.lead_in_offset.setToolTip(
             "Смещение точки старта (мм) от RT-угла ножа по контуру. "
-            "Отрицательное = влево по верхней стороне."
+            "Положительное = влево по верхней стороне."
         )
         lead_grid.addWidget(self.lead_in_offset, 3, 1)
         
         lead_grid.addWidget(QtWidgets.QLabel("Смещение:"), 3, 2)
         self.lead_out_offset = QtWidgets.QDoubleSpinBox()
         self.lead_out_offset.setRange(-100, 100); self.lead_out_offset.setDecimals(2)
-        self.lead_out_offset.setValue(-5); self.lead_out_offset.setSingleStep(0.5)
+        self.lead_out_offset.setValue(5); self.lead_out_offset.setSingleStep(0.5)
         self._lead_out_user_set = False
         self.lead_out_offset.valueChanged.connect(
             lambda v: setattr(self, '_lead_out_user_set', True))
         self.lead_out_offset.setToolTip(
             "Смещение точки старта (мм) от RT-угла ножа по контуру. "
-            "Отрицательное = влево по верхней стороне."
+            "Положительное = влево по верхней стороне."
         )
         lead_grid.addWidget(self.lead_out_offset, 3, 3)
         
@@ -663,17 +674,35 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         # необходимости для конкретного заказа.
         self.gen_corner.setChecked(False)
         gen_layout.addWidget(self.gen_corner)
+
+        # Порог радиуса, ниже которого скругление считается острым углом
+        # и уходит в _corner.anc на доработку тонкой фрезой T3.
+        _thr_row = QtWidgets.QHBoxLayout()
+        _thr_row.addSpacing(20)
+        _thr_lbl = QtWidgets.QLabel("Порог радиуса угла:")
+        _thr_row.addWidget(_thr_lbl)
+        self.corner_radius_threshold = QtWidgets.QDoubleSpinBox()
+        self.corner_radius_threshold.setRange(0.1, 5.0)
+        self.corner_radius_threshold.setDecimals(2)
+        self.corner_radius_threshold.setSingleStep(0.05)
+        self.corner_radius_threshold.setValue(0.70)
+        self.corner_radius_threshold.setSuffix(" мм")
+        self.corner_radius_threshold.setToolTip(
+            "Скругление с радиусом МЕНЬШЕ этого порога считается острым "
+            "углом и дорабатывается тонкой фрезой T3 в _corner.anc.\n\n"
+            "Порог не опускается ниже эквидистанты основной фрезы: то, что "
+            "она физически не проходит, углом считается всегда.\n"
+            "Поднимайте, если нужны углы на местах, куда фреза формально "
+            "входит, но впритык (напр. шпилька R0.64 при эквидистанте "
+            "0.53).\n\n"
+            "Больше порог — больше углов и дольше программа _corner.anc.")
+        _thr_row.addWidget(self.corner_radius_threshold)
+        _thr_row.addStretch(1)
+        gen_layout.addLayout(_thr_row)
         
         self.gen_corner_3d = QtWidgets.QCheckBox("Острые углы 3D (_corner3D.anc)")
         gen_layout.addWidget(self.gen_corner_3d)
         
-        self.gen_smooth = QtWidgets.QCheckBox("Сглаживание под фрезу (без самопересечений)")
-        self.gen_smooth.setToolTip(
-            "Скругляет тугие места до проходимого радиуса фрезы и убирает "
-            "биарк-веера, чтобы эквидистанта (offset) не самопересекалась.\n"
-            "Применяется и в превью, и в .anc. Требует shapely.")
-        gen_layout.addWidget(self.gen_smooth)
-
         # Отображение холостых перемещений (перебегов) между проходами
         self.show_rapids = QtWidgets.QCheckBox("Показывать перебеги станка")
         self.show_rapids.setChecked(False)
@@ -715,7 +744,7 @@ class CuttingParamsPanel(QtWidgets.QWidget):
                   self.lead_out_angle, self.lead_out_length, self.lead_out_offset,
                   self.max_geom_len]:
             w.valueChanged.connect(self._on_changed)
-        for w in [self.dir_horiz, self.dir_vert, self.use_reverse,
+        for w in [self.dir_horiz, self.dir_vert,
                   self.gen_rough, self.gen_reverse, self.gen_finish,
                   self.gen_sv, self.gen_corner, self.gen_corner_3d]:
             w.toggled.connect(self._on_changed)
@@ -738,7 +767,7 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         # Список всех виджетов которые получают сигналы
         widgets_to_block = [
             self.angle, self.tip, self.top, self.bottom,
-            self.dir_horiz, self.dir_vert, self.use_reverse,
+            self.dir_horiz, self.dir_vert,
             self.max_geom_len, self.fiducial_x,
             self.lead_in_angle, self.lead_in_length, 
             self.lead_in_offset, self.lead_in_overlap,
@@ -746,7 +775,7 @@ class CuttingParamsPanel(QtWidgets.QWidget):
             self.lead_out_offset, self.lead_out_overlap,
             self.gen_rough, self.gen_reverse, self.gen_finish,
             self.gen_sv, self.gen_corner, self.gen_corner_3d,
-            self.gen_smooth, self.auto_avoid_all,
+            self.auto_avoid_all,
         ]
         for w in widgets_to_block:
             w.blockSignals(True)
@@ -762,7 +791,6 @@ class CuttingParamsPanel(QtWidgets.QWidget):
             # ── Направление ──
             self.dir_horiz.setChecked(True)
             self.dir_vert.setChecked(False)
-            self.use_reverse.setChecked(True)
             
             # ── Группировка ──
             self.max_geom_len.setValue(3000)
@@ -771,11 +799,11 @@ class CuttingParamsPanel(QtWidgets.QWidget):
             # ── Точка входа/выхода ──
             self.lead_in_angle.setValue(45)
             self.lead_in_length.setValue(1.0)
-            self.lead_in_offset.setValue(-5)
+            self.set_lead_in_offset_value(-5)
             self.lead_in_overlap.setValue(0)
             self.lead_out_angle.setValue(45)
             self.lead_out_length.setValue(1.0)
-            self.lead_out_offset.setValue(-5)
+            self.set_lead_out_offset_value(-5)
             self.lead_out_overlap.setValue(0)
             
             # Флаги «пользователь менял» — сбрасываются, чтобы автоподбор
@@ -792,7 +820,6 @@ class CuttingParamsPanel(QtWidgets.QWidget):
             self.gen_sv.setChecked(True)
             self.gen_corner.setChecked(False)
             self.gen_corner_3d.setChecked(False)
-            self.gen_smooth.setChecked(False)
             self.auto_avoid_all.setChecked(True)
         finally:
             for w in widgets_to_block:
@@ -800,6 +827,31 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         # Один общий сигнал об изменении
         self.paramsChanged.emit()
     
+    # ── ЗНАК «СМЕЩЕНИЯ»: GUI ↔ внутреннее представление (v1.7.13) ──
+    # В поле оператор видит смещение с ОБРАТНЫМ знаком (так привычнее),
+    # наружу уходит прежнее значение. Инверсия только здесь.
+    GUI_OFFSET_SIGN = -1.0
+
+    def lead_in_offset_value(self) -> float:
+        """Смещение захода во ВНУТРЕННЕМ знаке (как уходит в .anc)."""
+        # ЕДИНСТВЕННОЕ место, где читается сам виджет. Не заменять на
+        # lead_in_offset_value() — это рекурсия (см. v1.7.14).
+        return self.lead_in_offset.value() * self.GUI_OFFSET_SIGN
+
+    def lead_out_offset_value(self) -> float:
+        """Смещение выхода во ВНУТРЕННЕМ знаке (как уходит в .anc)."""
+        # ЕДИНСТВЕННОЕ место, где читается сам виджет. Не заменять на
+        # lead_out_offset_value() — это рекурсия (см. v1.7.14).
+        return self.lead_out_offset.value() * self.GUI_OFFSET_SIGN
+
+    def set_lead_in_offset_value(self, value: float) -> None:
+        """Кладёт ВНУТРЕННЕЕ значение в поле, переворачивая знак для GUI."""
+        self.lead_in_offset.setValue(float(value) * self.GUI_OFFSET_SIGN)
+
+    def set_lead_out_offset_value(self, value: float) -> None:
+        """Кладёт ВНУТРЕННЕЕ значение в поле, переворачивая знак для GUI."""
+        self.lead_out_offset.setValue(float(value) * self.GUI_OFFSET_SIGN)
+
     def get_params_dict(self) -> dict:
         """Возвращает словарь параметров для CamSession."""
         # Пятка из текста '1_2' → 1.2
@@ -822,22 +874,21 @@ class CuttingParamsPanel(QtWidgets.QWidget):
             'top': _top_val,
             'bottom': self.bottom.value(),
             'direction': 'horizontal' if self.dir_horiz.isChecked() else 'vertical',
-            'enable_reverse': self.use_reverse.isChecked(),
             'max_geom_len': self.max_geom_len.value(),
             'fiducial_distance': self.fiducial_x.value(),
             'lead_inside': {
                 'angle': self.lead_in_angle.value(),
                 'length': self.lead_in_length.value(),
-                'offset': self.lead_in_offset.value(),
-                'sign_offset': '+' if self.lead_in_offset.value() >= 0 else '-',
+                'offset': self.lead_in_offset_value(),
+                'sign_offset': '+' if self.lead_in_offset_value() >= 0 else '-',
                 'overlap': self.lead_in_overlap.value(),
                 'user_set_offset': True,
             },
             'lead_outside': {
                 'angle': self.lead_out_angle.value(),
                 'length': self.lead_out_length.value(),
-                'offset': self.lead_out_offset.value(),
-                'sign_offset': '+' if self.lead_out_offset.value() >= 0 else '-',
+                'offset': self.lead_out_offset_value(),
+                'sign_offset': '+' if self.lead_out_offset_value() >= 0 else '-',
                 'overlap': self.lead_out_overlap.value(),
                 'user_set_offset': True,
             },
@@ -847,7 +898,7 @@ class CuttingParamsPanel(QtWidgets.QWidget):
             'generate_sv': self.gen_sv.isChecked(),
             'generate_corner': self.gen_corner.isChecked(),
             'generate_corner_3d': self.gen_corner_3d.isChecked(),
-            'smooth_offset_for_tool': self.gen_smooth.isChecked(),
+            'corner_radius_threshold_mm': self.corner_radius_threshold.value(),
             'auto_avoid_all': self.auto_avoid_all.isChecked(),
         }
     
@@ -1052,10 +1103,21 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Правая панель: параметры
         self.params_panel = CuttingParamsPanel()
+        # Умолчания оператора видны сразу при запуске, не дожидаясь
+        # открытия .ai (v1.7.9). Параметры ножа не трогаются — см.
+        # _apply_startup_defaults.
+        self._apply_startup_defaults()
         self.params_panel.btn_export.clicked.connect(self.action_export)
         self.params_panel.btn_show_paths.clicked.connect(self.action_toggle_paths)
         self.params_panel.rapidsVisibilityChanged.connect(
             self._on_rapids_visibility)
+
+        # «Направление» пересортировывает обход сразу (v1.7.6). Раньше
+        # переключатель только эмитил paramsChanged, а этот сигнал НИКУДА
+        # не был подключён — то есть смена направления не делала ничего,
+        # и порядок оставался тем, что сложился при открытии файла.
+        self.params_panel.dir_horiz.toggled.connect(
+            self._on_direction_changed)
         
         # Связка радио-режимов «Авто/Все/Выделенные» с возможностью 
         # выделения ножей на канвасе. Селект работает только в режиме 
@@ -1184,7 +1246,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # его надо жать ВСЕГДА перед любой работой — автоматизируем.
             try:
                 self.session.create_blade_operations()
-                self.session.sort_by_grid()
+                self._sort_by_direction()
             except Exception:
                 pass  # если что-то не так с .ai — юзер увидит через btn_create
             
@@ -1469,7 +1531,6 @@ class MainWindow(QtWidgets.QMainWindow):
             'top': p.top.value(),
             'bottom': p.bottom.value(),
             'direction_horiz': p.dir_horiz.isChecked(),
-            'use_reverse': p.use_reverse.isChecked(),
             'max_geom_len': p.max_geom_len.value(),
             'fiducial_x': p.fiducial_x.value(),
         }
@@ -1514,7 +1575,7 @@ class MainWindow(QtWidgets.QMainWindow):
         p = self.params_panel
         # Заблокировать сигналы во время массовой установки
         widgets = [p.angle, p.tip, p.top, p.bottom, p.dir_horiz, p.dir_vert,
-                   p.use_reverse, p.max_geom_len, p.fiducial_x]
+                   p.max_geom_len, p.fiducial_x]
         for w in widgets:
             w.blockSignals(True)
         try:
@@ -1549,7 +1610,6 @@ class MainWindow(QtWidgets.QMainWindow):
                                   else "columns"))
                 except Exception:
                     pass
-            if 'use_reverse' in ui: p.use_reverse.setChecked(ui['use_reverse'])
             if 'max_geom_len' in ui: p.max_geom_len.setValue(ui['max_geom_len'])
             if 'fiducial_x' in ui: p.fiducial_x.setValue(ui['fiducial_x'])
         finally:
@@ -1809,7 +1869,8 @@ class MainWindow(QtWidgets.QMainWindow):
         Радиус фрезы динамический: tip/2 + ABS·tan(angle/2). Скругление
         R >= радиуса фрезы фреза проходит — обработка не нужна.
         """
-        from ..geometry.corner_detect import detect_corners_by_equidistant
+        from ..geometry.corner_detect import (detect_corners_by_equidistant,
+                                              detect_geometric_corners)
         import math
 
         prj = self.session.project
@@ -1821,6 +1882,14 @@ class MainWindow(QtWidgets.QMainWindow):
         half_angle_rad = math.radians(cp.knife_angle / 2.0)
         tool_radius = (cp.tip_diameter / 2.0
                        + cp.bottom * math.tan(half_angle_rad))
+
+        # Порог 2D — ровно тот, что уйдёт в package_export:
+        # настройка оператора, но не ниже эквидистанты основной фрезы.
+        # Нижняя граница — эквидистанта, как в package_export
+        # (v1.7.26, откат привязки из v1.7.21).
+        _thr_2d = max(
+            float(getattr(cp, 'corner_radius_threshold_mm', 0.7) or 0.7),
+            tool_radius)
 
         knife = prj.get_layer_by_name("Knife")
         if knife is None:
@@ -1848,7 +1917,15 @@ class MainWindow(QtWidgets.QMainWindow):
         for g in _geoms:
             if not g.polypath:
                 continue
-            has2d, has3d = detect_corners_by_equidistant(
+            # 2D-углы проверяем ТЕМ ЖЕ детектором, которым они потом
+            # строятся (v1.7.7). Раньше галку ставил
+            # detect_corners_by_equidistant — проверка по вершинам, а
+            # операции строил detect_geometric_corners — радиус меньше
+            # порога плюс разворот от 40°. Критерии разные, поэтому галка
+            # вставала там, где углов потом не находилось ни одного.
+            has2d = bool(detect_geometric_corners(
+                g.polypath, radius_threshold_mm=_thr_2d))
+            _, has3d = detect_corners_by_equidistant(
                 g.polypath, tool_radius)
             any_2d = any_2d or has2d
             any_3d = any_3d or has3d
@@ -1900,20 +1977,59 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         try:
             created = self.session.create_blade_operations()
-            self.session.sort_by_grid()
+            self._sort_by_direction()
             QtWidgets.QMessageBox.information(
                 self, "Готово", 
-                f"Создано {len(created)} операций. "
-                f"Отсортированы слева-направо."
+                f"Создано {len(created)} операций. Порядок обхода: "
+                + ("строками, слева-направо."
+                   if self._grid_grouping() == "rows"
+                   else "столбцами, снизу-вверх.")
             )
             self._refresh_operations()
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Ошибка", str(e))
     
+    def _on_direction_changed(self, _checked=None):
+        """Смена «Направление» — пересортировать обход и перерисовать."""
+        if not self.session.has_project():
+            return
+        if getattr(self, '_restoring_saved_state', False):
+            return
+        try:
+            self._sort_by_direction()
+            self._refresh_operations()
+        except Exception:
+            pass
+
+    def _grid_grouping(self) -> str:
+        """Группировка обхода по переключателю «Направление» (v1.7.6).
+
+        «→ Горизонтально» — строками: нижний ряд слева-направо, затем
+        верхний. «↑↑ Вертикально» — столбцами: левый столбец снизу-вверх,
+        затем следующий.
+
+        Раньше три из четырёх точек вызова звали sort_by_grid() БЕЗ
+        аргументов, а умолчание там 'columns' — поэтому при выбранном
+        «Горизонтально» обход всё равно шёл столбцами снизу вверх, и
+        перебеги на экране выглядели вертикальными.
+        """
+        try:
+            return "rows" if self.params_panel.dir_horiz.isChecked() \
+                else "columns"
+        except Exception:
+            return "rows"
+
+    def _sort_by_direction(self):
+        """Пересортировывает операции под текущее «Направление»."""
+        if not self.session.has_project():
+            return
+        self.session.sort_by_grid(direction="LB",
+                                  grouping=self._grid_grouping())
+
     def action_sort_operations(self):
         if not self.session.has_project():
             return
-        self.session.sort_by_grid()
+        self._sort_by_direction()
         self._refresh_operations()
     
     def action_clear_operations(self):
@@ -1943,7 +2059,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Если ещё нет операций — создаём
         if not self.session.project.operations:
             self.session.create_blade_operations()
-            self.session.sort_by_grid()
+            self._sort_by_direction()
             self._refresh_operations()
         
         names = self.session.preview_package_filenames()
@@ -1984,8 +2100,20 @@ class MainWindow(QtWidgets.QMainWindow):
         is_excluded = op.attributes.get('excluded', False)
         has_override = 'lead_override' in op.attributes
         
-        # Название ножа для заголовка
+        # Название ножа для заголовка (v1.7.35). Раньше здесь стоял
+        # внутренний id — «blade 3f9a2c», по которому нож в журнале и в
+        # чертеже не найти. Берём имя геометрии из слоя Knife.
         op_name = f"{op.kind.value} {op.id[:6]}"
+        try:
+            _gid = (op.geometry_ids[0] if getattr(op, 'geometry_ids', None)
+                    else next((tp.geometry_id for tp in op.toolpaths
+                               if getattr(tp, 'geometry_id', '')), ''))
+            _g = self.session.project.get_geometry(_gid) if _gid else None
+            _gname = getattr(_g, 'name', '') if _g is not None else ''
+            if _gname:
+                op_name = f"{_gname} — {op.kind.value}"
+        except Exception:
+            pass
         header = menu.addAction(op_name)
         header.setEnabled(False)  # только заголовок
         menu.addSeparator()
@@ -2115,16 +2243,16 @@ class MainWindow(QtWidgets.QMainWindow):
                     'lead_inside': {
                         'angle': p.lead_in_angle.value(),
                         'length': p.lead_in_length.value(),
-                        'offset': p.lead_in_offset.value(),
-                        'sign_offset': ('+' if p.lead_in_offset.value() >= 0
+                        'offset': p.lead_in_offset_value(),
+                        'sign_offset': ('+' if p.lead_in_offset_value() >= 0
                                         else '-'),
                         'overlap': p.lead_in_overlap.value(),
                     },
                     'lead_outside': {
                         'angle': p.lead_out_angle.value(),
                         'length': p.lead_out_length.value(),
-                        'offset': p.lead_out_offset.value(),
-                        'sign_offset': ('+' if p.lead_out_offset.value() >= 0
+                        'offset': p.lead_out_offset_value(),
+                        'sign_offset': ('+' if p.lead_out_offset_value() >= 0
                                         else '-'),
                         'overlap': p.lead_out_overlap.value(),
                     },
@@ -2148,13 +2276,13 @@ class MainWindow(QtWidgets.QMainWindow):
             'lead_inside': {
                 'angle': p.lead_in_angle.value(),
                 'length': p.lead_in_length.value(),
-                'offset': p.lead_in_offset.value(),
+                'offset': p.lead_in_offset_value(),
                 'overlap': p.lead_in_overlap.value(),
             },
             'lead_outside': {
                 'angle': p.lead_out_angle.value(),
                 'length': p.lead_out_length.value(),
-                'offset': p.lead_out_offset.value(),
+                'offset': p.lead_out_offset_value(),
                 'overlap': p.lead_out_overlap.value(),
             },
         }
@@ -2297,13 +2425,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     'lead_inside': {
                         'angle': p.lead_in_angle.value(),
                         'length': p.lead_in_length.value(),
-                        'offset': p.lead_in_offset.value(),
+                        'offset': p.lead_in_offset_value(),
                         'overlap': p.lead_in_overlap.value(),
                     },
                     'lead_outside': {
                         'angle': p.lead_out_angle.value(),
                         'length': p.lead_out_length.value(),
-                        'offset': p.lead_out_offset.value(),
+                        'offset': p.lead_out_offset_value(),
                         'overlap': p.lead_out_overlap.value(),
                     },
                 }
@@ -2412,8 +2540,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 'tool_equidistant': tool_eq,
                 'corner_tool_radius': corner_tool_radius,
                 'corner_tool_equidistant': corner_tool_eq,
-                'smooth_offset_for_tool': self.gen_smooth.isChecked()
-                    if hasattr(self, 'gen_smooth') else False,
                 'auto_avoid_all': self.params_panel.auto_avoid_all.isChecked()
                     if hasattr(self.params_panel, 'auto_avoid_all') else True,
                 'lead_mode': lead_mode_id,  # 0=Авто, 1=Все, 2=Выделенные
@@ -2482,6 +2608,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 bottom=params.get('bottom', 0.2),
                 generate_corner=params.get('generate_corner', False),
                 generate_corner_3d=params.get('generate_corner_3d', False),
+                corner_radius_threshold_mm=params.get(
+                    'corner_radius_threshold_mm', 0.7),
             )
             exp = PackageExporter(self.session.project, macro)
             preferred = exp._analyze_layout_lead_side()
@@ -2502,7 +2630,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     corner_ops_2d, corner_ops_3d = exp._build_corner_operations()
             except Exception:
                 pass
-            
+
             # Добавляем corner-операции в проект ОДИН РАЗ (постоянно).
             # При повторном вызове action_toggle_paths не дублируем.
             
@@ -2801,6 +2929,13 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.setWindowTitle("Значения по умолчанию")
         form = QtWidgets.QFormLayout(dlg)
 
+        def _spin(rng, dec, step, val):
+            s = QtWidgets.QDoubleSpinBox()
+            s.setRange(*rng); s.setDecimals(dec); s.setSingleStep(step)
+            s.setValue(val)
+            return s
+
+
         # ── Параметры ножа ──
         w_angle = QtWidgets.QComboBox()
         w_angle.addItems(["60", "70", "80", "90"])
@@ -2812,11 +2947,15 @@ class MainWindow(QtWidgets.QMainWindow):
         w_tip.setCurrentText(self._get_default("tip", "0_8"))
         form.addRow("Пятка:", w_tip)
 
-        def _spin(rng, dec, step, val):
-            s = QtWidgets.QDoubleSpinBox()
-            s.setRange(*rng); s.setDecimals(dec); s.setSingleStep(step)
-            s.setValue(val)
-            return s
+        # Порог радиуса угла — относится к «Острым углам 2D».
+        w_corner_thr = _spin((0.1, 5.0), 2, 0.05,
+                             self._get_default("corner_radius_threshold", 0.70))
+        w_corner_thr.setSuffix(" мм")
+        w_corner_thr.setToolTip(
+            "Скругление с радиусом МЕНЬШЕ порога считается острым углом и "
+            "уходит в _corner.anc на тонкую фрезу T3.\n"
+            "Ниже эквидистанты основной фрезы порог не опускается.")
+        form.addRow("Порог радиуса угла:", w_corner_thr)
 
         w_top = _spin((0.0, 5.0), 3, 0.001, self._get_default("top", 0.440))
         form.addRow("Высота:", w_top)
@@ -2845,7 +2984,9 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow("Внутр. угол:", w_in_ang)
         w_in_len = _spin((0, 100), 2, 0.1, self._get_default("lead_in_length", 1.0))
         form.addRow("Внутр. длина:", w_in_len)
-        w_in_off = _spin((-100, 100), 2, 0.5, self._get_default("lead_in_offset", -5.0))
+        # Знак в диалоге тот же, что в панели — экранный (v1.7.13).
+        w_in_off = _spin((-100, 100), 2, 0.5,
+                         -self._get_default("lead_in_offset", -5.0))
         form.addRow("Внутр. смещение:", w_in_off)
         w_in_ovl = _spin((0, 100), 2, 0.1, self._get_default("lead_in_overlap", 0.0))
         form.addRow("Внутр. перекрытие:", w_in_ovl)
@@ -2854,7 +2995,8 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow("Внеш. угол:", w_out_ang)
         w_out_len = _spin((0, 100), 2, 0.1, self._get_default("lead_out_length", 1.0))
         form.addRow("Внеш. длина:", w_out_len)
-        w_out_off = _spin((-100, 100), 2, 0.5, self._get_default("lead_out_offset", -5.0))
+        w_out_off = _spin((-100, 100), 2, 0.5,
+                          -self._get_default("lead_out_offset", -5.0))
         form.addRow("Внеш. смещение:", w_out_off)
         w_out_ovl = _spin((0, 100), 2, 0.1, self._get_default("lead_out_overlap", 0.0))
         form.addRow("Внеш. перекрытие:", w_out_ovl)
@@ -2870,6 +3012,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_defaults({
             "angle": w_angle.currentText(),
             "tip": w_tip.currentText(),
+            "corner_radius_threshold": w_corner_thr.value(),
             "abs_boundary": w_abs_bnd.value(),
             "abs_low": w_abs_lo.value(),
             "abs_high": w_abs_hi.value(),
@@ -2877,11 +3020,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "limit": w_limit.value(),
             "lead_in_angle": w_in_ang.value(),
             "lead_in_length": w_in_len.value(),
-            "lead_in_offset": w_in_off.value(),
+            "lead_in_offset": -w_in_off.value(),
             "lead_in_overlap": w_in_ovl.value(),
             "lead_out_angle": w_out_ang.value(),
             "lead_out_length": w_out_len.value(),
-            "lead_out_offset": w_out_off.value(),
+            "lead_out_offset": -w_out_off.value(),
             "lead_out_overlap": w_out_ovl.value(),
         })
         # Применяем сразу к текущим полям
@@ -2896,7 +3039,7 @@ class MainWindow(QtWidgets.QMainWindow):
         hi = self._get_default("abs_high", 0.25)
         return lo if height < bnd else hi
 
-    def _apply_defaults_to_fields(self):
+    def _apply_defaults_to_fields(self, include_knife: bool = True):
         """Проставляет сохранённые дефолты в поля панели параметров.
 
         ABS вычисляется от ВЫСОTЫ по правилу-порогу (не хранится как
@@ -2905,6 +3048,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         Каждое поле — в своём try, чтобы сбой на одном (напр. угол не в
         списке комбо) не помешал применить остальные.
+
+        Args:
+            include_knife: трогать ли параметры ножа (угол/пятка/высота/
+                ABS). При запуске программы — False: угол и высота
+                приходят только из XML спецификации, и пометка «не задано»
+                розовым на пустом старте выглядела бы как ошибка. Всё
+                остальное (лимит, лиды, порог угла) осмысленно и без
+                загруженного файла — см. _apply_startup_defaults.
         """
         p = self.params_panel
 
@@ -2914,30 +3065,48 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-        # Угол и высота НЕ берём из дефолтов — только из XML спецификации.
-        # Ставим «не задано» + розовое, чтобы было видно (иначе уедет в
-        # работу с дефолтом).
-        def _mark_unset_angle():
-            p.angle.setCurrentText("—")
-            p.angle.setStyleSheet("background-color: #ffd6ec;")
-        def _mark_unset_top():
-            p.top.setValue(0.0)
-            p.top.setStyleSheet("background-color: #ffd6ec;")
-        _set(_mark_unset_angle)
-        _set(lambda: p.tip.setCurrentText(self._get_default("tip", "0_8")))
-        _set(_mark_unset_top)
-        # ABS по умолчанию (высота ещё не задана — берём ABS-низ как базу;
-        # реальное значение проставится когда придёт высота из XML)
-        _set(lambda: p.bottom.setValue(self._get_default("abs_low", 0.19)))
+        if include_knife:
+            # Угол и высота НЕ берём из дефолтов — только из XML
+            # спецификации. Ставим «не задано» + розовое, чтобы было видно
+            # (иначе уедет в работу с дефолтом).
+            def _mark_unset_angle():
+                p.angle.setCurrentText("—")
+                p.angle.setStyleSheet("background-color: #ffd6ec;")
+            def _mark_unset_top():
+                p.top.setValue(0.0)
+                p.top.setStyleSheet("background-color: #ffd6ec;")
+            _set(_mark_unset_angle)
+            _set(lambda: p.tip.setCurrentText(self._get_default("tip", "0_8")))
+            _set(_mark_unset_top)
+            # ABS по умолчанию (высота ещё не задана — берём ABS-низ как
+            # базу; реальное значение проставится когда придёт высота из XML)
+            _set(lambda: p.bottom.setValue(self._get_default("abs_low", 0.19)))
         _set(lambda: p.max_geom_len.setValue(self._get_default("limit", 3000.0)))
+        _set(lambda: p.corner_radius_threshold.setValue(
+            self._get_default("corner_radius_threshold", 0.70)))
         _set(lambda: p.lead_in_angle.setValue(self._get_default("lead_in_angle", 45.0)))
         _set(lambda: p.lead_in_length.setValue(self._get_default("lead_in_length", 1.0)))
-        _set(lambda: p.lead_in_offset.setValue(self._get_default("lead_in_offset", -5.0)))
+        _set(lambda: p.set_lead_in_offset_value(self._get_default("lead_in_offset", -5.0)))
         _set(lambda: p.lead_in_overlap.setValue(self._get_default("lead_in_overlap", 0.0)))
         _set(lambda: p.lead_out_angle.setValue(self._get_default("lead_out_angle", 45.0)))
         _set(lambda: p.lead_out_length.setValue(self._get_default("lead_out_length", 1.0)))
-        _set(lambda: p.lead_out_offset.setValue(self._get_default("lead_out_offset", -5.0)))
+        _set(lambda: p.set_lead_out_offset_value(self._get_default("lead_out_offset", -5.0)))
         _set(lambda: p.lead_out_overlap.setValue(self._get_default("lead_out_overlap", 0.0)))
+
+    def _apply_startup_defaults(self):
+        """Умолчания, видимые сразу при запуске — без параметров ножа.
+
+        _apply_defaults_to_fields() зовётся только при открытии .ai,
+        поэтому до первого файла панель показывала конструкторские
+        значения, а не сохранённые оператором. Параметры ножа (угол,
+        пятка, высота, ABS) намеренно НЕ трогаем: угол и высота приходят
+        из XML заказа, и метка «не задано» розовым на пустом старте
+        выглядела бы как ошибка.
+        """
+        try:
+            self._apply_defaults_to_fields(include_knife=False)
+        except Exception:
+            pass
 
     def _get_export_base_path(self) -> str:
         """Возвращает настроенный базовый путь экспорта (UNC-корень
@@ -3056,21 +3225,10 @@ class MainWindow(QtWidgets.QMainWindow):
         params = self.params_panel.get_params_dict()
         self.session.set_cutting_params_from_dict(params)
         
-        # Если включено сглаживание под фрезу, но shapely нет — предупредим
-        if getattr(self.session.cutting_params, 'smooth_offset_for_tool', False):
-            try:
-                import shapely  # noqa
-            except Exception:
-                QtWidgets.QMessageBox.warning(
-                    self, "Нужен модуль shapely",
-                    "Включено «Сглаживание под фрезу», но модуль shapely не "
-                    "установлен — сглаживание НЕ будет применено.\n\n"
-                    "Установите его командой:\n    pip install shapely")
-        
         # Если ещё нет операций — создаём
         if not self.session.project.operations:
             self.session.create_blade_operations()
-            self.session.sort_by_grid()
+            self._sort_by_direction()
             self._refresh_operations()
         
         # ── ПРОВЕРКА СОВМЕСТИМОСТИ ФРЕЗЫ С МАКЕТОМ ──
@@ -3218,6 +3376,7 @@ class MainWindow(QtWidgets.QMainWindow):
             progress = _make_progress()
             all_written = []       # аггрегированный список файлов
             per_order_summary = [] # строки для итогового детального лога
+            _mach_all = []         # журнал проходимости/узких мест
             n_ok = 0
             n_err = 0
             cancelled = False
@@ -3303,6 +3462,11 @@ class MainWindow(QtWidgets.QMainWindow):
                             nc_dir_override=str(nc_dir) if nc_dir else None)
                         written = r_main.get('written', [])
                         archived = r_main.get('archived')
+                        # Журнал проходимости и узких мест (v1.7.23).
+                        # session его возвращает с 1.7.0, но UI результат
+                        # не читал — записи копились и пропадали.
+                        for _m in r_main.get('machinability', []) or []:
+                            _mach_all.append(f"  {disp}: {_m}")
                     except Exception as e_main:
                         n_err += 1
                         per_order_summary.append(
@@ -3377,6 +3541,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 headline += f" (ошибок: {n_err})"
             headline += f". Всего файлов: {total_files}."
             details_body = "\n".join(per_order_summary)
+            if _mach_all:
+                _uniq = []
+                for _m in _mach_all:
+                    if _m not in _uniq:
+                        _uniq.append(_m)
+                _narrow = [m for m in _uniq if 'УЗКОЕ МЕСТО' in m]
+                _unfix = [m for m in _uniq
+                          if 'НЕ ИСПРАВЛЕНО' in m or 'ОТКАТ' in m]
+                if _narrow or _unfix:
+                    headline += (f" Внимание: узких мест {len(_narrow)}, "
+                                 f"неисправленных {len(_unfix)} — см. детали.")
+                details_body += ("\n\n--- ПРОХОДИМОСТЬ ФРЕЗЫ ---\n"
+                                 + "\n".join(_uniq))
             title = ("Экспорт завершён" if n_err == 0
                      else "Экспорт завершён с ошибками")
             icon = (QtWidgets.QMessageBox.Information if n_err == 0

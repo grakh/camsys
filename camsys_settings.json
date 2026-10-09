@@ -15,7 +15,8 @@
     "lead_out_overlap": 0.0,
     "abs_boundary": 0.46,
     "abs_low": 0.19,
-    "abs_high": 0.25
+    "abs_high": 0.25,
+    "corner_radius_threshold": 0.7
   },
   "export_base_path": "\\\\storage\\Zakaz"
 }

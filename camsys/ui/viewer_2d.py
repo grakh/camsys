@@ -886,11 +886,30 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
     is_3d_corner = (op.kind == OperationKind.CORNER_REWORK 
                     and op.attributes.get('corner_is_3d')
                     and 'corner3d_point' in op.attributes)
+    is_pocket = (op.kind == OperationKind.CORNER_REWORK
+                 and 'pocket_s0' in op.attributes)
     is_2d_corner = (op.kind == OperationKind.CORNER_REWORK
-                    and 'corner_first_idx' in op.attributes
+                    and (('corner_first_idx' in op.attributes) or is_pocket)
                     and not op.attributes.get('corner_is_3d'))
-    
-    if is_3d_corner:
+
+    if is_pocket:
+        # ── ПРОТОЧКА КАРМАНА (v1.7.38) ──
+        # Тот же участок, что выброшен из основного прохода. Считаем его
+        # ТОЙ ЖЕ формулой, что и пост: контур, нормализованный под свой
+        # проход, от устья до устья плюс выход на уже снятый металл.
+        from ..geometry.path_offset import _subpath_forward as _sfwv
+        from ..geometry.primitives import Polypath as _PPv
+        _pside = op.attributes.get('pocket_side', 'OUTSIDE')
+        _ppar = normalize_for_side(geom.polypath, _pside)
+        _ptot = sum(x.length() for x in _ppar.segments)
+        _pad_v = 0.5
+        _segs_v = _sfwv(_ppar,
+                        (float(op.attributes['pocket_s0']) - _pad_v) % _ptot,
+                        (float(op.attributes['pocket_s1']) + _pad_v) % _ptot)
+        if not _segs_v:
+            return None
+        polypath = _PPv(segments=_segs_v, closed=False)
+    elif is_3d_corner:
         pt = op.attributes['corner3d_point']
         seg_hint = op.attributes['corner3d_segment_index']
         polypath = extract_subpath_around_point(
@@ -992,14 +1011,16 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         # G-code emitter выдаст G42 (комп. вправо). Внутренний рез blade 
         # тоже идёт CW, углы должны продолжать это направление — тогда 
         # фреза с G42 уходит в ту же сторону = ВНУТРЬ ножа = крючок в угол.
-        bb = polypath_bbox(geom.polypath)
-        cx = (bb[0] + bb[2]) / 2.0
-        cy = (bb[1] + bb[3]) / 2.0
-        sp = polypath.segments[0].a
-        tan = polypath.segments[0].tangent_at_start()
-        cross = tan[0]*(cy - sp[1]) - tan[1]*(cx - sp[0])
-        if cross > 0:  # центр слева = CCW → разворачиваем под CW
-            polypath = reverse_polypath(polypath)
+        # Направление фрагмента — по намотке РОДИТЕЛЬСКОГО контура, той
+        # же функцией, что и в посте (v1.7.37). Прежний признак «центр
+        # bbox ножа справа от касательной» на ложках и языках врал.
+        _corner_outside = (tp.side != ContourSide.INSIDE)
+        if not is_pocket:
+            # Карман уже вырезан из контура, нормализованного под свой
+            # проход, — разворачивать его второй раз нельзя.
+            from ..geometry.direction import orient_corner_fragment as _ocf
+            polypath = _ocf(polypath, geom.polypath,
+                            'OUTSIDE' if _corner_outside else 'INSIDE')
     elif geom.is_closed and tp.side in (ContourSide.OUTSIDE, ContourSide.INSIDE):
         side_name = "OUTSIDE" if tp.side == ContourSide.OUTSIDE else "INSIDE"
         polypath = normalize_for_side(polypath, side_name)
@@ -1024,7 +1045,40 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
             # стороне (как делал сдвиг по периметру → каша на прямоугольниках).
             from ..geometry.path_offset import shift_start_from_diagonal_zero as _ssdz
             polypath = _ssdz(polypath, user_offset)
-        
+
+        # ── ОБРЕЗКА КАРМАНОВ (v1.7.35) ──
+        # Пост выбрасывает участки, куда основная фреза не проходит, и
+        # перекидывает через устье дугу (см. mtx_anderson). Без этого же
+        # шага здесь вьювер рисовал эквидистанту НЕ той осевой, что уходит
+        # в .anc: на «ложке» 124173 картинка показывала ход в карман,
+        # которого в программе нет. Радиусы считает ОДНА функция на
+        # вьювер и пост — расходиться им больше нечем.
+        if polypath is not None and polypath.closed:
+            try:
+                from ..geometry.path_offset import (bridge_narrow_pits,
+                                                    bridge_radii_for_tool)
+                _eq_v = options_extras.get('tool_equidistant')
+                _tip_v = options_extras.get('tool_radius', 0.4) * 2.0
+                _abs_v = getattr(cutting_params, 'bottom', None)
+                if _abs_v is None:
+                    # ABS из эквидистанты и угла: eq = пятка + 2·ABS·tg(у/2)
+                    import math as _m_bv
+                    _ang_v = float(options_extras.get('tool_angle', 80.0))
+                    _tg_v = _m_bv.tan(_m_bv.radians(_ang_v / 2.0))
+                    _abs_v = ((float(_eq_v) - _tip_v) / (2.0 * _tg_v)
+                              if (_eq_v and _tg_v > 0) else 0.25)
+                _rm_v, _rb_v = bridge_radii_for_tool(
+                    _tip_v, _abs_v, _eq_v,
+                    margin=float(options_extras.get(
+                        'machinable_margin', 0.02)))
+                _pp_v, _br_v = bridge_narrow_pits(polypath, _rb_v,
+                                                  r_mouth=_rm_v)
+                if _br_v:
+                    polypath = _ssdz(_pp_v, user_offset)
+            except Exception:
+                pass
+
+
         # ── ДИАГНОСТИКА СМЕЩЕНИЯ (правый клик «Диагностика смещения») ──
         # Пишем на op по стороне прохода: какой offset пришёл, взялась ли
         # точка из .anc (тангенс) и куда встал старт. Юзер сравнивает −5/0/5/2.
@@ -1109,34 +1163,33 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
     # Замена на прямые → срез угла под 45° длиной ~1мм. Это визуально 
     # резко но устойчиво — никаких артефактов.
     # 
-    # ВАЖНО: только для визуализации, в .anc программу идёт исходник.
-    # Предобработка осевой для визуализации:
-    # - если включено «Сглаживание под фрезу» — применяем smooth_for_offset
-    #   (та же геометрия, что уйдёт в .anc): тугие места скруглены, offset чист.
-    # - иначе — оставляем как есть. (Раньше здесь был flatten_arcs_to_chords,
-    #   но после merge_segments_to_arcs в session.load_ai дуги стали чистыми,
-    #   и flatten только портил вид скруглений — превращал их в ломаные.)
-    smooth_on = bool(options_extras.get('smooth_offset_for_tool', False))
-    if smooth_on and not (is_3d_corner or is_2d_corner) and geom.is_closed \
-            and tp.side in (ContourSide.OUTSIDE, ContourSide.INSIDE):
-        from ..geometry.path_offset import (smooth_for_offset, 
-            simplify_geometry_via_shapely, has_real_3d_corners,
-            merge_segments_to_arcs)
-        _side = "OUTSIDE" if tp.side == ContourSide.OUTSIDE else "INSIDE"
-        min_tool_r = options_extras.get('min_tool_radius', tool_offset * 0.9)
-        
-        # Адаптивно: если есть настоящие 3D углы — НЕ сглаживаем
-        # (любое сглаживание их уничтожит)
-        if not has_real_3d_corners(polypath, min_tool_radius_mm=min_tool_r):
-            polypath_for_vis = simplify_geometry_via_shapely(polypath, tol_mm=0.1)
-            polypath_for_vis = smooth_for_offset(polypath_for_vis, tool_offset, _side)
-            # Обратная сборка полилинии в дуги (чтобы viewer показывал 
-            # чистые кривые как в .anc, а не тысячи мелких Line)
-            polypath_for_vis = merge_segments_to_arcs(polypath_for_vis, tol=0.02)
-        else:
-            polypath_for_vis = polypath
-    else:
-        polypath_for_vis = polypath
+    # Осевая для визуализации берётся как есть. (Раньше здесь был
+    # flatten_arcs_to_chords, но после merge_segments_to_arcs в
+    # session.load_ai дуги стали чистыми, и flatten только портил вид
+    # скруглений — превращал их в ломаные. «Сглаживание под фрезу»
+    # убрано в v1.7.)
+    polypath_for_vis = polypath
+
+    # ── ГАРАНТИЯ ПРОХОДИМОСТИ ФРЕЗЫ (v1.7) ──
+    # Пост поднимает радиус дуг, которые компенсация G41/G42 выворачивает
+    # (см. mtx_anderson). Повторяем ту же правку здесь, иначе вьювер рисовал
+    # бы эквидистанту НЕ той осевой, что уходит в .anc.
+    if geom.is_closed and not (is_3d_corner or is_2d_corner):
+        try:
+            from ..geometry.path_offset import ensure_machinable_arcs
+            _gc = {ContourSide.OUTSIDE: "G42",
+                   ContourSide.RIGHT:   "G42",
+                   ContourSide.INSIDE:  "G42",
+                   ContourSide.LEFT:    "G41"}.get(tp.side, "G40")
+            if _gc in ("G41", "G42"):
+                polypath_for_vis = ensure_machinable_arcs(
+                    polypath_for_vis, tool_offset, _gc,
+                    margin=float(options_extras.get(
+                        'machinable_margin', 0.02)),
+                    max_deviation_mm=float(options_extras.get(
+                        'machinable_max_deviation', 0.05)))[0]
+        except Exception:
+            pass
     
     # ── ВНУТРЕННЕЕ СГЛАЖИВАНИЕ для соответствия с .anc ──
     # Объединение коллинеарных линий (как в mtx_anderson.py перед эмиссией NC).
@@ -1215,22 +1268,28 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
                 _point_in_polypath as _pip3,
                 trim_self_intersections as _tsi2,
                 join_polypath_corners as _jpc2)
-            _inward = _main_side_inside
-            _eq_try = _ofu2(polypath_for_vis, corner_tool_offset,
-                            inward=True)
+            # Фрагмент уже развёрнут под сторону, а G42 всегда кладёт
+            # фрезу СПРАВА ПО ХОДУ — независимо от стороны. Поэтому
+            # эквидистанта угла считается явной функцией «вправо по
+            # ходу», а не через `inward` (v1.7.37).
+            #
+            # Через `inward` это и ломалось: «внутрь» определено для
+            # ЗАМКНУТОГО контура, а у разомкнутого фрагмента
+            # offset_polypath_uniform безусловно принимает намотку за
+            # CCW. inward=True давал ЛЕВУЮ нормаль, и все углы со
+            # стороной OUTSIDE (16 из 26 на заказе 124173) рисовались
+            # зеркально — рез показывался не с той стороны контура.
+            from ..geometry.path_offset import (
+                offset_right_of_travel as _ort)
+            _inward = _corner_outside   # только для диагностики ниже
+            _eq_try = _ort(polypath_for_vis, corner_tool_offset)
             _eq_try = _tsi2(_eq_try)
             _eq_try = _jpc2(_eq_try, tol=0.01)
-            if _eq_try.segments:
-                _mp3 = _eq_try.segments[len(_eq_try.segments)//2].a
-                _in_true = _pip3(_mp3, geom.polypath)
-                _inward = True if (_in_true == _main_side_inside) else False
         except Exception:
-            _inward = _main_side_inside
+            _inward = _corner_outside
 
-        polypath_offset = offset_polypath_uniform(
-            polypath_for_vis, corner_tool_offset,
-            inward=_inward
-        )
+        from ..geometry.path_offset import offset_right_of_travel as _ort2
+        polypath_offset = _ort2(polypath_for_vis, corner_tool_offset)
         polypath_offset = trim_self_intersections(polypath_offset)
         # После оффсета каждого сегмента в углу остаётся разрыв.
         # Стыкуем линии через их пересечение — острый угол на
@@ -1296,11 +1355,40 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
     # Это даёт корректную lateral clearance от контура.
     effective_tool_offset = corner_tool_offset if (is_3d_corner or is_2d_corner) else tool_offset
     import math as _m_view
+
+    # ── МАСШТАБ ЛИДОВ (v1.7.12) ──
+    # Множители «x_tool_rad» AlphaCAM считает от ЭКВИДИСТАНТЫ, а не от её
+    # половины. В посте это исправлено в v1.7.11 (lead_scale = tool_eq);
+    # здесь оставалось старое tool_offset, из-за чего ВЬЮВЕР рисовал лиды
+    # вдвое короче, чем уходит в программу, и выход выглядел почти прямой
+    # линией — дуга была слишком мелкой, чтобы её заметить.
+    _lead_scale_view = effective_tool_offset * 2.0
+
+    # ── МНОЖИТЕЛИ И ЗАПАС ЛИДА ДОРАБОТКИ (v1.7.39) ──
+    # Пост домножает длину и радиус лида угла/кармана на свои множители
+    # (corner_lead_length_mult / corner_lead_radius_mult, по умолчанию
+    # 0.5), а вьювер этого не делал — и рисовал лиды вдвое длиннее, чем
+    # уходит в программу. Плюс общий запас длины прямой части.
+    _c_lmult = 1.0
+    _c_rmult = 1.0
+    _lead_extra_view = 0.0
+    if is_3d_corner or is_2d_corner:
+        _c_lmult = float(getattr(cutting_params, 'corner_lead_length_mult',
+                                 0.5) or 1.0) if cutting_params else 0.5
+        _c_rmult = float(getattr(cutting_params, 'corner_lead_radius_mult',
+                                 0.5) or 1.0) if cutting_params else 0.5
+        _extra_d = float(getattr(cutting_params, 'corner_lead_extra_diam',
+                                 1.0) or 0.0) if cutting_params else 1.0
+        _c_tip = float(getattr(cutting_params, 'corner_tip_diameter',
+                               0.6) or 0.6) if cutting_params else 0.6
+        _lead_extra_view = _extra_d * _c_tip
+
     def _line_len_alpha_view(user_factor: float, angle_deg: float) -> float:
         ang_rad = _m_view.radians(max(5.0, min(175.0, angle_deg)))
         sin_a = _m_view.sin(ang_rad)
         if sin_a < 0.05: sin_a = 0.05
-        return user_factor * effective_tool_offset / sin_a
+        return (user_factor * _c_lmult * _lead_scale_view
+                + _lead_extra_view) / sin_a
     
     # Сторона захода для 2D/3D углов — выбирается по bbox центру 
     # (передаётся как forced_side в LeadGeometryRequest).
@@ -1317,41 +1405,43 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         # Берём среднюю точку эквидистанты угла (эталон стороны) и
         # стартовую точку; сравниваем на какой стороне от касательной
         # лежит эквидистанта. Лид строим в ТУ ЖЕ сторону.
-        if polypath_offset and polypath_offset.segments:
-            try:
-                from ..geometry.lead_inout import build_lead_in as _bli3
-                from ..geometry.path_offset import _point_in_polypath as _pip_lead
-                _sp = polypath_offset.segments[0].a
-                _tan = polypath_offset.segments[0].tangent_at_start()
-                # ЗНАК ЛИДА = ЗНАК ЭКВИДИСТАНТЫ, устойчиво.
-                # Эквидистанта смещена от программного контура в сторону
-                # inward. Лид должен идти в ТУ ЖЕ сторону (дальше от детали).
-                # Определяем сторону эквидистанты как «внутри/снаружи
-                # замкнутого контура ножа» по её СЕРЕДИНЕ (хорошо разнесённая
-                # точка — устойчиво, в отличие от вектора у самого старта,
-                # который у пограничных углов почти нулевой и переворачивался).
-                # Затем строим обе пробы лида и берём ту, чей кончик на той же
-                # стороне контура (внутри/снаружи), что и эквидистанта.
-                _mid_off = _corner_mid_ref if _corner_mid_ref is not None \
-                    else polypath_offset.segments[
-                        len(polypath_offset.segments)//2].a
-                _eq_inside = _pip_lead(_mid_off, geom.polypath)
-                _chosen = None
-                _fallback = None
-                for _side in ('left', 'right'):
-                    _lg = _bli3(start_point=_sp, tangent=_tan, side=_side,
-                                line_length=1.0, arc_radius=0.5,
-                                approach_angle_deg=45, style='line_arc')
-                    _tip = _lg.line.a if _lg.line else _sp
-                    if _fallback is None:
-                        _fallback = _side
-                    if _pip_lead(_tip, geom.polypath) == _eq_inside:
-                        _chosen = _side
-                        break
-                forced_lead_side = _chosen or _fallback or "right"
-            except Exception:
-                forced_lead_side = "right"
-        else:
+        # ── СТОРОНА ЛИДА ДОРАБОТКИ — ПО ЗАМЕРУ ЗАЗОРА (v1.7.39) ──
+        # Эмиттер пишет G42, фреза снимает металл справа по ходу, и
+        # заходить она обязана оттуда же. Но в узкой щели справа может не
+        # быть места: лид ложится на встречную стенку. Поэтому сторона
+        # меряется — той же функцией, что и в посте, чтобы картинка и
+        # программа не разошлись.
+        forced_lead_side = "right"
+        try:
+            from ..geometry.lead_inout import fit_rework_lead as _plsc_view
+            # Соседи — из слоя Knife (в операциях доработки BLADE_FORMING
+            # нет, список получался пустым), и только ножи: контуры
+            # других слоёв лежат прямо на линии и всё забраковали бы.
+            _nb_view = []
+            _klay_v = project.get_layer_by_name("Knife")
+            for _go in (getattr(_klay_v, 'geometries', ()) if _klay_v else ()):
+                if (_go is not None and _go.is_closed
+                        and _go.polypath is not None and _go is not geom):
+                    _nb_view.append(_go.polypath)
+            _sp_v = polypath_offset.segments[0].a
+            _tan_v = polypath_offset.segments[0].tangent_at_start()
+            forced_lead_side, _shrink_v, _ang_v, _clr_v = _plsc_view(
+                _sp_v, _tan_v, geom.polypath,
+                effective_tool_offset,
+                _line_len_alpha_view(lead_in_length_mult, lead_in_angle),
+                lead_in_radius_mult * _c_rmult * _lead_scale_view,
+                lead_in_angle, is_exit=False, neighbours=_nb_view)
+            if _ang_v and abs(_ang_v - lead_in_angle) > 1e-6:
+                lead_in_angle = _ang_v
+                lead_out_angle = _ang_v
+            if _shrink_v < 1.0:
+                # В тесном месте лид укорачивается — ровно как в посте,
+                # иначе картинка покажет лид длиннее программного.
+                lead_in_length_mult *= _shrink_v
+                lead_in_radius_mult *= _shrink_v
+                lead_out_length_mult *= _shrink_v
+                lead_out_radius_mult *= _shrink_v
+        except Exception:
             forced_lead_side = "right"
         # ── ДИАГНОСТИКА (для правого клика «Диагностика угла») ──
         # Пишем вычисленные признаки прямо на op, чтобы юзер мог их
@@ -1444,7 +1534,7 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
             pass_side=tp.side.name,
             angle_deg=lead_in_angle,
             line_length=_line_len_alpha_view(lead_in_length_mult, lead_in_angle),
-            arc_radius=lead_in_radius_mult * effective_tool_offset,
+            arc_radius=lead_in_radius_mult * _c_rmult * _lead_scale_view,
             style=('line' if tp.entry.style == LeadStyle.LINE else 'line_arc'),
             forced_side=forced_lead_side,
         )
@@ -1459,7 +1549,7 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
                 pass_side=tp.side.name,
                 angle_deg=lead_out_angle,
                 line_length=_line_len_alpha_view(lead_out_length_mult, lead_out_angle),
-                arc_radius=lead_out_radius_mult * effective_tool_offset,
+                arc_radius=lead_out_radius_mult * _c_rmult * _lead_scale_view,
                 style=('line' if tp.exit.style == LeadStyle.LINE else 'line_arc'),
                 forced_side=None,
             )
@@ -1518,7 +1608,7 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
             pass_side=tp.side.name,
             angle_deg=lead_out_angle,
             line_length=_line_len_alpha_view(lead_out_length_mult, lead_out_angle),
-            arc_radius=lead_out_radius_mult * effective_tool_offset,
+            arc_radius=lead_out_radius_mult * _c_rmult * _lead_scale_view,
             style=('line' if tp.exit.style == LeadStyle.LINE else 'line_arc'),
             forced_side=forced_exit_side,
         )

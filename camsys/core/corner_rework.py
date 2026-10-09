@@ -15,7 +15,8 @@ from typing import List, Optional
 from .project import (Project, Operation, ToolPath, ContourSide,
                        OperationKind, CutSettings, PassType, EntryExitConfig,
                        LeadStyle)
-from ..geometry.corner_detect import (detect_geometric_corners,
+from ..geometry.corner_detect import (corner_side_name,
+                                     detect_geometric_corners,
                                        group_corner_arcs, CornerGroup)
 
 
@@ -93,7 +94,12 @@ def create_corner_rework_operations(project: Project,
             # (компенсация G42 — фреза идёт снаружи дуги).
             tp = ToolPath(
                 geometry_id=geom_id,
-                side=ContourSide.OUTSIDE,
+                # Сторона доработки (v1.7.1) — считается, а не
+                # хардкодится: тонкая фреза нужна там, где компенсация
+                # G42 сжимает угол. См. corner_side_name.
+                side=(ContourSide.OUTSIDE
+                      if corner_side_name(geom.polypath, grp.ccw) == "OUTSIDE"
+                      else ContourSide.INSIDE),
                 # Lead-in/out — короткие, для обхода острия (как на скриншоте)
                 entry=EntryExitConfig(
                     enabled=True,

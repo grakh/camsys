@@ -407,8 +407,36 @@ class PackageExporter:
         half_angle_rad = math.radians(self.params.knife_angle / 2.0)
         tool_eq = self.params.tip_diameter + 2.0 * self.params.bottom * math.tan(half_angle_rad)
         opts.extras['tool_equidistant'] = tool_eq
-        opts.extras['smooth_offset_for_tool'] = bool(
-            getattr(self.params, 'smooth_offset_for_tool', False))
+        # ── Журнал проходимости фрезы (v1.7) ──
+        # Общий на весь пакет список: пост дописывает в него, какой нож и
+        # какой проход пришлось править (и что не удалось спасти). Один и
+        # тот же объект во всех PostOptions, поэтому после generate() весь
+        # отчёт лежит в self.machinability_report.
+        if not hasattr(self, 'machinability_report'):
+            self.machinability_report = []
+        opts.extras['machinability_report'] = self.machinability_report
+        # Эквидистанта ТОНКОЙ фрезы T3 (v1.7.29). Пост её не получал, и
+        # лиды угловых проходов масштабировались по ОСНОВНОЙ фрезе —
+        # выходили примерно на четверть длиннее, чем нужно, и дотягивались
+        # до контура на узких местах. Вьювер при этом брал corner-фрезу,
+        # поэтому картинка и программа расходились.
+        import math as _m_ce
+        _c_tip = float(getattr(self.params, 'corner_tip_diameter', 0.6) or 0.6)
+        opts.extras['corner_tool_equidistant'] = (
+            _c_tip + 2.0 * float(self.params.bottom) * _m_ce.tan(
+                _m_ce.radians(float(self.params.knife_angle) / 2.0)))
+        opts.extras['corner_lead_length_mult'] = float(
+            getattr(self.params, 'corner_lead_length_mult', 0.5))
+        opts.extras['corner_lead_radius_mult'] = float(
+            getattr(self.params, 'corner_lead_radius_mult', 0.5))
+        # Запас длины прямой части лида доработки, мм (v1.7.39)
+        opts.extras['corner_lead_extra_mm'] = (
+            float(getattr(self.params, 'corner_lead_extra_diam', 1.0))
+            * float(getattr(self.params, 'corner_tip_diameter', 0.6)))
+        opts.extras['min_tool_clearance_mm'] = float(
+            getattr(self.params, 'min_tool_clearance_mm', 0.030))
+        opts.extras['machinable_margin'] = float(
+            getattr(self.params, 'machinable_margin', 0.02))
         return opts
     
     def _apply_lead_params(self, project: Project) -> None:
@@ -614,6 +642,47 @@ class PackageExporter:
         
         return self.post.generate(prj, opts)
     
+    def _sv_single_line(self, op_centers) -> Optional[str]:
+        """Раскладка в одну строку/столбец? Возвращает 'row', 'col' или None.
+
+        Признак: разброс центров поперёк линии меньше ПОЛОВИНЫ типового
+        размера элемента — то есть все элементы стоят на одной высоте (или
+        на одной вертикали) с точностью до собственной ширины.
+
+        Сравнивать разбросы между собой недостаточно: у длинной строки из
+        двух рядов X-разброс тоже сильно больше Y-разброса, а два ряда там
+        есть. Поэтому мерим именно по размеру элемента.
+        """
+        if len(op_centers) < 2:
+            return None
+        from ..geometry.path_offset import polypath_bbox
+        widths, heights = [], []
+        for op, _c in op_centers:
+            if not op.geometry_ids:
+                continue
+            g = self.project.get_geometry(op.geometry_ids[0])
+            if not g or not g.polypath:
+                continue
+            bb = polypath_bbox(g.polypath)
+            widths.append(abs(bb[2] - bb[0]))
+            heights.append(abs(bb[3] - bb[1]))
+        if not widths or not heights:
+            return None
+        widths.sort(); heights.sort()
+        med_w = widths[len(widths) // 2]
+        med_h = heights[len(heights) // 2]
+
+        xs = [c[0] for _o, c in op_centers]
+        ys = [c[1] for _o, c in op_centers]
+        span_x = max(xs) - min(xs)
+        span_y = max(ys) - min(ys)
+
+        if span_y < med_h * 0.5 and span_x > med_w * 0.5:
+            return 'row'
+        if span_x < med_w * 0.5 and span_y > med_h * 0.5:
+            return 'col'
+        return None
+
     def _generate_sv(self) -> str:
         """4 угловых элемента — для контроля сведения координат на станке.
         
@@ -636,7 +705,18 @@ class PackageExporter:
         if _ct is not None:
             op_centers = [(op, _ct(c)) for op, c in op_centers]
         
-        if len(op_centers) <= 4:
+        # ── ОДНА СТРОКА ИЛИ ОДИН СТОЛБЕЦ (v1.7.15) ──
+        # Четыре «угла» на такой раскладке вырождаются: сверху-слева и
+        # снизу-слева — это соседние элементы 1 и 2, справа — (n-1) и n.
+        # Для контроля сведения такой набор бесполезен, нужны только
+        # крайние. Проверяем ДО ветки «их и так ≤ 4»: строка ровно из
+        # четырёх элементов — самый частый случай, и там тоже нужны два.
+        _sv_axis = self._sv_single_line(op_centers)
+        if _sv_axis is not None:
+            k = 0 if _sv_axis == 'row' else 1
+            ordered = sorted(op_centers, key=lambda oc: oc[1][k])
+            sv_ops = [ordered[0][0], ordered[-1][0]]
+        elif len(op_centers) <= 4:
             sv_ops = [op for op, _ in op_centers]
         else:
             # 4 крайних угла
@@ -675,6 +755,132 @@ class PackageExporter:
         
         return self.post.generate(prj, opts)
     
+    def _build_pocket_operations(self, blade_ops):
+        """Проточка T3 по карманам, выброшенным из основного прохода.
+
+        Пост обрезает карман — место, куда основная фреза физически не
+        проходит, — и перекидывает через устье дугу. Металл оттуда никуда
+        не девается: его обязана снять тонкая фреза, и на ВЕСЬ выброшенный
+        участок.
+
+        Раньше на кармане оказывалась только угловая операция. Она
+        строится вокруг найденного угла с запасом 1.5 мм, поэтому карман
+        длиной 20 мм покрывала едва на десятую часть — «проточил не весь
+        карман» (v1.7.38).
+
+        Карман ищется на том же контуре и теми же радиусами, что и в
+        посте, поэтому участки совпадают. Сторона операции — тот проход,
+        на котором карман и обрезается: его намотка уже учтена, разворот
+        фрагмента в посте не нужен.
+
+        Returns:
+            (операции, {geom_id: [{'side', 's0', 's1', 'pts'}]})
+        """
+        from ..core.project import (
+            Operation, OperationKind, CutSettings, ToolPath, ContourSide,
+            LeadStyle, EntryExitConfig, PassType)
+        from ..geometry.path_offset import (bridge_narrow_pits,
+                                            bridge_radii_for_tool,
+                                            _subpath_forward,
+                                            _exact_axis_points)
+        from ..geometry.primitives import Polypath
+        from ..geometry.direction import normalize_for_side
+        import math as _m
+
+        # Поиск карманов — самая дорогая часть сборки операций (на заказе
+        # из 31 ножа это ~40 с), а _build_corner_operations может
+        # вызываться не один раз за экспорт. Считаем один раз (v1.7.39).
+        _ck = (id(self.project), float(self.params.tip_diameter),
+               float(self.params.bottom), float(self.params.knife_angle))
+        if getattr(self, '_pocket_cache_key', None) == _ck:
+            return self._pocket_cache
+        ops = []
+        spans = {}
+        tip = float(self.params.tip_diameter)
+        bottom = float(self.params.bottom)
+        tool_eq = tip + 2.0 * bottom * _m.tan(
+            _m.radians(float(self.params.knife_angle) / 2.0))
+        r_mouth, r_bridge = bridge_radii_for_tool(
+            tip, bottom, tool_eq,
+            margin=float(getattr(self.params, 'machinable_margin', 0.02)))
+
+        for blade_op in blade_ops:
+            if not blade_op.geometry_ids:
+                continue
+            geom_id = blade_op.geometry_ids[0]
+            geom = self.project.get_geometry(geom_id)
+            if not geom or not geom.polypath or not geom.polypath.closed:
+                continue
+            for side_name in ('INSIDE', 'OUTSIDE'):
+                try:
+                    pp = normalize_for_side(geom.polypath, side_name)
+                    _trim, bridges = bridge_narrow_pits(
+                        pp, r_bridge, r_mouth=r_mouth)
+                except Exception:
+                    continue
+                if not bridges:
+                    continue
+                total = sum(x.length() for x in pp.segments)
+                for b_idx, br in enumerate(bridges):
+                    s0, s1 = br['sA'], br['sB']
+                    try:
+                        sub = _subpath_forward(pp, s0, s1)
+                        pts = [q for _s, q in _exact_axis_points(
+                            Polypath(segments=sub, closed=False), 0.05)[0]]
+                    except Exception:
+                        pts = []
+                    spans.setdefault(geom_id, []).append(
+                        {'side': side_name, 's0': s0, 's1': s1, 'pts': pts})
+                    settings = CutSettings(
+                        tool_number=self.params.corner_tool_number,
+                        pass_type=PassType.SINGLE,
+                        feed_cut=1500,
+                        feed_plunge=800,
+                        prog_z_depth=0.3,
+                    )
+                    op = Operation(
+                        name=f"{blade_op.name} карман #{b_idx + 1}",
+                        kind=OperationKind.CORNER_REWORK,
+                        geometry_ids=[geom_id],
+                        settings=settings,
+                        sequence_number=1,
+                    )
+                    op.attributes['parent_geom_id'] = geom_id
+                    op.attributes['corner_index'] = b_idx
+                    op.attributes['pocket_side'] = side_name
+                    op.attributes['pocket_s0'] = s0
+                    op.attributes['pocket_s1'] = s1
+                    op.attributes['pocket_skip'] = br['skip']
+                    op.attributes['pocket_total'] = total
+                    op.attributes['corner_apex'] = (
+                        pts[len(pts) // 2] if pts else br['A'])
+                    op.attributes['corner_side'] = side_name
+                    _side = (ContourSide.INSIDE if side_name == 'INSIDE'
+                             else ContourSide.OUTSIDE)
+                    tp = ToolPath(
+                        geometry_id=geom_id,
+                        side=_side,
+                        entry=EntryExitConfig(
+                            enabled=True,
+                            style=LeadStyle.LINE_ARC_TANGENTIAL,
+                            line_length_x_tool_rad=1.0,
+                            arc_radius_x_tool_rad=1.0,
+                            approach_angle=45.0,
+                        ),
+                        exit=EntryExitConfig(
+                            enabled=True,
+                            style=LeadStyle.LINE_ARC_TANGENTIAL,
+                            line_length_x_tool_rad=1.0,
+                            arc_radius_x_tool_rad=1.0,
+                            approach_angle=45.0,
+                        ),
+                    )
+                    op.toolpaths = [tp]
+                    ops.append(op)
+        self._pocket_cache_key = _ck
+        self._pocket_cache = (ops, spans)
+        return ops, spans
+
     def _build_corner_operations(self) -> Tuple[List[Operation], List[Operation]]:
         """Находит углы по геометрии (дуги с малым радиусом скругления) и
         создаёт операции CORNER_REWORK для каждого ножа.
@@ -691,7 +897,8 @@ class PackageExporter:
             Operation, OperationKind, CutSettings, ToolPath, ContourSide,
             LeadStyle, EntryExitConfig, PassType
         )
-        from ..geometry.corner_detect import (detect_geometric_corners,
+        from ..geometry.corner_detect import (corner_side_name,
+                                              detect_geometric_corners,
                                                group_corner_arcs)
         
         # Порог радиуса — динамический, зависит от реального радиуса фрезы.
@@ -706,14 +913,34 @@ class PackageExporter:
         half_angle_rad = math.radians(self.params.knife_angle / 2.0)
         tool_offset = (self.params.tip_diameter / 2.0 
                        + self.params.bottom * math.tan(half_angle_rad))
-        # Порог = actual_tool_offset + небольшой запас на неточность биарк-
-        # аппроксимации Illustrator'а. Юзер задаёт `corner_radius_threshold_mm`
-        # как ФИКСИРОВАННЫЙ верхний предел — уважаем если он МЕНЬШЕ 
-        # динамического (юзер хочет более строгий отбор).
-        dynamic_threshold = tool_offset
-        radius_threshold_2d = min(
-            self.params.corner_radius_threshold_mm,
-            dynamic_threshold
+        # Порог радиуса угла (v1.7): берётся ИЗ НАСТРОЕК, а эквидистанта
+        # работает НИЖНЕЙ границей.
+        #
+        # Раньше здесь было min(настройка, эквидистанта). С обычной фрезой
+        # эквидистанта ≈0.53, а настройка по умолчанию 0.7 — то есть min()
+        # молча опускал её до 0.53, и настройка не работала НИКОГДА. На
+        # 124173 это давало 0 углов на всех 60 ножах: шпилька R0.64 (нож
+        # #14, дуги 576-585, разворот 175°) угол не получала, потому что
+        # 0.64 > 0.53, хотя пользователь просил 0.7.
+        #
+        # max() сохраняет обе гарантии: то, что фреза физически не проходит
+        # (R < эквидистанты), считается углом ВСЕГДА, даже если настройку
+        # опустили; а поднять планку выше эквидистанты пользователь теперь
+        # может — для мест, куда фреза входит впритык.
+        # Нижняя граница — эквидистанта (v1.7.26, откат привязки из
+        # v1.7.21). Настоящий угол — это место, где грань ФИЗИЧЕСКИ
+        # невозможна: радиус меньше эквидистаты, фреза туда не входит.
+        # Привязка к `эквидистанта + min_face` объявляла углами ещё и
+        # места с тонкой, но положительной гранью 0.01–0.15 мм — это
+        # касательные переходы, T3 там не нужна. На 124173 из-за неё
+        # появлялись 48 ложных углов там, где не должно быть ни одного.
+        #
+        # Места, куда основная фреза не дошла по ДРУГОЙ причине — ямы,
+        # где путь упирается сам в себя, — обнаруживаются отдельно
+        # (find_narrow_gaps) и на радиус дуги не завязаны.
+        radius_threshold_2d = max(
+            float(getattr(self.params, 'corner_radius_threshold_mm', 0.7)),
+            tool_offset
         )
         
         ops_2d: List[Operation] = []
@@ -729,6 +956,16 @@ class PackageExporter:
                      if op.kind == OperationKind.BLADE_FORMING
                      and not op.attributes.get('stitch_filtered_out', False)]
         
+        # ── КАРМАНЫ ПОД ПРОТОЧКУ T3 (v1.7.38) ──
+        # Пост выбрасывает из основного прохода места, куда фреза не
+        # проходит, и перекидывает через устье дугу. Снять металл оттуда
+        # обязана тонкая фреза, и ровно на ВЕСЬ выброшенный участок:
+        # прежде там оказывалась только угловая операция, а она строится
+        # вокруг угла с запасом 1.5 мм и карман длиной 20 мм покрывала
+        # едва на десятую часть.
+        pocket_ops, pocket_spans = self._build_pocket_operations(blade_ops)
+        ops_2d.extend(pocket_ops)
+
         for blade_op in blade_ops:
             if not blade_op.geometry_ids:
                 continue
@@ -745,7 +982,26 @@ class PackageExporter:
                 continue
             
             groups = group_corner_arcs(small_arcs, proximity_mm=2.0)
-            
+
+            # Угол внутри обрезанного кармана отдельной операцией не
+            # нужен: карман целиком уходит в проточку T3 (см.
+            # _build_pocket_operations). Иначе на одном месте оказывались
+            # две операции, и короткая из них — угловая — проходила лишь
+            # кусок кармана (v1.7.38).
+            _pits = pocket_spans.get(geom_id, [])
+            if _pits:
+                _kept = []
+                for grp in groups:
+                    _gs = corner_side_name(geom.polypath, grp.ccw)
+                    _ax, _ay = grp.apex
+                    if any(_p['side'] == _gs
+                           and any((q[0] - _ax) ** 2 + (q[1] - _ay) ** 2
+                                   < 0.25 for q in _p['pts'])
+                           for _p in _pits):
+                        continue
+                    _kept.append(grp)
+                groups = _kept
+
             for grp_idx, grp in enumerate(groups):
                 # Параметры резания для тонкой фрезы
                 settings = CutSettings(
@@ -772,9 +1028,18 @@ class PackageExporter:
                 op.attributes['corner_apex'] = grp.apex
                 op.attributes['corner_ccw'] = grp.ccw
                 
+                # Сторона доработки (v1.7.1): раньше здесь было
+                # захардкожено OUTSIDE для ВСЕХ углов, из-за чего примерно
+                # половина углов резалась с неверной стороны. Считаем по
+                # тому, на какой стороне компенсация G42 СЖИМАЕТ этот угол
+                # — там рез зажат, туда и нужна тонкая фреза.
+                _side = (ContourSide.OUTSIDE
+                         if corner_side_name(geom.polypath, grp.ccw) == "OUTSIDE"
+                         else ContourSide.INSIDE)
+                op.attributes['corner_side'] = _side.name
                 tp = ToolPath(
                     geometry_id=geom_id,
-                    side=ContourSide.OUTSIDE,  # внутренний рез (CW) — corner rework часть внутр. реза
+                    side=_side,
                     entry=EntryExitConfig(
                         enabled=True,
                         style=LeadStyle.LINE_ARC_TANGENTIAL,
@@ -842,9 +1107,16 @@ class PackageExporter:
                 # НЕ ставим corner_first_idx/last_idx — для 3D углов
                 # эмиттер использует extract_subpath_around_point.
                 
+                # Сторона доработки (v1.7.1) — как у 2D, но направление
+                # обхода берётся из turn_sign (+1 = CCW).
+                _side = (ContourSide.OUTSIDE
+                         if corner_side_name(geom.polypath,
+                                             pc.turn_sign > 0) == "OUTSIDE"
+                         else ContourSide.INSIDE)
+                op.attributes['corner_side'] = _side.name
                 tp = ToolPath(
                     geometry_id=geom_id,
-                    side=ContourSide.OUTSIDE,  # внутренний рез (CW) — corner rework часть внутр. реза
+                    side=_side,
                     entry=EntryExitConfig(
                         enabled=True,
                         style=LeadStyle.LINE_ARC_TANGENTIAL,

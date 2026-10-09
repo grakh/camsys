@@ -211,3 +211,117 @@ if __name__ == "__main__":
             import traceback; traceback.print_exc()
     print(f"\n{passed}/{len(tests)} тестов пройдено")
     sys.exit(0 if not failed else 1)
+
+
+def test_rows_and_columns_give_different_order():
+    """Строки и столбцы дают РАЗНЫЙ порядок обхода.
+
+    Строками (горизонтально): нижний ряд слева-направо, затем верхний.
+    Столбцами (вертикально): левый столбец снизу-вверх, затем следующий.
+    """
+    import os
+    from camsys.core.macros import (sort_operations_by_grid, GridDirection,
+                                    GridGrouping, operation_center)
+    import camsys.core.importer as importer_mod
+
+    ai = '/mnt/user-data/uploads/124173.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет файла')
+        return
+    project = importer_mod.import_ai_to_project(ai)
+    for geom in project.get_layer_by_name("Knife").geometries[:12]:
+        project.add_blade_operation(geom.id)
+
+    def order(grouping):
+        sort_operations_by_grid(project, direction=GridDirection.LB,
+                                grouping=grouping)
+        return [operation_center(op, project) for op in project.operations]
+
+    rows = order(GridGrouping.ROWS)
+    cols = order(GridGrouping.COLUMNS)
+    print(f'  строками: {[(round(x), round(y)) for x, y in rows[:4]]}')
+    print(f'  столбцами: {[(round(x), round(y)) for x, y in cols[:4]]}')
+    assert rows != cols, "группировка не влияет на порядок"
+
+
+def _sv_layout(positions, w=60.0, h=100.0):
+    """Проект из прямоугольников в заданных позициях + операции ножей."""
+    from camsys.core.project import Project, Geometry
+    from camsys.geometry.primitives import Line, Polypath
+    project = Project(name="SV")
+    layer = project.add_layer("Knife")
+    for x, y in positions:
+        pts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+        poly = Polypath(segments=[Line(a=pts[i], b=pts[(i + 1) % 4])
+                                  for i in range(4)], closed=True)
+        geom = Geometry(polypath=poly)
+        layer.geometries.append(geom)
+        project.add_blade_operation(geom.id)
+    return project
+
+
+def _sv_pick(project):
+    """Что отберётся в _SV.anc: список центров."""
+    import camsys.post.mtx_anderson  # noqa: F401 — регистрация поста
+    from camsys.core.cutting_macro import CuttingMacroParams
+    from camsys.core.project import OperationKind
+    from camsys.core.macros import operation_center
+    from camsys.post.package_export import PackageExporter
+
+    exporter = PackageExporter(project, CuttingMacroParams())
+    centers = [(op, operation_center(op, project))
+               for op in project.operations
+               if op.kind != OperationKind.FIDUCIAL_DRILL]
+    axis = exporter._sv_single_line(centers)
+    if axis is not None:
+        k = 0 if axis == 'row' else 1
+        ordered = sorted(centers, key=lambda oc: oc[1][k])
+        return axis, [ordered[0][1], ordered[-1][1]]
+    if len(centers) <= 4:
+        return axis, [c for _op, c in centers]
+    return axis, None       # ветка «4 угла»
+
+
+def test_sv_single_row_takes_only_first_and_last():
+    """Строка элементов → в SV только крайние, не 1-2 и (n-1)-n.
+
+    На одной строке четыре «угла» bbox вырождаются: слева-сверху и
+    слева-снизу оказываются соседние элементы 1 и 2 (их центры по Y
+    отличаются на доли миллиметра), справа — (n-1) и n. Для контроля
+    сведения это бесполезно.
+    """
+    for count in (3, 4, 8):
+        project = _sv_layout([(70.0 * i, 0.0) for i in range(count)])
+        axis, picked = _sv_pick(project)
+        print(f'  строка из {count}: ось={axis}, отобрано {len(picked)}')
+        assert axis == 'row'
+        assert len(picked) == 2, f"строка из {count}: отобрано {len(picked)}"
+        # Именно крайние по X
+        assert picked[0][0] < picked[1][0]
+        assert abs(picked[1][0] - picked[0][0]) > 70.0 * (count - 2)
+
+
+def test_sv_single_column_takes_only_first_and_last():
+    """Столбец элементов — то же самое по вертикали."""
+    project = _sv_layout([(0.0, 110.0 * i) for i in range(5)])
+    axis, picked = _sv_pick(project)
+    print(f'  столбец: ось={axis}, отобрано {len(picked)}')
+    assert axis == 'col'
+    assert len(picked) == 2
+    assert picked[0][1] < picked[1][1]
+
+
+def test_sv_grid_still_takes_four_corners():
+    """Настоящая сетка — по-прежнему четыре угла."""
+    project = _sv_layout([(70.0 * i, 110.0 * j)
+                          for i in range(3) for j in range(3)])
+    axis, picked = _sv_pick(project)
+    print(f'  сетка 3x3: ось={axis}')
+    assert axis is None, "сетка ошибочно принята за одну линию"
+    assert picked is None    # ушли в ветку «4 угла»
+
+    # 2x2 — все четыре и есть углы
+    project = _sv_layout([(70.0 * i, 110.0 * j)
+                          for i in range(2) for j in range(2)])
+    axis, picked = _sv_pick(project)
+    assert axis is None and len(picked) == 4

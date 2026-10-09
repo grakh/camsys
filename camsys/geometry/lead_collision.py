@@ -153,6 +153,11 @@ def _point_to_segment_distance(p: Point, a: Point, b: Point) -> float:
     return math.hypot(p[0] - fx, p[1] - fy)
 
 
+# Радиус вокруг точки стыковки, в котором пересечение лида с контуром
+# считается касанием, а не коллизией: там они сходятся по построению.
+JOIN_TOUCH_MM = 0.08
+
+
 def lead_crosses_contours(lead_poly: Optional[Polypath],
                            contours_lines: List[Tuple[str, List[Tuple[Point, Point]]]],
                            own_geom_id: str,
@@ -255,17 +260,59 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
                 continue
         
         is_own = (cid == own_geom_id)
-        for (ca, cb) in c_lines:
-            # На СВОЕМ контуре скипаем сегменты которые ПРОХОДЯТ через 
-            # окрестность точки стыковки lead'а.
-            if is_own:
-                d_min = _point_to_segment_distance(entry_point, ca, cb)
-                if d_min < own_skip_radius:
-                    continue
+        # ── ПРОПУСК ПО ДЛИНЕ ВДОЛЬ КОНТУРА (v1.7.16) ──
+        # На своём контуре нельзя пропускать сегменты по ЕВКЛИДОВУ
+        # расстоянию от точки стыковки: на мелком элементе
+        # противоположная сторона перешейка оказывается ближе
+        # own_skip_radius (≈1.2 мм, а после увеличения лидов вдвое —
+        # ≈2.4 мм), и реальное пересечение молча пропускалось. Лезвие
+        # при этом режет само себя.
+        #
+        # Пропускать надо только то, что рядом ПО КОНТУРУ — там arc
+        # лида тангенциально прижат к нему по построению. Всё, что
+        # далеко по контуру, но близко геометрически, проверяем.
+        _skip_idx = set()
+        if is_own and c_lines:
+            _cum = [0.0]
+            for (ca_, cb_) in c_lines:
+                _cum.append(_cum[-1] + math.hypot(cb_[0] - ca_[0],
+                                                  cb_[1] - ca_[1]))
+            _total = _cum[-1]
+            # позиция точки стыковки вдоль контура
+            _best_i, _best_d = 0, float('inf')
+            for _i, (ca_, cb_) in enumerate(c_lines):
+                _d = _point_to_segment_distance(entry_point, ca_, cb_)
+                if _d < _best_d:
+                    _best_d, _best_i = _d, _i
+            _s0 = (_cum[_best_i] + _cum[_best_i + 1]) * 0.5
+            for _i in range(len(c_lines)):
+                _sm = (_cum[_i] + _cum[_i + 1]) * 0.5
+                _ds = abs(_sm - _s0)
+                if _total > 0:
+                    _ds = min(_ds, _total - _ds)   # замкнутый контур
+                if _ds < own_skip_radius:
+                    _skip_idx.add(_i)
+
+        for _ci, (ca, cb) in enumerate(c_lines):
+            # В «зоне тангенциального касания» пропускаем только
+            # distance-чек: дуга лида там прижата к контуру по построению.
+            # Явное ПЕРЕСЕЧЕНИЕ остаётся ошибкой и в этой зоне (v1.7.18) —
+            # на 124819 выход резал свою осевую в 0.45 мм по контуру от
+            # стыковки, при пороге пропуска 1.79 мм.
+            _near_join = is_own and _ci in _skip_idx
             
             for (la, lb) in lead_lines:
                 # 1. Явное пересечение — реальная коллизия, всегда проверяется
                 if _segments_intersect_2d(la, lb, ca, cb):
+                    if _near_join:
+                        # У самой точки стыковки лид и контур сходятся —
+                        # это касание, а не пересечение. Игнорируем только
+                        # его, в пределах JOIN_TOUCH_MM.
+                        _mx = (la[0] + lb[0]) * 0.5
+                        _my = (la[1] + lb[1]) * 0.5
+                        if math.hypot(_mx - entry_point[0],
+                                      _my - entry_point[1]) < JOIN_TOUCH_MM:
+                            continue
                     return True
                 # 2. Distance-check (внутри зоны эквидистанты соседа) — 
                 # для ЧУЖИХ контуров + для СВОЕГО контура на далёких 
@@ -273,6 +320,8 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
                 # На своём это ловит случай когда lead-line проходит близко 
                 # к своей же offset-toolpath на противоположной стороне 
                 # выпуклого изгиба (тангенс срезает материал).
+                if _near_join:
+                    continue
                 for p in (la, lb, ((la[0]+lb[0])/2, (la[1]+lb[1])/2)):
                     if _point_to_segment_distance(p, ca, cb) < safe_offset:
                         return True
@@ -280,6 +329,40 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
 
 
 # Совместимость со старым API:
+def leads_cross_each_other(lead_in: Optional[Polypath],
+                           lead_out: Optional[Polypath],
+                           skip_mm: float = 0.25) -> bool:
+    """Пересекаются ли заход и выход между собой (v1.7.17).
+
+    Заход и выход строились независимо и сверялись только с контурами
+    ножей — друг с другом их не сравнивал никто. На мелких элементах они
+    расходятся от почти одной точки и успевают пересечься.
+
+    У замкнутого контура без перекрытия обе стыковки лежат в одной точке,
+    и рядом с ней дуги неизбежно идут вплотную. Поэтому пересечения
+    ближе skip_mm к любой из точек стыковки не считаем.
+    """
+    if not lead_in or not lead_out:
+        return False
+    if not lead_in.segments or not lead_out.segments:
+        return False
+    a_join = lead_in.segments[-1].b     # заход ВХОДИТ в контур концом
+    b_join = lead_out.segments[0].a     # выход НАЧИНАЕТСЯ на контуре
+    a_lines = polypath_to_lines(lead_in, max_chord=0.2)
+    b_lines = polypath_to_lines(lead_out, max_chord=0.2)
+    for (a1, a2) in a_lines:
+        for (b1, b2) in b_lines:
+            if not _segments_intersect_2d(a1, a2, b1, b2):
+                continue
+            # Пересечение рядом со стыковкой — это касание у контура
+            mid = ((a1[0] + a2[0]) * 0.5, (a1[1] + a2[1]) * 0.5)
+            if min(math.hypot(mid[0] - a_join[0], mid[1] - a_join[1]),
+                   math.hypot(mid[0] - b_join[0], mid[1] - b_join[1])) < skip_mm:
+                continue
+            return True
+    return False
+
+
 def lead_collides_with_neighbors(lead_poly, neighbor_bboxes, tool_offset,
                                   sample_per_seg=8):
     """Устаревший bbox-чек. Использовать lead_crosses_contours."""
@@ -684,10 +767,13 @@ def plan_lead_in(polypath: Polypath,
             if lead_out is None or not lead_out.segments:
                 return False  # если не построилось — не наша забота
             join_pt = lead_out.segments[0].a
-            return lead_crosses_contours(
-                lead_out, contours_lines, own_geom_id, join_pt,
-                tool_offset=tool_offset, safety_factor=sf,
-                contours_bboxes=contours_bboxes)
+            if lead_crosses_contours(
+                    lead_out, contours_lines, own_geom_id, join_pt,
+                    tool_offset=tool_offset, safety_factor=sf,
+                    contours_bboxes=contours_bboxes):
+                return True
+            # Заход и выход не должны пересекаться между собой (v1.7.17)
+            return leads_cross_each_other(lead_in, lead_out)
         return _combined
     
     def _make_combined_scorer(sf):
@@ -712,7 +798,11 @@ def plan_lead_in(polypath: Polypath,
             score_out = _lead_violation_score(
                 lead_out, contours_lines, own_geom_id, join_pt,
                 tool_offset, sf, contours_bboxes)
-            return max(score_in, score_out)  # худшая из двух
+            # Взаимное пересечение лидов — отдельный штраф (v1.7.17):
+            # без него позиция с крестом считалась бы идеальной.
+            cross_pen = tool_offset if leads_cross_each_other(
+                lead_in, lead_out) else 0.0
+            return max(score_in, score_out, cross_pen)
         return _combined
     
     # auto_avoid=False — просто строим как есть

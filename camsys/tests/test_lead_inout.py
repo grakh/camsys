@@ -219,3 +219,32 @@ if __name__ == "__main__":
             import traceback; traceback.print_exc()
     print(f"\n{passed}/{len(tests)} тестов пройдено")
     sys.exit(0 if not failed else 1)
+
+
+def test_sample_cache_survives_id_reuse():
+    """Кэш выборки контура держит сам объект, а не только его id.
+
+    Регрессия v1.7.40: точки контура запоминались по `id(polypath)`, а
+    Python отдаёт адрес освобождённого объекта следующему. В экспорте,
+    где полипасов создаётся много, замер лида начинал считаться ПО
+    ЧУЖОМУ контуру — и подбор длины давал бессмыслицу (10 лидов из 54
+    «не удалось» на ровном месте).
+
+    Лечится тем, что в кэше вместе с точками лежит ССЫЛКА на полипас:
+    пока запись жива, адрес не может достаться другому объекту.
+    """
+    from camsys.geometry.lead_inout import _cached_points, _SAMPLE_CACHE
+    from camsys.geometry.primitives import Line, Polypath
+
+    _SAMPLE_CACHE.clear()
+    poly = Polypath(segments=[Line(a=(0.0, 0.0), b=(10.0, 0.0))], closed=False)
+    pts = _cached_points(poly, 0.02)
+    assert pts, 'выборка пустая'
+    assert len(_SAMPLE_CACHE) == 1
+    stored = next(iter(_SAMPLE_CACHE.values()))
+    assert isinstance(stored, tuple) and len(stored) == 2, (
+        'в кэше лежат только точки — ключ по id снова небезопасен')
+    assert stored[0] is poly, 'кэш не держит ссылку на контур'
+    assert stored[1] is pts
+    # повторный вызов отдаёт то же самое, без пересчёта
+    assert _cached_points(poly, 0.02) is pts

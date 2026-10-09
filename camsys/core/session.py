@@ -579,7 +579,18 @@ class CamSession:
                 {'path': str(p), 'name': p.name, 'size': p.stat().st_size}
                 for p in written_paths
             ]
-            return {'dir': str(nc), 'archived': archived, 'written': written}
+            # ── Журнал проходимости фрезы (v1.7) ──
+            # Пост копит сюда, какие ножи пришлось править под компенсацию
+            # G41/G42 и что не удалось спасти. Дедуп: один и тот же нож
+            # повторяется во всех типах программ (rough/finish/SV).
+            _mach = []
+            for _s in getattr(exporter, 'machinability_report', []) or []:
+                if _s not in _mach:
+                    _mach.append(_s)
+            _unfix = [s for s in _mach if 'НЕ ИСПРАВЛЕНО' in s
+                      or 'ОТКАТ' in s]
+            return {'dir': str(nc), 'archived': archived, 'written': written,
+                    'machinability': _mach, 'warnings': _unfix}
         finally:
             # Восстанавливаем исходные stitch_filtered_out флаги (если
             # применяли фильтр под order_number). live-состояние UI

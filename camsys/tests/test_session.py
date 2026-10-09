@@ -342,3 +342,55 @@ if __name__ == "__main__":
             import traceback; traceback.print_exc()
     print(f"\n{passed}/{len(tests)} тестов пройдено")
     sys.exit(0 if not failed else 1)
+
+
+def test_corner_threshold_survives_order_json():
+    """Порог радиуса угла сохраняется в JSON заказа и поднимается обратно.
+
+    Пер-заказный JSON пишет cutting_params через to_dict(dataclass), так
+    что поле должно попадать туда автоматически — тест это фиксирует,
+    чтобы поле не потерялось при будущих правках сериализации.
+    """
+    import json, tempfile, os
+    from camsys.core.session import CamSession
+    from camsys.core.cutting_macro import CuttingMacroParams
+
+    ses = CamSession()
+    ses.cutting_params = CuttingMacroParams()
+    ses.cutting_params.corner_radius_threshold_mm = 1.25
+
+    data = ses.get_cutting_params_dict()
+    assert 'corner_radius_threshold_mm' in data, \
+        "порог не попал в словарь параметров заказа"
+    assert abs(data['corner_radius_threshold_mm'] - 1.25) < 1e-9
+
+    # Обратный ход
+    ses2 = CamSession()
+    ses2.cutting_params = CuttingMacroParams()
+    ses2.set_cutting_params_from_dict(data)
+    assert abs(ses2.cutting_params.corner_radius_threshold_mm - 1.25) < 1e-9
+
+    # И через реальный файл
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'order.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'cutting_params': data}, f, ensure_ascii=False)
+        back = json.load(open(path, encoding='utf-8'))
+        assert abs(back['cutting_params']['corner_radius_threshold_mm']
+                   - 1.25) < 1e-9
+
+
+def test_corner_threshold_default_present_in_settings_file():
+    """В camsys_settings.json есть умолчание порога угла."""
+    import json, os
+    root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    path = os.path.join(root, 'camsys_settings.json')
+    if not os.path.exists(path):
+        print('  SKIP — нет файла настроек')
+        return
+    data = json.loads(open(path, encoding='utf-8').read())
+    val = data.get('defaults', {}).get('corner_radius_threshold')
+    print(f'  умолчание порога: {val}')
+    assert val is not None, "ключ corner_radius_threshold отсутствует"
+    assert 0.1 <= float(val) <= 5.0

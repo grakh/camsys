@@ -14,6 +14,7 @@ from typing import List, Tuple, Optional
 import math
 
 from .primitives import Line, Arc, Polypath, Segment, Point, EPS
+from .direction import is_ccw
 
 
 def segment_length(seg: Segment) -> float:
@@ -1289,6 +1290,29 @@ def offset_polypath_toward_center(polypath: Polypath, offset: float,
     return Polypath(segments=new_segments, closed=polypath.closed)
 
 
+def offset_right_of_travel(polypath: Polypath, offset: float) -> Polypath:
+    """Эквидистанта СПРАВА ПО ХОДУ — то, что делает G42 (v1.7.37).
+
+    Для фрагмента угла это единственно верный способ посчитать, где
+    пройдёт фреза: эмиттер пишет G42 всегда, а сторону задаёт
+    направление обхода фрагмента.
+
+    Через `inward` это считать нельзя: «внутрь» определено относительно
+    ЗАМКНУТОГО контура, а у разомкнутого фрагмента
+    `offset_polypath_uniform` безусловно принимает намотку за CCW. В
+    результате `inward=True` давал ЛЕВУЮ нормаль, и во вьювере все углы
+    со стороной OUTSIDE рисовались зеркально — рез показывался не с той
+    стороны контура.
+    """
+    if not polypath or not polypath.segments or abs(offset) < 1e-9:
+        return polypath
+    # В терминах offset_polypath_uniform правая нормаль — это sign = −1,
+    # что при намотке CCW соответствует inward=False.
+    forced = Polypath(segments=list(polypath.segments), closed=False)
+    out = offset_polypath_uniform(forced, abs(offset), inward=False)
+    return Polypath(segments=out.segments, closed=polypath.closed)
+
+
 def offset_polypath_uniform(polypath: Polypath, offset: float,
                              inward: bool) -> Polypath:
     """Равномерный оффсет полипаса по направлению обхода контура.
@@ -1927,6 +1951,1027 @@ def despike_polypath(polypath: Polypath, max_pass: int = 80,
         sj = _truncate_to_point(segs[j], X, keep_start=False)
         segs = segs[:i] + [si, sj] + segs[j + 1:]
     return Polypath(segments=segs, closed=polypath.closed)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  ПРОХОДИМОСТЬ ФРЕЗЫ ПОД КОМПЕНСАЦИЕЙ G41/G42
+# ─────────────────────────────────────────────────────────────────────────
+#
+# В .anc пишется ОСЕВАЯ линия + G41/G42; эквидистанту считает сам станок.
+# Поэтому проверять проходимость надо НЕ на выходе offset_polypath_uniform
+# (та функция живёт только во вьювере и на рез не влияет), а на осевой
+# ПЕРЕД эмиссией — ровно на том, что увидит контроллер.
+#
+# Правило сжатия радиуса (ISO):
+#   G42 — фреза СПРАВА по ходу. Центр дуги справа ⇔ дуга по часовой (G2,
+#         ccw=False). Компенсация уводит путь вправо → R_факт = R − T.
+#   G41 — фреза СЛЕВА. Сжимается дуга против часовой (G3, ccw=True).
+# Если R < T, то R_факт ≤ 0 — дуга ВЫВОРАЧИВАЕТСЯ. Контроллер NUM на этом
+# либо ругается, либо крутит петлю на месте («мелкий барашек»).
+
+def find_narrow_gaps(polypath: Polypath, cut_width: float,
+                     min_contour_separation_mm: float = 2.5,
+                     sample_step_mm: float = 0.01,
+                     min_span_mm: float = 0.0) -> List[dict]:
+    """Участки, где контур подходит к себе ближе ШИРИНЫ РЕЗА (v1.7.27).
+
+    Фреза режет канавку шириной `cut_width` = 2 × эквидистанта. Если два
+    участка контура сходятся ближе, канавки сливаются: фреза, идущая по
+    одному участку, срезает лезвие противоположного.
+
+    Возвращает УЧАСТКИ, а не отдельные точки: для обрезки прохода нужны
+    границы, а не минимум.
+
+    `min_span_mm` отсекает короткие касания. Решает не глубина перемычки,
+    а протяжённость. Замер по эталону альфы на 124173_test:
+
+        шпилька, длина 4.24 мм, перемычка -0.088 → альфа ОБРЫВАЕТ проход
+        нож #18, длина 0.88 мм, перемычка -0.049 → альфа НЕ обрывает
+
+    Разница по длине впятеро, по глубине меньше чем вдвое. На коротком
+    касании фреза задевает стенку по касательной, лезвие практически не
+    страдает, и обрывать проход дороже, чем оставить.
+
+    `min_contour_separation_mm` отсекает соседей ПО КОНТУРУ: рядом с любой
+    точкой контур всегда близок сам к себе, и это нормально.
+
+    Returns:
+        Список словарей по участкам: gap (минимальный зазор), land
+        (перемычка = gap − cut_width), point (где минимум), span_mm
+        (длина участка), s_start / s_end (границы по длине контура),
+        separation (расстояние по контуру в точке минимума).
+        Отсортирован по возрастанию зазора.
+    """
+    if not polypath or not polypath.segments or cut_width <= 0:
+        return []
+    pts = _sample_polypath_points(polypath, sample_step_mm)
+    n = len(pts)
+    if n < 8:
+        return []
+    cum = [0.0]
+    for i in range(n - 1):
+        cum.append(cum[-1] + math.hypot(pts[i + 1][0] - pts[i][0],
+                                        pts[i + 1][1] - pts[i][1]))
+    total = cum[-1]
+
+    cell = max(cut_width, 1e-6)
+    grid: dict = {}
+    for i, (x, y) in enumerate(pts):
+        grid.setdefault((int(x / cell), int(y / cell)), []).append(i)
+
+    # Зазор до ДАЛЁКОГО по контуру участка для каждой точки
+    gap = [float('inf')] * n
+    sep = [0.0] * n
+    for i, (x, y) in enumerate(pts):
+        gx, gy = int(x / cell), int(y / cell)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for j in grid.get((gx + dx, gy + dy), ()):
+                    ds = abs(cum[j] - cum[i])
+                    if polypath.closed:
+                        ds = min(ds, total - ds)
+                    if ds < min_contour_separation_mm:
+                        continue
+                    d = math.hypot(pts[j][0] - x, pts[j][1] - y)
+                    if d < gap[i]:
+                        gap[i] = d
+                        sep[i] = ds
+
+    narrow = [i for i in range(n) if gap[i] < cut_width]
+    if not narrow:
+        return []
+
+    # Склеиваем в участки по ДЛИНЕ КОНТУРА, а не по числу отсчётов.
+    # _sample_polypath_points принимает допуск по хорде: на прямых
+    # участках точек почти нет, на кривых много. Разрыв «больше 5
+    # отсчётов» поэтому означал разную длину в разных местах, и
+    # измеренная протяжённость участка зависела от плотности сэмплинга,
+    # а не от геометрии (v1.7.27).
+    gap_join_mm = max(0.3, cut_width * 0.25)
+    runs = []
+    start = prev = narrow[0]
+    for i in narrow[1:]:
+        if cum[i] - cum[prev] > gap_join_mm:
+            runs.append((start, prev))
+            start = i
+        prev = i
+    runs.append((start, prev))
+
+    out: List[dict] = []
+    for a, b in runs:
+        span = cum[b] - cum[a]
+        if span < min_span_mm:
+            continue
+        k = min(range(a, b + 1), key=lambda t: gap[t])
+        out.append({'gap': gap[k], 'land': gap[k] - cut_width,
+                    'point': pts[k], 'separation': sep[k],
+                    'span_mm': span, 's_start': cum[a], 's_end': cum[b]})
+    return sorted(out, key=lambda r: r['gap'])
+
+
+def find_pass_self_intersections(polypath: Polypath, tool_offset: float,
+                                 margin: float = 0.02,
+                                 min_contour_separation_mm: float = 0.3,
+                                 sample_chord_mm: float = 0.005) -> dict:
+    """Самопересечения эквидистанты — ТОЙ ЖЕ цепочкой, что рисует вьювер
+    (v1.7.31).
+
+    Единый источник для детектора ям и будущей обрезки. Повторяет шаги
+    вьювера один в один:
+
+        1. normalize_for_side — разворот осевой под проход
+           (INSIDE → CCW, OUTSIDE → CW);
+        2. ensure_machinable_arcs — правка проходимости под G42;
+        3. offset_polypath_uniform — смещение, inward по стороне
+           (OUTSIDE → внутрь, INSIDE → наружу, как во вьювере);
+        4. поиск пересечений смещённого пути с самим собой.
+
+    Пропущенный первый шаг и был причиной, почему ложку Knife_10 не
+    находил ни детектор узких мест, ни голая функция смещения: без
+    разворота «внутрь» для функции смещения означало не ту сторону.
+
+    Проверено на 124173_test против глаза оператора и эталона альфы:
+    Knife_3 (внешний путь), Knife_10 и Knife_19 (внутренний), Knife_14
+    (внутренний). Все четыре — настоящие, лишних нет.
+
+    Сторону обрезки отдельно вычислять НЕ нужно: каждый проход смещается
+    в свою сторону, и пересечение появляется ровно в том, у которого
+    карман.
+
+    Returns:
+        {'INSIDE': [точки], 'OUTSIDE': [точки]} — для каждого прохода
+        список точек пересечения (внешний путь = INSIDE, внутренний =
+        OUTSIDE в терминах ContourSide).
+    """
+    from .direction import normalize_for_side
+    out = {'INSIDE': [], 'OUTSIDE': []}
+    if not polypath or not polypath.segments or not polypath.closed:
+        return out
+    if tool_offset <= 0:
+        return out
+
+    def _cross(a, b, c, d):
+        def cr(o, p, q):
+            return (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0])
+        d1, d2 = cr(c, d, a), cr(c, d, b)
+        d3, d4 = cr(a, b, c), cr(a, b, d)
+        return ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0))
+
+    for side in ('INSIDE', 'OUTSIDE'):
+        try:
+            pp = normalize_for_side(polypath, side)
+            pp = ensure_machinable_arcs(pp, tool_offset, 'G42', margin)[0]
+            off = offset_polypath_uniform(pp, tool_offset,
+                                          inward=(side == 'OUTSIDE'))
+        except Exception:
+            continue
+        pts = _sample_polypath_points(off, sample_chord_mm)
+        n = len(pts)
+        if n < 4:
+            continue
+        cum = [0.0]
+        for i in range(n - 1):
+            cum.append(cum[-1] + math.hypot(pts[i + 1][0] - pts[i][0],
+                                            pts[i + 1][1] - pts[i][1]))
+        total = cum[-1]
+        # Сетка по ширине ячейки ~ шаг поиска: сравниваем только соседние
+        cell = max(tool_offset, 1e-6)
+        grid: dict = {}
+        for i in range(n - 1):
+            mx = (pts[i][0] + pts[i + 1][0]) * 0.5
+            my = (pts[i][1] + pts[i + 1][1]) * 0.5
+            grid.setdefault((int(mx / cell), int(my / cell)), []).append(i)
+        found = []
+        for i in range(n - 1):
+            mx = (pts[i][0] + pts[i + 1][0]) * 0.5
+            my = (pts[i][1] + pts[i + 1][1]) * 0.5
+            gx, gy = int(mx / cell), int(my / cell)
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for j in grid.get((gx + dx, gy + dy), ()):
+                        if j <= i + 1:
+                            continue
+                        ds = abs(cum[j] - cum[i])
+                        ds = min(ds, total - ds)
+                        if ds < min_contour_separation_mm:
+                            continue
+                        if _cross(pts[i], pts[i + 1], pts[j], pts[j + 1]):
+                            p = pts[i]
+                            if not any(abs(p[0] - q[0]) < 0.4 and
+                                       abs(p[1] - q[1]) < 0.4 for q in found):
+                                found.append(p)
+        out[side] = found
+    return out
+
+
+def _exact_axis_points(polypath: Polypath, step: float):
+    """Точки ПРЯМО на дугах и прямых осевой, без хордового приближения.
+
+    Хордовый сэмплинг даёт на дуге ошибку в несколько микрон — столько же,
+    сколько допуск по высоте вершины. Поэтому только точные точки.
+    """
+    out = []
+    cum = 0.0
+    for seg in polypath.segments:
+        L = seg.length()
+        n = max(2, int(L / step))
+        for k in range(n):
+            f = k / n
+            if isinstance(seg, Line):
+                p = (seg.a[0] + (seg.b[0] - seg.a[0]) * f,
+                     seg.a[1] + (seg.b[1] - seg.a[1]) * f)
+            else:
+                cx, cy = seg.center
+                a0 = math.atan2(seg.a[1] - cy, seg.a[0] - cx)
+                a1 = math.atan2(seg.b[1] - cy, seg.b[0] - cx)
+                sw = a1 - a0
+                if seg.ccw:
+                    while sw < 0:
+                        sw += 2 * math.pi
+                else:
+                    while sw > 0:
+                        sw -= 2 * math.pi
+                ang = a0 + sw * f
+                p = (cx + seg.radius * math.cos(ang),
+                     cy + seg.radius * math.sin(ang))
+            out.append((cum + L * f, p))
+        cum += L
+    return out, cum
+
+
+def find_tool_clearance_issues(polypath: Polypath, cut_width: float,
+                               min_clearance_mm: float = 0.030,
+                               min_contour_separation_mm: float = 2.0,
+                               step_mm: float = 0.02) -> List[dict]:
+    """Места, куда основная фреза проходит с зазором меньше допустимого
+    (v1.7.32).
+
+    Зазор = расстояние между вершинами лезвия двух РАЗНЫХ участков контура
+    минус ширина реза. Отрицательный — фреза срезает вершину соседнего
+    лезвия. Положительный, но малый — проходит впритык.
+
+    Критерий согласован с оператором на 124173_test (угол 80, ABS 0.25):
+
+        Knife_3   −152 мкм   яма
+        Knife_19  −101 мкм   яма
+        Knife_14   −27 мкм   яма
+        Knife_1    −13 мкм   угол
+        Knife_10   +15 мкм   ложка — по физике проходима, но обрезается
+                             с запасом, как у альфы
+        Knife_11   +48 мкм   чисто
+
+    Порог 30 мкм стоит посреди разрыва между +15 и +48, поэтому устойчив:
+    небольшой сдвиг геометрии или фрезы решения не переворачивает.
+
+    Раньше перебирались глубина перемычки, длина участка, самопересечение
+    эквидистанты, отклонение конструкционной линии — все они либо путали
+    ямы с углами и шипами, либо пропускали ложку. Зазор разводит все
+    случаи одним числом. Точность — от точных точек на дугах, без хорд
+    (эталон: на круге ровно 0).
+
+    Returns:
+        Список словарей: clearance (мм, со знаком), point, other_point,
+        separation (мм по контуру). По возрастанию зазора, одна запись на
+        участок.
+    """
+    if not polypath or not polypath.segments or cut_width <= 0:
+        return []
+    pts, total = _exact_axis_points(polypath, step_mm)
+    reach = cut_width + max(0.0, min_clearance_mm)
+    cell = max(reach, 1e-6)
+    grid: dict = {}
+    for k, (_s, p) in enumerate(pts):
+        grid.setdefault((int(p[0] / cell), int(p[1] / cell)), []).append(k)
+
+    hits = []
+    for i, (s, p) in enumerate(pts):
+        gx, gy = int(p[0] / cell), int(p[1] / cell)
+        best = None
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for k in grid.get((gx + dx, gy + dy), ()):
+                    s2, q = pts[k]
+                    ds = abs(s2 - s)
+                    if polypath.closed:
+                        ds = min(ds, total - ds)
+                    if ds < min_contour_separation_mm:
+                        continue
+                    d = math.hypot(q[0] - p[0], q[1] - p[1])
+                    if best is None or d < best[0]:
+                        best = (d, q, ds)
+        if best is None:
+            continue
+        clearance = best[0] - cut_width
+        if clearance < min_clearance_mm:
+            hits.append({'s': s, 'clearance': clearance, 'point': p,
+                         'other_point': best[1], 'separation': best[2]})
+
+    # Одна запись на участок: соседние по контуру точки склеиваем
+    hits.sort(key=lambda h: h['s'])
+    regions = []
+    for h in hits:
+        if regions and h['s'] - regions[-1][-1]['s'] < 0.3:
+            regions[-1].append(h)
+        else:
+            regions.append([h])
+    out = [min(r, key=lambda h: h['clearance']) for r in regions]
+    for r in out:
+        r.pop('s', None)
+    return sorted(out, key=lambda h: h['clearance'])
+
+
+def _seg_point_at(seg, f: float) -> Point:
+    """Точка на сегменте по доле длины (0..1) — точно, без хорд."""
+    if isinstance(seg, Line):
+        return (seg.a[0] + (seg.b[0] - seg.a[0]) * f,
+                seg.a[1] + (seg.b[1] - seg.a[1]) * f)
+    cx, cy = seg.center
+    a0 = math.atan2(seg.a[1] - cy, seg.a[0] - cx)
+    a1 = math.atan2(seg.b[1] - cy, seg.b[0] - cx)
+    sw = a1 - a0
+    if seg.ccw:
+        while sw < 0:
+            sw += 2 * math.pi
+    else:
+        while sw > 0:
+            sw -= 2 * math.pi
+    ang = a0 + sw * f
+    return (cx + seg.radius * math.cos(ang), cy + seg.radius * math.sin(ang))
+
+
+def _point_at_s(polypath: Polypath, s: float) -> Point:
+    """Точка контура по длине s (с заворотом). Точно, без хорд."""
+    segs = polypath.segments
+    total = sum(x.length() for x in segs)
+    s = s % total
+    c = 0.0
+    for seg in segs:
+        L = seg.length()
+        if c + L >= s - 1e-12:
+            return _seg_point_at(seg, 0.0 if L < 1e-12 else (s - c) / L)
+        c += L
+    return _seg_point_at(segs[-1], 1.0)
+
+
+def _subpath_forward(polypath: Polypath, s0: float, s1: float) -> List[Segment]:
+    """Кусок контура от s0 вперёд до s1 (через 0, если надо)."""
+    segs = polypath.segments
+    total = sum(x.length() for x in segs)
+    span = (s1 - s0) % total
+    if span < 1e-9:
+        return []
+    out: List[Segment] = []
+    cur = s0 % total
+    rem = span
+    guard = 0
+    while rem > 1e-9 and guard < 10 * len(segs) + 10:
+        guard += 1
+        c = 0.0
+        for seg in segs:
+            L = seg.length()
+            if L > 1e-12 and c - 1e-12 <= cur < c + L - 1e-12:
+                f0 = (cur - c) / L
+                take = min(L * (1.0 - f0), rem)
+                f1 = f0 + take / L
+                p0, p1 = _seg_point_at(seg, f0), _seg_point_at(seg, f1)
+                if take > 1e-9:
+                    out.append(Line(a=p0, b=p1) if isinstance(seg, Line)
+                               else Arc(a=p0, b=p1, center=seg.center,
+                                        ccw=seg.ccw))
+                cur = (cur + take) % total
+                rem -= take
+                break
+            c += L
+        else:
+            cur = 0.0
+    return out
+
+
+def bridge_radii_for_tool(tip_diameter: float, abs_depth: float,
+                          tool_equidistant: float,
+                          margin: float = 0.02) -> Tuple[float, float]:
+    """Радиусы для обрезки карманов: (устье, дуга моста) — v1.7.35.
+
+    ОДНА точка расчёта для поста и вьювера: формула жила в двух местах, и
+    картинка расходилась с программой каждый раз, когда правилось только
+    одно из них.
+
+    Устье (куда основная фреза не проходит) — по формуле альфы
+    `пятка/2 + ABS`. Она от угла заточки НЕ зависит, поэтому хорда устья
+    одна и та же на любом угле; на эталонном угле 80 это совпало с
+    хордой альфы 1.2893 с точностью 0.7 мкм.
+
+    Радиус дуги — тот же, но не меньше `эквидистанта/2 + margin`: иначе
+    компенсация G41/G42 вычитает из него всю эквидистанту, радиус
+    обращается в ноль и дуга схлопывается (на угле 90 запас формулы
+    альфы РОВНО нулевой, выше 90 — отрицательный).
+
+    Запас НЕ подмешивается в устье: от этого оно расширялось, мост нырял
+    в карман глубже нужного и выходил за исходный контур у обоих концов
+    устья, срезая вершину соседнего лезвия.
+
+    Args:
+        tip_diameter: пятка фрезы, мм (tool_radius * 2).
+        abs_depth: ABS — глубина реза от вершины ножа, мм.
+        tool_equidistant: ПОЛНАЯ ширина реза, мм (tip + 2·ABS·tan(угол/2)).
+        margin: запас радиуса дуги над эквидистантой, мм.
+
+    Returns:
+        (r_mouth, r_bridge), r_bridge >= r_mouth.
+    """
+    r_mouth = tip_diameter / 2.0 + float(abs_depth)
+    r_bridge = r_mouth
+    if tool_equidistant and float(tool_equidistant) > 0:
+        r_bridge = max(r_bridge, float(tool_equidistant) / 2.0 + margin)
+    return r_mouth, r_bridge
+
+
+def bridge_narrow_pits(polypath: Polypath, r_bridge: float,
+                       mouth_margin_mm: float = 0.010,
+                       min_contour_separation_mm: float = 2.0,
+                       max_skip_fraction: float = 0.30,
+                       step_mm: float = 0.05,
+                       fine_step_mm: float = 0.002,
+                       max_pits: int = 8,
+                       r_mouth: Optional[float] = None
+                       ) -> Tuple[Polypath, List[dict]]:
+    """Обрезает ВСЕ карманы ножа, куда основная фреза не проходит.
+
+    Карманов на одном ноже бывает несколько: у «ложки» из 124173_test их
+    два — угол и горло с расширением. Поэтому поиск и мост повторяются,
+    пока карманы находятся: после каждого моста контур короче, и
+    следующий ищется уже на нём.
+
+    Механику одного моста см. в `_bridge_one`.
+    """
+    out = polypath
+    all_br: List[dict] = []
+    for _ in range(max_pits):
+        nxt, br = _bridge_one(out, r_bridge, mouth_margin_mm,
+                              min_contour_separation_mm, max_skip_fraction,
+                              step_mm, fine_step_mm, r_mouth)
+        if not br or nxt is out:
+            break
+        # Сам мост ныряет в устье и оказывается близко к встречному
+        # берегу, поэтому следующий проход находит «карман» на уже
+        # обрезанном месте и вешает мост поверх моста. Останавливаемся,
+        # если новый мост рядом с прежним (v1.7.33).
+        new_a = br[0]['A']
+        if any(math.hypot(new_a[0] - b['A'][0],
+                          new_a[1] - b['A'][1]) < r_bridge * 3.0
+               for b in all_br):
+            break
+        all_br.extend(br)
+        out = nxt
+    return (out if all_br else polypath), all_br
+
+
+def _bridge_one(polypath: Polypath, r_bridge: float,
+                mouth_margin_mm: float = 0.010,
+                min_contour_separation_mm: float = 2.0,
+                max_skip_fraction: float = 0.30,
+                step_mm: float = 0.05,
+                fine_step_mm: float = 0.002,
+                r_mouth: Optional[float] = None
+                ) -> Tuple[Polypath, List[dict]]:
+    """Обрезает карманы, куда основная фреза не проходит (v1.7.33).
+
+    Механика взята с эталонного выхода AlphaCAM (124173_test.anc,
+    Knife_3): участок контура внутри кармана выбрасывается, а через устье
+    перекидывается ОДНА дуга радиуса r_bridge, идущая G2 на сжимающей
+    стороне. Компенсация остаётся G41/G42 на всём проходе.
+
+    Почему это даёт угол: радиус моста чуть больше эквидистанты, поэтому
+    станок строит его эквидистанту радиусом r_bridge − T (десятки микрон).
+    Центр фрезы разворачивается почти на месте — на пути образуется угол,
+    и при этом ничего не выворачивается, петли нет.
+
+    r_bridge у альфы = пятка/2 + ABS (то есть как если бы склон был 45°).
+    Всегда больше настоящей эквидистанты на ABS·(1 − tan(угол/2)).
+
+    mouth_margin_mm: устье берётся так, чтобы хорда была на этот запас
+    меньше диаметра. Без запаса дуга вырождается в полуокружность (179.5°)
+    и при малейшем сдвиге геометрии перестаёт существовать. У альфы запас
+    ~11 мкм, разворот моста 165°.
+
+    r_mouth: радиус, по которому ИЩЕТСЯ устье (куда фреза физически не
+    проходит) — это настоящая эквидистанта/2. Радиус самой дуги (r_bridge)
+    берётся с запасом, чтобы компенсация не вывернула его в ноль. Если эти
+    вещи не развязать, запас на радиусе расширяет устье и мост ныряет в
+    карман глубже, чем нужно (v1.7.35).
+
+    Returns:
+        (новый Polypath, список мостов). Если карманов нет — возвращается
+        ИСХОДНЫЙ объект.
+    """
+    if not polypath or not polypath.segments or not polypath.closed:
+        return polypath, []
+    if r_bridge <= 0:
+        return polypath, []
+    pts, total = _exact_axis_points(polypath, step_mm)
+    n = len(pts)
+    if n < 8:
+        return polypath, []
+    _rm = float(r_mouth) if (r_mouth and float(r_mouth) > 0) else r_bridge
+    diam = 2.0 * _rm
+    cell = diam + 0.1
+    grid: dict = {}
+    for k, (_s, p) in enumerate(pts):
+        grid.setdefault((int(p[0] / cell), int(p[1] / cell)), []).append(k)
+
+    gap = [float('inf')] * n
+    for i, (s, p) in enumerate(pts):
+        gx, gy = int(p[0] / cell), int(p[1] / cell)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for k in grid.get((gx + dx, gy + dy), ()):
+                    s2, q = pts[k]
+                    ds = abs(s2 - s)
+                    ds = min(ds, total - ds)
+                    if ds < min_contour_separation_mm:
+                        continue
+                    d = math.hypot(q[0] - p[0], q[1] - p[1])
+                    if d < gap[i]:
+                        gap[i] = d
+
+    narrow = [i for i in range(n) if gap[i] < diam]
+    if not narrow:
+        return polypath, []
+    runs = []
+    st = pv = narrow[0]
+    for i in narrow[1:]:
+        if pts[i][0] - pts[pv][0] > 0.3:
+            runs.append((st, pv))
+            st = i
+        pv = i
+    runs.append((st, pv))
+    if len(runs) < 2:
+        return polypath, []
+
+    # Пары берегов: конец одного и начало другого смотрят друг на друга
+    bridges = []
+    used = set()
+    for x in range(len(runs)):
+        for y in range(len(runs)):
+            if x == y or x in used or y in used:
+                continue
+            ia0, ib0 = runs[x][1], runs[y][0]   # конец X, начало Y
+            if math.hypot(pts[ib0][1][0] - pts[ia0][1][0],
+                          pts[ib0][1][1] - pts[ia0][1][1]) > diam * 1.4:
+                continue
+            # Устье уточняем ЛОКАЛЬНО на мелком шаге: грубого хватает
+            # найти карман, но не поставить мост. Точки считаются по
+            # запросу, без огромного массива — иначе шаг 2 мкм на контуре
+            # 270 мм даёт 135 тысяч точек и минуты счёта (v1.7.33).
+            sa0, sb0 = pts[ia0][0], pts[ib0][0]
+            found = None
+            steps = int(0.5 / fine_step_mm)   # окно поиска устья
+            for tot_in in range(0, steps + 1):
+                for da in range(0, tot_in + 1):
+                    db = tot_in - da
+                    sa = sa0 - da * fine_step_mm
+                    sb = sb0 + db * fine_step_mm
+                    A = _point_at_s(polypath, sa)
+                    B = _point_at_s(polypath, sb)
+                    if math.hypot(B[0] - A[0], B[1] - A[1]) <= diam - mouth_margin_mm:
+                        found = (sa, sb, A, B)
+                        break
+                if found:
+                    break
+            if not found:
+                continue
+            sa, sb, _A, _B = found
+            # Карман — всегда КОРОТКИЙ из двух путей между точками устья.
+            # Пары берегов перечисляются в произвольном порядке, поэтому
+            # направление нельзя брать из порядка пары: на Knife_3 это
+            # давало 257.74 мм вместо 12.26, пара отсекалась по
+            # max_skip_fraction, и мост уходил на второе устье с выбросом
+            # 3.39 мм не того участка (v1.7.33).
+            fwd = (sb - sa) % total
+            bwd = (sa - sb) % total
+            if bwd < fwd:
+                sa, sb = sb, sa
+                _A, _B = _B, _A
+                skip = bwd
+            else:
+                skip = fwd
+            if skip > total * max_skip_fraction or skip < 1e-6:
+                continue
+            bridges.append({'sA': sa, 'sB': sb, 'A': _A, 'B': _B,
+                            'skip': skip})
+    if not bridges:
+        return polypath, []
+
+    # У кармана бывает несколько устьев: у шпильки Knife_3 их два —
+    # слева и справа. Брать первое попавшееся нельзя: левое отсекает
+    # 3.5 мм вместо 12.13 справа. Нужен вариант, выбрасывающий карман
+    # ЦЕЛИКОМ, то есть с наибольшим skip (v1.7.33).
+    # Возвращаем ТОЛЬКО выбранный мост: остальные кандидаты — сырые
+    # записи без геометрии, и вызывающий код на них падал (v1.7.33).
+    br = max(bridges, key=lambda z: z['skip'])
+    # Устье уточняем ПО КАСАНИЮ (v1.7.36). Зазор < диаметра находит
+    # карман, но не задаёт устье: дуга фиксированного радиуса через
+    # найденные точки на одних ножах ложится внутрь кармана, а на
+    # других сразу выходит ЗА контур и срезает соседнее лезвие. У альфы
+    # хорда устья поэтому не константа: на 124173 угол 90 она 1.2297 на
+    # Knife_19, 1.2562 на Knife_14, 1.2869 на Knife_10 и 1.2893 на
+    # Knife_3. Сдвигаем устье внутрь кармана, пока дуга не перестанет
+    # выходить за контур.
+    br = _fit_mouth_to_arc(polypath, br, r_bridge, total, fine_step_mm)
+    if br is None:
+        return polypath, []
+    bridges = [br]
+    A, B = br['A'], br['B']
+    dx, dy = B[0] - A[0], B[1] - A[1]
+    c = math.hypot(dx, dy)
+    h = math.sqrt(max(0.0, r_bridge * r_bridge - (c / 2) ** 2))
+    mx, my = (A[0] + B[0]) / 2, (A[1] + B[1]) / 2
+    ux, uy = -dy / c, dx / c
+    # Направление моста задаётся не минимальным разворотом, а стороной,
+    # которую СЖИМАЕТ компенсация: только там эквидистанта моста выходит
+    # радиусом r_bridge − T и фреза разворачивается на месте, давая угол.
+    # Выбор по минимальному развороту совпадал с верным случайно и
+    # переворачивался от сдвига устья на сотые доли (v1.7.33).
+    # Мост обязан быть G2 (ccw=False) В НАМОТКЕ СВОЕГО ПРОХОДА: только
+    # тогда компенсация его сжимает и фреза разворачивается на месте.
+    # Сжимающая сторона у двух проходов противоположна, поэтому обрезка —
+    # свойство ПРОХОДА, а не ножа (v1.7.33).
+    want_ccw = False
+    best = None
+    for sgn in (1.0, -1.0):
+        cx, cy = mx + sgn * h * ux, my + sgn * h * uy
+        a0 = math.atan2(A[1] - cy, A[0] - cx)
+        a1 = math.atan2(B[1] - cy, B[0] - cx)
+        sw = a1 - a0
+        if want_ccw:
+            while sw < 0:
+                sw += 2 * math.pi
+        else:
+            while sw > 0:
+                sw -= 2 * math.pi
+        if abs(sw) < math.pi and (best is None or abs(sw) < best[0]):
+            best = (abs(sw), cx, cy, want_ccw)
+    if best is None:
+        return polypath, []
+    sweep, cx, cy, ccw = best
+    # Мост должен НЫРЯТЬ в карман, а не выпирать наружу. Проверка — по
+    # знаку относительно хорды устья: середина дуги и выброшенный участок
+    # обязаны лежать с одной стороны. Без порогов и расстояний: прежняя
+    # версия мерила расстояние до середины кармана и отбраковывала
+    # честные мосты на длинных карманах (12 и 20 мм).
+    _am = _seg_point_at(Arc(a=A, b=B, center=(cx, cy), ccw=ccw), 0.5)
+    _ex, _ey = B[0] - A[0], B[1] - A[1]
+    _side_arc = _ex * (_am[1] - A[1]) - _ey * (_am[0] - A[0])
+    _pit = _point_at_s(polypath, br['sA'] + br['skip'] * 0.5)
+    _side_pit = _ex * (_pit[1] - A[1]) - _ey * (_pit[0] - A[0])
+    if _side_arc * _side_pit <= 0:
+        return polypath, []
+    kept = _subpath_forward(polypath, br['sB'], br['sA'])  # мимо кармана
+    if not kept:
+        return polypath, []
+    kept.append(Arc(a=A, b=B, center=(cx, cy), ccw=ccw))
+    br['sweep_deg'] = math.degrees(sweep)
+    br['center'] = (cx, cy)
+    br['ccw'] = ccw
+    return Polypath(segments=kept, closed=True), bridges
+
+
+def _bridge_center(A, B, r_bridge: float):
+    """Центр дуги моста (G2 в намотке прохода) через A и B. None — не строится."""
+    dx, dy = B[0] - A[0], B[1] - A[1]
+    c = math.hypot(dx, dy)
+    if c < 1e-9 or c > 2.0 * r_bridge:
+        return None
+    h = math.sqrt(max(0.0, r_bridge * r_bridge - (c / 2) ** 2))
+    mx, my = (A[0] + B[0]) / 2.0, (A[1] + B[1]) / 2.0
+    ux, uy = -dy / c, dx / c
+    best = None
+    for sgn in (1.0, -1.0):
+        cx, cy = mx + sgn * h * ux, my + sgn * h * uy
+        a0 = math.atan2(A[1] - cy, A[0] - cx)
+        a1 = math.atan2(B[1] - cy, B[0] - cx)
+        sw = a1 - a0
+        while sw > 0:          # мост всегда G2 в намотке прохода
+            sw -= 2 * math.pi
+        if abs(sw) < math.pi and (best is None or abs(sw) < best[0]):
+            best = (abs(sw), cx, cy)
+    return best
+
+
+def arc_penetration_mm(center, r_bridge: float, A, B, samples) -> float:
+    """На сколько мост выходит ЗА контур, мм (0 — не выходит).
+
+    Критерий — катящийся диск: ни одна точка контура не должна лежать
+    ВНУТРИ окружности моста в пределах её дуги. Точка внутри значит, что
+    мост идёт глубже контура и снимает металл, который контур просил
+    оставить, — то есть срезает вершину соседнего лезвия.
+
+    Меряется ГЛУБИНА захода, а не число пересечений: концы устья лежат
+    точно на окружности и дают ровно ноль, поэтому никаких исключений
+    вокруг них не нужно — а значит, и порог получается честный.
+
+    Проверяются ОТРЕЗКИ выборки, а не точки: выборка контура идёт с
+    допуском на хорду, и на прямой стенке соседние точки стоят далеко
+    друг от друга — проверка по точкам пробой между ними не видела.
+
+    Точки вне углового сектора дуги не считаются: окружность большая и
+    захватывает контур выше устья, где самой дуги нет.
+    """
+    cx, cy = center
+    a0 = math.atan2(A[1] - cy, A[0] - cx)
+    a1 = math.atan2(B[1] - cy, B[0] - cx)
+    sweep = (a0 - a1) % (2 * math.pi)       # мост всегда G2
+    worst = 0.0
+    for i in range(len(samples) - 1):
+        p, q = samples[i][1], samples[i + 1][1]
+        ex, ey = q[0] - p[0], q[1] - p[1]
+        L2 = ex * ex + ey * ey
+        if L2 < 1e-18:
+            continue
+        t = ((cx - p[0]) * ex + (cy - p[1]) * ey) / L2
+        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+        nx, ny = p[0] + ex * t, p[1] + ey * t
+        d = math.hypot(nx - cx, ny - cy)
+        if d >= r_bridge:
+            continue
+        ang = (a0 - math.atan2(ny - cy, nx - cx)) % (2 * math.pi)
+        if 1e-12 < ang < sweep - 1e-12 and (r_bridge - d) > worst:
+            worst = r_bridge - d
+    return worst
+
+
+def _fit_mouth_to_arc(polypath: Polypath, br: dict, r_bridge: float,
+                      total: float, fine_step_mm: float = 0.002,
+                      max_shrink_mm: float = 0.60,
+                      tol_mm: float = 0.0005) -> Optional[dict]:
+    """Сдвигает устье внутрь кармана, пока дуга не перестанет резать контур.
+
+    Зазор < диаметра фрезы находит, ГДЕ карман, но устье по нему выходит
+    одинаковой ширины на всех ножах. Дуга фиксированного радиуса через
+    такое устье на одних карманах ложится внутрь, а на других сразу
+    уходит за стенку и срезает вершину соседнего лезвия — это и видно
+    было на Knife_19 и Knife_14 заказа 124173 (v1.7.36).
+
+    Альфа ставит устье по касанию, поэтому её хорда у каждого кармана
+    своя. Повторяем: двигаем оба конца внутрь мелким шагом и берём
+    первое положение, где дуга не выходит за контур.
+
+    Returns:
+        обновлённый br, либо None — если такого положения нет и мост
+        ставить нельзя (место остаётся на тонкую фрезу T3).
+    """
+    sA0, sB0 = br['sA'], br['sB']
+    # Точки контура вокруг устья считаем ОДИН раз: сдвиг двигает только
+    # концы внутри этого окна, сама выборка не меняется.
+    pad = 1.0
+    sub = _subpath_forward(polypath, (sA0 - pad) % total,
+                           (sB0 + pad) % total)
+    if not sub:
+        return None
+    _s0 = (sA0 - pad) % total
+    win = Polypath(segments=sub, closed=False)
+    # Мелкая выборка нужна ТОЛЬКО там, где контур может попасть внутрь
+    # окружности моста: радиус 0.65 мм, а карман бывает 27 мм длиной.
+    # Сначала грубо ищем такие куски, потом добираем их мелко — иначе
+    # 0.2 мкм по всему карману считается минутами (v1.7.36).
+    _M = ((br['A'][0] + br['B'][0]) / 2.0, (br['A'][1] + br['B'][1]) / 2.0)
+    _reach = 2.0 * r_bridge + 0.1
+    _coarse = _exact_axis_points(win, 0.02)[0]
+    _runs, _st, _pv = [], None, None
+    for s, p in _coarse:
+        near = math.hypot(p[0] - _M[0], p[1] - _M[1]) < _reach
+        if near and _st is None:
+            _st = s
+        elif not near and _st is not None:
+            _runs.append((_st, _pv))
+            _st = None
+        _pv = s
+    if _st is not None:
+        _runs.append((_st, _pv))
+    # Куски держим ОТДЕЛЬНО: склеенные в один список, они дали бы
+    # ложный отрезок через весь карман от конца одного к началу другого.
+    pieces: List[List[tuple]] = []
+    _wlen = sum(x.length() for x in sub)
+    for a, b in _runs:
+        a = max(0.0, a - 0.05)
+        b = min(_wlen, b + 0.05)
+        if b - a >= _wlen - 1e-6:
+            # Кусок покрывает окно целиком: _subpath_forward считает
+            # длину по модулю и на полном обороте вернул бы пусто.
+            _piece = sub
+        else:
+            _piece = _subpath_forward(win, a, b)
+        if not _piece:
+            continue
+        # Допуск выборки — 0.2 мкм: при 10 мкм сама ломаная срезала бы
+        # дугу глубже порога и устье уезжало бы без причины.
+        _loc = _exact_axis_points(Polypath(segments=_piece, closed=False),
+                                  0.0002)[0]
+        if len(_loc) > 1:
+            pieces.append([((_s0 + a + s) % total, p) for (s, p) in _loc])
+    if not pieces:
+        return None
+    step = max(fine_step_mm, 0.002)
+    n_steps = int(max_shrink_mm / step)
+    for k in range(n_steps + 1):
+        d = k * step
+        sa = (sA0 + d) % total
+        sb = (sB0 - d) % total
+        skip = (sb - sa) % total
+        if skip < 0.2:
+            break
+        A = _point_at_s(polypath, sa)
+        B = _point_at_s(polypath, sb)
+        res = _bridge_center(A, B, r_bridge)
+        if res is None:
+            continue
+        _sw, cx, cy = res
+        pen = max(arc_penetration_mm((cx, cy), r_bridge, A, B, pc)
+                  for pc in pieces)
+        if pen <= tol_mm:
+            out = dict(br)
+            out['sA'], out['sB'] = sa, sb
+            out['A'], out['B'] = A, B
+            out['skip'] = skip
+            out['mouth_shrink'] = d
+            out['mouth_chord'] = math.hypot(B[0] - A[0], B[1] - A[1])
+            out['penetration_mm'] = pen
+            return out
+    return None
+
+
+def arc_shrinks_under_comp(seg: Segment, gcomp: str) -> bool:
+    """True, если компенсация УМЕНЬШАЕТ радиус этой дуги.
+
+    Args:
+        seg: сегмент пути (не-дуги дают False)
+        gcomp: 'G41' | 'G42' | 'G40'
+    """
+    if not isinstance(seg, Arc):
+        return False
+    g = str(gcomp).upper()
+    if g == "G42":
+        return not seg.ccw          # G2
+    if g == "G41":
+        return seg.ccw              # G3
+    return False
+
+
+def _arc_sweep(seg: Arc) -> float:
+    """Развёрнутый угол дуги, радианы (всегда > 0)."""
+    import math as _m
+    va = (seg.a[0] - seg.center[0], seg.a[1] - seg.center[1])
+    vb = (seg.b[0] - seg.center[0], seg.b[1] - seg.center[1])
+    d = _m.atan2(vb[1], vb[0]) - _m.atan2(va[1], va[0])
+    if seg.ccw:
+        while d < 0:
+            d += 2 * _m.pi
+    else:
+        while d > 0:
+            d -= 2 * _m.pi
+        d = -d
+    return d
+
+
+def _sagitta(radius: float, chord: float) -> float:
+    """Стрелка прогиба дуги (высота сегмента) по радиусу и хорде."""
+    import math as _m
+    h = radius * radius - (chord * 0.5) ** 2
+    return radius - _m.sqrt(h) if h > 0.0 else radius
+
+
+def _recenter_arc(a: Point, b: Point, radius: float, ccw: bool):
+    """Центр МАЛОЙ дуги (развёртка ≤ 180°) через концы, радиус и направление.
+
+    Возвращает None, если радиус меньше половины хорды (дуга невозможна).
+    """
+    import math as _m
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    c = _m.hypot(dx, dy)
+    if c < 1e-12 or radius < c * 0.5 - 1e-12:
+        return None
+    h2 = radius * radius - (c * 0.5) ** 2
+    h = _m.sqrt(h2) if h2 > 0.0 else 0.0
+    mx, my = (a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5
+    # Левый перпендикуляр к хорде a→b
+    ux, uy = -dy / c, dx / c
+    s = 1.0 if ccw else -1.0
+    return (mx + s * h * ux, my + s * h * uy)
+
+
+def find_unmachinable_arcs(polypath: Polypath, tool_offset: float,
+                           gcomp: str, margin: float = 0.0
+                           ) -> List[dict]:
+    """Находит дуги, которые компенсация выворачивает (R_факт ≤ 0).
+
+    Args:
+        polypath: ОСЕВАЯ линия ровно в том виде, в каком уйдёт в .anc
+        tool_offset: эквидистанта фрезы (= tool_equidistant / 2), мм
+        gcomp: код компенсации для этого прохода ('G41'/'G42'/'G40')
+        margin: запас сверх эквидистанты, мм. Фрезы точатся, станок меряет
+            их щупом Renishaw и считает эквидистанту сам; запас страхует
+            случай, когда фактическая фреза чуть больше заложенной.
+
+    Returns:
+        Список словарей: index, radius, needed, sweep_deg, length,
+        deviation (насколько сместится контур при подъёме радиуса).
+    """
+    out: List[dict] = []
+    if not polypath or tool_offset <= 1e-9:
+        return out
+    import math as _m
+    need = tool_offset + max(0.0, margin)
+    for i, seg in enumerate(polypath.segments):
+        if not arc_shrinks_under_comp(seg, gcomp):
+            continue
+        r = seg.radius
+        if r >= need - 1e-9:
+            continue
+        chord = _m.hypot(seg.b[0] - seg.a[0], seg.b[1] - seg.a[1])
+        out.append({
+            'index': i,
+            'radius': r,
+            'needed': need,
+            'sweep_deg': _m.degrees(_arc_sweep(seg)),
+            'length': seg.length(),
+            'chord': chord,
+            'deviation': abs(_sagitta(need, chord) - _sagitta(r, chord)),
+        })
+    return out
+
+
+def ensure_machinable_arcs(polypath: Polypath, tool_offset: float,
+                           gcomp: str, margin: float = 0.02,
+                           max_deviation_mm: float = 0.05,
+                           max_sweep_deg: float = 170.0,
+                           max_affected_fraction: float = 0.30
+                           ) -> Tuple[Polypath, List[dict], List[dict]]:
+    """Заменяет непроходимые дуги проходимым скруглением.
+
+    Радиус дуги поднимается до tool_offset + margin с СОХРАНЕНИЕМ концов
+    и направления обхода — пересчитывается только центр. Концы не двигаются,
+    поэтому стыки с соседними сегментами остаются точными и каскада искажений
+    (как при правке центра в repair_arc_tangency) не возникает.
+
+    Дуга НЕ трогается, если:
+      - развёртка больше max_sweep_deg (большая дуга: подъём радиуса при
+        фиксированных концах превратил бы её в другую фигуру);
+      - подъём сместил бы контур больше чем на max_deviation_mm (значит это
+        не биарк-шум, а осознанная мелкая фича — молча деформировать деталь
+        нельзя, такой участок уходит в лог как неспасаемый);
+      - пересчёт центра геометрически невозможен.
+
+    Returns:
+        (новый Polypath, список исправленных, список неспасаемых)
+        Если исправлять нечего — возвращается ИСХОДНЫЙ объект (is polypath),
+        что позволяет вызывающему коду дёшево проверить «ничего не менялось».
+    """
+    bad = find_unmachinable_arcs(polypath, tool_offset, gcomp, margin)
+    if not bad:
+        return polypath, [], []
+
+    # ── КОНТУРНЫЙ GUARD ──
+    # Отдельная непроходимая дуга среди длинного контура — это биарк-шум
+    # или мелкий филет, который фреза всё равно скруглит; поднять радиус
+    # безопасно. Но если непроходима ЗНАЧИТЕЛЬНАЯ часть контура, то мелкая
+    # тут вся деталь целиком (например круглый нож R0.3 при фрезе R0.533):
+    # подъём радиуса молча изменил бы РАЗМЕР изделия. Такое не чиним —
+    # отдаём наверх как неспасаемое, пусть решает человек.
+    total_len = sum(s.length() for s in polypath.segments)
+    bad_len = sum(r['length'] for r in bad)
+    if total_len > 1e-9 and bad_len / total_len > max_affected_fraction:
+        for r in bad:
+            r['reason'] = (f"непроходимо {100.0 * bad_len / total_len:.0f}% "
+                           f"длины контура — деталь мельче фрезы")
+        return polypath, [], bad
+
+    segs = list(polypath.segments)
+    fixed: List[dict] = []
+    unfixable: List[dict] = []
+    for rec in bad:
+        i = rec['index']
+        seg = segs[i]
+        if rec['sweep_deg'] > max_sweep_deg:
+            rec['reason'] = f"развёртка {rec['sweep_deg']:.0f}° > {max_sweep_deg:.0f}°"
+            unfixable.append(rec)
+            continue
+        if rec['deviation'] > max_deviation_mm:
+            rec['reason'] = (f"смещение контура {rec['deviation']:.4f} мм "
+                             f"> {max_deviation_mm:.3f} мм")
+            unfixable.append(rec)
+            continue
+        new_c = _recenter_arc(seg.a, seg.b, rec['needed'], seg.ccw)
+        if new_c is None:
+            rec['reason'] = "пересчёт центра невозможен"
+            unfixable.append(rec)
+            continue
+        segs[i] = Arc(a=seg.a, b=seg.b, center=new_c, ccw=seg.ccw)
+        fixed.append(rec)
+
+    if not fixed:
+        return polypath, [], unfixable
+    return (Polypath(segments=segs, closed=polypath.closed),
+            fixed, unfixable)
 
 
 def simplify_for_visualization(polypath: Polypath,
@@ -2670,7 +3715,9 @@ def _point_in_polypath(point: Point, polypath: Polypath) -> bool:
 def merge_segments_to_arcs(polypath: Polypath, tol: float = 0.02, 
                             min_chain: int = 3,
                             tangent_tol_deg: float = 3.0,
-                            short_seg: float = 1.0) -> Polypath:
+                            short_seg: float = 1.0,
+                            smooth_guard_deg: float = 3.0,
+                            max_radius_ratio: float = 2.0) -> Polypath:
     """Объединяет цепочки коротких сегментов в одну дугу или линию.
     
     После biarc-разбиения кривых Безье из .ai контуры могут содержать 
@@ -2792,6 +3839,7 @@ def merge_segments_to_arcs(polypath: Polypath, tol: float = 0.02,
     tangent_cos_tol = math.cos(math.radians(tangent_tol_deg))
     
     result: List[Segment] = []
+    spans = []          # какие исходные сегменты покрывает каждый результат
     i = 0
     n = len(segs)
     while i < n:
@@ -2800,6 +3848,7 @@ def merge_segments_to_arcs(polypath: Polypath, tol: float = 0.02,
         # Длинные одиночные сегменты — не трогаем
         if cur_L >= SHORT_SEG:
             result.append(cur)
+            spans.append((i, i + 1))
             i += 1
             continue
         
@@ -2816,6 +3865,26 @@ def merge_segments_to_arcs(polypath: Polypath, tol: float = 0.02,
         for jj in range(i + min_chain, max_end + 1):
             chain = segs[i:jj]
             pts = [s.a for s in chain] + [chain[-1].b]
+
+            # ── РАЗБРОС РАДИУСОВ В ЦЕПОЧКЕ (v1.7.30) ──
+            # Illustrator описывает кривую переменной кривизны цепочкой
+            # дуг с ПЛАВНО растущим радиусом. Склеивать такую цепочку в
+            # одну дугу нельзя: участок с малым радиусом подменяется
+            # средним, контур отходит от истинной траектории и
+            # возвращается изломом — на экране это видно ступенькой.
+            #
+            # Нож #0 файла 124173_test, точка (57.8, 93.8): десять дуг
+            # R 2.3 → 3.1 → 3.7 → 6.6 → 8.6 → 14.0 → 17.6 → 61.9,
+            # изломы 0.00°, склеивались в одну дугу R 16.08 с изломом
+            # 1.66° на стыке. Формально допуск tol=0.02 соблюдён, а
+            # ступенька видна.
+            #
+            # Guard по изломам (v1.7.3) это не ловил: его порог 3°.
+            _ch_radii = [sg.radius for sg in chain if isinstance(sg, Arc)]
+            if len(_ch_radii) >= 2:
+                _rmin, _rmax = min(_ch_radii), max(_ch_radii)
+                if _rmin > 1e-9 and _rmax / _rmin > max_radius_ratio:
+                    break
             
             # Прямая?
             if _all_on_line(pts, tol):
@@ -2885,10 +3954,86 @@ def merge_segments_to_arcs(polypath: Polypath, tol: float = 0.02,
         
         if best_seg is not None and best_end > i + 1:
             result.append(best_seg)
+            spans.append((i, best_end))
             i = best_end
         else:
             result.append(cur)
+            spans.append((i, i + 1))
             i += 1
+
+    # ── ГАРАНТИЯ «НЕ НАВРЕДИ» (v1.7.3) ──
+    # Склейка цепочки в одну дугу не должна УХУДШАТЬ гладкость контура.
+    # Раньше проверялась только касательная с ПРЕДЫДУЩИМ результатом, а
+    # стык со СЛЕДУЮЩИМ не проверялся вовсе — из-за этого на импорте число
+    # изломов > 3° росло вдвое (на 124173: 81 → 167), и плавные дуги .ai
+    # приезжали в вид ломаной с видимыми углами.
+    #
+    # Здесь сравниваем излом на каждом стыке ПОСЛЕ склейки с изломом,
+    # который был на том же месте в ОРИГИНАЛЕ. Стало хуже более чем на
+    # smooth_guard_deg — откатываем оба соседних сегмента к исходным.
+    def _tan_end_raw(seg):
+        if isinstance(seg, Line):
+            dx, dy = seg.b[0] - seg.a[0], seg.b[1] - seg.a[1]
+            L = math.hypot(dx, dy)
+            return None if L < 1e-9 else (dx / L, dy / L)
+        if isinstance(seg, Arc):
+            rx, ry = seg.b[0] - seg.center[0], seg.b[1] - seg.center[1]
+            L = math.hypot(rx, ry)
+            if L < 1e-9:
+                return None
+            return (-ry / L, rx / L) if seg.ccw else (ry / L, -rx / L)
+        return None
+
+    def _tan_start_raw(seg):
+        if isinstance(seg, Line):
+            dx, dy = seg.b[0] - seg.a[0], seg.b[1] - seg.a[1]
+            L = math.hypot(dx, dy)
+            return None if L < 1e-9 else (dx / L, dy / L)
+        if isinstance(seg, Arc):
+            rx, ry = seg.a[0] - seg.center[0], seg.a[1] - seg.center[1]
+            L = math.hypot(rx, ry)
+            if L < 1e-9:
+                return None
+            return (-ry / L, rx / L) if seg.ccw else (ry / L, -rx / L)
+        return None
+
+    def _break_deg(t1, t2):
+        if t1 is None or t2 is None:
+            return 0.0
+        return math.degrees(abs(math.atan2(
+            t1[0] * t2[1] - t1[1] * t2[0],
+            t1[0] * t2[0] + t1[1] * t2[1])))
+
+    changed = True
+    guard_passes = 0
+    while changed and guard_passes < 4:
+        changed = False
+        guard_passes += 1
+        k = 0
+        while k < len(result) - 1:
+            after = _break_deg(_tan_end_raw(result[k]),
+                               _tan_start_raw(result[k + 1]))
+            if after <= smooth_guard_deg:
+                k += 1
+                continue
+            # Излом на этом стыке в ОРИГИНАЛЕ (между теми же точками)
+            j0 = spans[k][1] - 1
+            before = _break_deg(_tan_end_raw(segs[j0]),
+                                _tan_start_raw(segs[(j0 + 1) % len(segs)]))
+            if after <= before + smooth_guard_deg:
+                k += 1
+                continue
+            # Склейка ухудшила стык — возвращаем исходные сегменты
+            revert = []
+            rspans = []
+            for (a, b) in (spans[k], spans[k + 1]):
+                for t in range(a, b):
+                    revert.append(segs[t])
+                    rspans.append((t, t + 1))
+            result[k:k + 2] = revert
+            spans[k:k + 2] = rspans
+            changed = True
+            k += len(revert)
     
     # ── Постобработка: устранение изломов касательной ──
     # На изогнутых контурах (волнистая линия) после merge могут возникнуть

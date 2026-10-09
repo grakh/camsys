@@ -21,6 +21,7 @@ from typing import List, Tuple
 import math
 
 from .primitives import Line, Arc, Polypath, Segment, Point
+from .direction import is_ccw
 
 
 def _segment_tangent_at_start(seg: Segment) -> Tuple[float, float]:
@@ -484,6 +485,105 @@ def detect_geometric_corners(polypath: Polypath,
     return corners
 
 
+
+
+def suggest_corner_threshold(polypath: Polypath,
+                             max_radius_mm: float = 5.0) -> float:
+    """Минимальный порог, при котором на контуре найдётся хотя бы угол.
+
+    Нужна, чтобы программа могла подсказать оператору конкретное число
+    вместо молчаливого «углов нет». Считается ТОЧНО: detect_geometric_corners
+    монотонна по порогу (больше порог — не меньше углов), поэтому двоичным
+    поиском по фактическим радиусам дуг контура ищем наименьший порог с
+    непустым результатом.
+
+    Returns:
+        Порог в мм, либо 0.0 если углов нет ни при каком пороге
+        (до max_radius_mm).
+    """
+    if not polypath or not polypath.segments:
+        return 0.0
+    radii = sorted({round(sg.radius, 4) for sg in polypath.segments
+                    if isinstance(sg, Arc) and sg.radius <= max_radius_mm})
+    if not radii:
+        return 0.0
+    # Проверяем самый большой кандидат — если и там пусто, углов нет
+    if not detect_geometric_corners(polypath,
+                                    radius_threshold_mm=radii[-1] + 1e-4):
+        return 0.0
+    lo, hi = 0, len(radii) - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if detect_geometric_corners(polypath,
+                                    radius_threshold_mm=radii[mid] + 1e-4):
+            hi = mid
+        else:
+            lo = mid + 1
+    return radii[lo] + 1e-4
+
+
+def corner_is_convex(polypath: Polypath, arc: Arc) -> bool:
+    """Выпуклый ли угол — ГЕОМЕТРИЧЕСКИ, а не по флагам намотки (v1.7.25).
+
+    Выпуклый угол (бугор наружу) имеет центр дуги ВНУТРИ контура;
+    вогнутый (вырез) — снаружи. Признак не зависит от того, как
+    Illustrator записал намотку участка.
+
+    Прежний признак `corner_ccw == is_ccw(polypath)` на шпильках с
+    разворотом около 180° давал обратный ответ: кончик языка ножа #14
+    геометрически выпуклый, а по флагам получался вогнутым. Подгонка
+    знака под этот один случай (v1.7.24) сломала все остальные — на
+    обычном треугольнике со скруглением R0.5 угол уезжал наружу.
+    """
+    from .path_offset import _point_in_polypath
+    try:
+        return bool(_point_in_polypath(arc.center, polypath))
+    except Exception:
+        return bool(arc.ccw) == is_ccw(polypath)
+
+
+def corner_side_for_arc(polypath: Polypath, arc: Arc) -> str:
+    """Сторона доработки T3 по геометрии дуги.
+
+    У ВЫПУКЛОГО угла вырождается ВНУТРЕННЯЯ грань (R − эквидистанта),
+    у ВОГНУТОГО — ВНЕШНЯЯ. Туда и идёт тонкая фреза.
+
+    В терминах ContourSide (имена там перевёрнуты относительно смысла):
+        внутренний путь = ContourSide.OUTSIDE
+        внешний путь    = ContourSide.INSIDE
+    """
+    return "OUTSIDE" if corner_is_convex(polypath, arc) else "INSIDE"
+
+
+def corner_side_name(polypath: Polypath, corner_ccw: bool) -> str:
+    """Сторона прохода, на которой углу нужна доработка тонкой фрезой.
+
+    Возвращает 'OUTSIDE' или 'INSIDE'.
+
+    Нож режется двумя проходами, оба под G42 (фреза справа):
+        INSIDE  — намотка CCW
+        OUTSIDE — намотка CW
+    G42 СЖИМАЕТ дугу, идущую по часовой (ccw=False) в намотке своего
+    прохода: там радиус реза равен R − T. Именно на этой стороне угол
+    получается зажатым (а при R < T вообще невозможен) — её и должна
+    доработать тонкая фреза T3. На второй стороне радиус R + T, рез
+    гладкий, доработка не нужна.
+
+    Разворот контура переворачивает флаг ccw у дуг, поэтому ориентацию
+    дуги надо приводить к намотке конкретного прохода:
+
+        ccw_в_OUTSIDE = (corner_ccw != is_ccw(polypath))
+
+    Если в намотке OUTSIDE дуга идёт по часовой — сжимается там,
+    значит сторона OUTSIDE. Иначе INSIDE.
+
+    Args:
+        polypath: контур ножа в том виде, в каком он хранится в геометрии
+        corner_ccw: направление обхода угла (CornerGroup.ccw, либо
+            turn_sign > 0 для острых 3D-углов)
+    """
+    ccw_in_outside = (bool(corner_ccw) != is_ccw(polypath))
+    return "INSIDE" if ccw_in_outside else "OUTSIDE"
 
 
 @dataclass
