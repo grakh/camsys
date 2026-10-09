@@ -531,3 +531,40 @@ def test_viewer_fits_lead_on_axis_not_on_equidistant():
     # Инструмент для замера — полуширина реза, а не полная
     assert 'effective_tool_offset' in blk, (
         'в подбор не передана полуширина реза')
+
+
+def test_viewer_lead_shrink_applied_like_in_post():
+    """Укорочение лида применяется к ИТОГОВОЙ длине, а не к множителю.
+
+    Регрессия v1.7.44: вьювер умножал на укорочение множитель длины, а
+    запас (`corner_lead_extra`, 0.6 мм) прибавляется ПОСЛЕ него и не
+    уменьшался. При укорочении ×0.6 лид выходил на треть длиннее
+    программного — то есть правка делала его длиннее, а не короче.
+
+    Пост умножает итог: `_line_len_alpha(...) * _shrink_in`.
+    """
+    source = open(os.path.join(UI_DIR, 'viewer_2d.py'), encoding='utf-8').read()
+    assert 'lead_in_length_mult *= _shrink_v' not in source, (
+        'укорочение снова применяется к множителю, а не к длине')
+    assert '_lead_shrink_view' in source
+    i_decl = source.index('_lead_shrink_view = 1.0')
+    i_use = source.index('* _lead_shrink_view')
+    assert i_decl < i_use, '_lead_shrink_view используется до объявления'
+
+
+def test_viewer_builds_rework_lead_on_axis():
+    """Лид доработки во вьювере строится на осевой и рисуется смещённым.
+
+    Пост строит лид на осевой и пишет G42 — станок сам отодвигает фрезу
+    вправо. Настоящий путь фрезы = лид осевой, смещённый вправо.
+
+    Регрессия v1.7.44: вьювер вызывал plan_lead_in от ЭКВИДИСТАНТЫ, то
+    есть строил другую кривую, а подбор длины считался для осевой —
+    решение применялось не к той кривой.
+    """
+    source = open(os.path.join(UI_DIR, 'viewer_2d.py'), encoding='utf-8').read()
+    i = source.index('plan_lead_in(')
+    blk = source[max(0, i - 1500):i + 900]
+    assert 'offset_right_of_travel' in blk, (
+        'лид доработки не смещается для показа пути фрезы')
+    assert '_axis_src' in blk, 'лид доработки строится не от осевой'

@@ -1395,6 +1395,9 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
     # Для OUTSIDE/INSIDE — авто-подбор стороны через pick_lead_side_for_pass 
     # внутри plan_lead_in.
     forced_lead_side = None
+    # Укорочение лида — только для доработки; у обычных проходов 1.0.
+    # Объявляем ДО ветки, иначе обычный проход падает на NameError.
+    _lead_shrink_view = 1.0
     if is_3d_corner or is_2d_corner:
         # СТОРОНА ЛИДА УГЛА: кончик лида должен быть с ТОЙ ЖЕ стороны от
         # контура, что и сама ЭКВИДИСТАНТА УГЛА (она уже построена
@@ -1443,13 +1446,12 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
             if _ang_v and abs(_ang_v - lead_in_angle) > 1e-6:
                 lead_in_angle = _ang_v
                 lead_out_angle = _ang_v
-            if _shrink_v < 1.0:
-                # В тесном месте лид укорачивается — ровно как в посте,
-                # иначе картинка покажет лид длиннее программного.
-                lead_in_length_mult *= _shrink_v
-                lead_in_radius_mult *= _shrink_v
-                lead_out_length_mult *= _shrink_v
-                lead_out_radius_mult *= _shrink_v
+            # Укорочение применяется к ИТОГОВОЙ длине, как в посте
+            # (v1.7.44). Раньше вьювер умножал на него МНОЖИТЕЛЬ, а запас
+            # длины (corner_lead_extra, 0.6 мм) при этом не уменьшался —
+            # при укорочении ×0.6 лид выходил на треть длиннее
+            # программного, то есть правка делала его ещё длиннее.
+            _lead_shrink_view = _shrink_v
         except Exception:
             forced_lead_side = "right"
         # ── ДИАГНОСТИКА (для правого клика «Диагностика угла») ──
@@ -1542,8 +1544,11 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
             is_entry=True,
             pass_side=tp.side.name,
             angle_deg=lead_in_angle,
-            line_length=_line_len_alpha_view(lead_in_length_mult, lead_in_angle),
-            arc_radius=lead_in_radius_mult * _c_rmult * _lead_scale_view,
+            line_length=(_line_len_alpha_view(lead_in_length_mult,
+                                              lead_in_angle)
+                             * _lead_shrink_view),
+            arc_radius=(lead_in_radius_mult * _c_rmult
+                            * _lead_scale_view * _lead_shrink_view),
             style=('line' if tp.entry.style == LeadStyle.LINE else 'line_arc'),
             forced_side=forced_lead_side,
         )
@@ -1557,20 +1562,51 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
                 is_entry=False,
                 pass_side=tp.side.name,
                 angle_deg=lead_out_angle,
-                line_length=_line_len_alpha_view(lead_out_length_mult, lead_out_angle),
-                arc_radius=lead_out_radius_mult * _c_rmult * _lead_scale_view,
+                line_length=(_line_len_alpha_view(lead_out_length_mult,
+                                              lead_out_angle)
+                             * _lead_shrink_view),
+                arc_radius=(lead_out_radius_mult * _c_rmult
+                            * _lead_scale_view * _lead_shrink_view),
                 style=('line' if tp.exit.style == LeadStyle.LINE else 'line_arc'),
                 forced_side=None,
             )
         
-        polypath_offset, lead_in_poly, lead_in_collision, _ = plan_lead_in(
-            polypath_offset, req_in,
-            contours_lines_cache, contours_bboxes_cache,
-            geom.id, effective_tool_offset,
-            auto_avoid=(this_op_auto_avoid and project is not None),
-            safety_factor=1.2,
-            exit_request=exit_req,
-            overlap=pending_overlap)
+        if is_corner:
+            # ── ЛИД ДОРАБОТКИ СТРОИТСЯ НА ОСЕВОЙ (v1.7.44) ──
+            # Пост строит лид на осевой и пишет G42 — станок сам
+            # отодвигает фрезу вправо на полуширину реза. Значит
+            # настоящий путь фрезы = лид ОСЕВОЙ, смещённый вправо.
+            #
+            # Вьювер же строил лид от ЭКВИДИСТАНТЫ, из её стартовой точки
+            # и по её касательной. Это другая кривая: у кончика языка
+            # эквидистанта загнута иначе, чем осевая, и нарисованный лид
+            # не совпадал с тем, что исполнит станок. Подбор длины при
+            # этом считался для осевой — решение применялось не к той
+            # кривой, и в узких местах лид оставался длинным и резал.
+            from ..geometry.path_offset import (
+                offset_right_of_travel as _ort_lead)
+            _axis_src = (polypath_for_vis
+                         if (polypath_for_vis and polypath_for_vis.segments)
+                         else polypath)
+            _ax_path, _ax_lead, lead_in_collision, _ = plan_lead_in(
+                _axis_src, req_in,
+                contours_lines_cache, contours_bboxes_cache,
+                geom.id, effective_tool_offset,
+                auto_avoid=(this_op_auto_avoid and project is not None),
+                safety_factor=1.2,
+                exit_request=exit_req,
+                overlap=pending_overlap)
+            lead_in_poly = (_ort_lead(_ax_lead, effective_tool_offset)
+                            if _ax_lead and _ax_lead.segments else None)
+        else:
+            polypath_offset, lead_in_poly, lead_in_collision, _ = plan_lead_in(
+                polypath_offset, req_in,
+                contours_lines_cache, contours_bboxes_cache,
+                geom.id, effective_tool_offset,
+                auto_avoid=(this_op_auto_avoid and project is not None),
+                safety_factor=1.2,
+                exit_request=exit_req,
+                overlap=pending_overlap)
         # ── СОХРАНЯЕМ ТОЧКУ ЗАХОДА ДЛЯ ЭМИТТЕРА ──
         # Эмиттер возьмёт её как старт контура (см. mtx_anderson), чтобы
         # .anc давал те же заходы, что видны в превью: логичнее и меньше
@@ -1616,15 +1652,33 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
             is_entry=False,
             pass_side=tp.side.name,
             angle_deg=lead_out_angle,
-            line_length=_line_len_alpha_view(lead_out_length_mult, lead_out_angle),
-            arc_radius=lead_out_radius_mult * _c_rmult * _lead_scale_view,
+            line_length=(_line_len_alpha_view(lead_out_length_mult,
+                                              lead_out_angle)
+                             * _lead_shrink_view),
+            arc_radius=(lead_out_radius_mult * _c_rmult
+                            * _lead_scale_view * _lead_shrink_view),
             style=('line' if tp.exit.style == LeadStyle.LINE else 'line_arc'),
             forced_side=forced_exit_side,
         )
-        lead_out_poly, lead_out_collision, _ = plan_lead_out(
-            polypath_offset, req_out,
-            contours_lines_cache, contours_bboxes_cache,
-            geom.id, effective_tool_offset)
+        if is_corner:
+            # Выход доработки — так же от осевой, с показом смещения
+            # (см. комментарий у захода, v1.7.44).
+            from ..geometry.path_offset import (
+                offset_right_of_travel as _ort_lead2)
+            _axis_src2 = (polypath_for_vis
+                          if (polypath_for_vis and polypath_for_vis.segments)
+                          else polypath)
+            _ax_out, lead_out_collision, _ = plan_lead_out(
+                _axis_src2, req_out,
+                contours_lines_cache, contours_bboxes_cache,
+                geom.id, effective_tool_offset)
+            lead_out_poly = (_ort_lead2(_ax_out, effective_tool_offset)
+                             if _ax_out and _ax_out.segments else None)
+        else:
+            lead_out_poly, lead_out_collision, _ = plan_lead_out(
+                polypath_offset, req_out,
+                contours_lines_cache, contours_bboxes_cache,
+                geom.id, effective_tool_offset)
     
     return {
         'contour': polypath_offset,
