@@ -902,10 +902,11 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         _pside = op.attributes.get('pocket_side', 'OUTSIDE')
         _ppar = normalize_for_side(geom.polypath, _pside)
         _ptot = sum(x.length() for x in _ppar.segments)
-        _pad_v = 0.5
-        _segs_v = _sfwv(_ppar,
-                        (float(op.attributes['pocket_s0']) - _pad_v) % _ptot,
-                        (float(op.attributes['pocket_s1']) + _pad_v) % _ptot)
+        # Концы — до пологих участков, той же функцией, что и в посте.
+        from ..geometry.path_offset import (
+            pocket_fragment_with_gentle_ends as _pfge_v)
+        _segs_v = _pfge_v(_ppar, float(op.attributes['pocket_s0']),
+                          float(op.attributes['pocket_s1']), pad_mm=0.5)
         if not _segs_v:
             return None
         polypath = _PPv(segments=_segs_v, closed=False)

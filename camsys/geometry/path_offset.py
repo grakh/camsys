@@ -4673,3 +4673,51 @@ def repair_c1_iterative(polypath: Polypath,
             break
     
     return Polypath(segments=result, closed=polypath.closed)
+
+
+def end_curvature_radius(polypath: Polypath, at_start: bool) -> float:
+    """Радиус кривизны на конце фрагмента, мм (линия — бесконечность).
+
+    Лид садится на КРАЙНИЙ сегмент. Если это дуга малого радиуса —
+    бугор, и заход с него сразу уходит в металл.
+    """
+    if not polypath or not polypath.segments:
+        return float('inf')
+    edge = polypath.segments[0] if at_start else polypath.segments[-1]
+    return edge.radius if isinstance(edge, Arc) else float('inf')
+
+
+def pocket_fragment_with_gentle_ends(parent: Polypath, s0: float, s1: float,
+                                     pad_mm: float = 0.5,
+                                     r_min_mm: float = 1.5,
+                                     pad_max_mm: float = 5.0):
+    """Фрагмент кармана, продлённый до ПОЛОГИХ концов (v1.7.47).
+
+    Лид доработки начинается на краю фрагмента. Если край попал на бугор
+    — дугу малого радиуса, — заход сходит с него прямо в лезвие: ровно
+    это видно на угле 10 заказа 124173, где кончик лида оказался в
+    0.474 мм от лезвия при полуширине реза 0.550.
+
+    Поэтому концы отодвигаются вдоль контура, пока оба не выйдут на
+    пологий участок (радиус кривизны >= r_min_mm). Тот же приём уже
+    применялся к 2D-углам во вьювере; карманы шли с фиксированным
+    запасом 0.5 мм и этой защиты не имели.
+
+    Returns:
+        список сегментов; пустой, если фрагмент не построился.
+    """
+    total = sum(x.length() for x in parent.segments)
+    if total <= 0:
+        return []
+    pad = pad_mm
+    segs = _subpath_forward(parent, (s0 - pad) % total, (s1 + pad) % total)
+    while pad < pad_max_mm:
+        if not segs:
+            break
+        frag = Polypath(segments=segs, closed=False)
+        if (end_curvature_radius(frag, True) >= r_min_mm
+                and end_curvature_radius(frag, False) >= r_min_mm):
+            break
+        pad = min(pad + 0.5, pad_max_mm)
+        segs = _subpath_forward(parent, (s0 - pad) % total, (s1 + pad) % total)
+    return segs

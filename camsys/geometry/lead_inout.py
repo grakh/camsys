@@ -544,7 +544,7 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
                     path_is_cutter: bool = False):
     """Подбирает лид доработки так, чтобы фреза НЕ доставала до геометрии.
 
-    Два условия (v1.7.40):
+    Три условия (1–2 с v1.7.40, 3-е с v1.7.47):
 
     1. Лид не пересекает контур ножа. Прежний замер исключал «свою»
        стенку на 2 мм вокруг точки стыка — а лид пересекал именно её,
@@ -554,11 +554,21 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
     2. До ЧУЖИХ стенок (дальше по контуру, плюс соседние ножи) остаётся
        не меньше `cut_half_width + margin_mm`.
 
-    Если условия не выполняются, лид сначала УКОРАЧИВАЕТСЯ, а затем
-    становится более пологим (угол захода уменьшается): пологий лид
-    уходит вдоль пути и не перелезает через стенку. Сторона реза
-    меняется в последнюю очередь — слева по ходу стоит металл, который
-    этот проход не снимает.
+    3. КОНЧИК лида (точка врезания) — не ближе `cut_half_width +
+       margin_mm` к любому металлу рядом, без исключений: именно это
+       видно на картинке как «расстояние от кончика до лезвия».
+
+    Перебор идёт от исходных значений В ОБЕ стороны. Укорочение тянет
+    кончик К стыку, то есть К металлу, поэтому условие 3 выполняется
+    УДЛИНЕНИЕМ и увеличением угла, а пересечения (условие 1) —
+    укорочением и пологостью. Сторона реза меняется в последнюю
+    очередь — слева по ходу стоит металл, который этот проход не
+    снимает.
+
+    Если ни один вариант не выполняет все три условия, возвращается
+    лучший по приоритету: не режет геометрию → не налезает на чужую
+    стенку → кончик дальше от металла. Зазор при этом отрицательный —
+    пост пишет такое место в журнал как требующее ручной правки.
 
     `path_is_cutter` — переданный лид УЖЕ является путём фрезы (так его
     строит вьювер: от эквидистанты). Тогда его не смещают второй раз для
@@ -580,6 +590,15 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
     walls = [[q for _s, q in cpts]]
     # Чужие стенки — для замера зазора
     reach = line_length + arc_radius + cut_half_width + 1.0
+    # Весь металл рядом — для проверки КОНЧИКА (без исключений)
+    all_metal = [q for _s, q in cpts
+                 if abs(q[0] - point[0]) < reach
+                 and abs(q[1] - point[1]) < reach]
+    for _nb0 in (neighbours or ()):
+        for _s0, _q0 in _cached_points(_nb0, 0.05):
+            if (abs(_q0[0] - point[0]) < reach
+                    and abs(_q0[1] - point[1]) < reach):
+                all_metal.append(_q0)
     far = [q for s, q in cpts
            if min((s - s_att) % ctot, (s_att - s) % ctot) > 2.0
            and abs(q[0] - point[0]) < reach and abs(q[1] - point[1]) < reach]
@@ -636,7 +655,21 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
             out.append((x1 + nx * cut_half_width, y1 + ny * cut_half_width))
         return out
 
-    def ok(lpts):
+    def evaluate(lpts):
+        """Замер варианта лида.
+
+        Returns:
+            None, если вариант не построился, иначе
+            (пересекает ли геометрию, зазор от КОНЧИКА до металла,
+             зазор от всего лида до ЧУЖИХ стенок) — всё в мм.
+
+        Раньше здесь был `ok()`, который возвращал None на первом же
+        невыполненном условии. Из-за этого аварийный выбор «лучшего»
+        варианта (v1.7.47) видел только зазор кончика и мог взять лид,
+        который налезает на чужую стенку: в заказе 124173 такой лид
+        подходил к ней на −290 мкм. Теперь меряются все три величины,
+        а приоритет условий задан при переборе.
+        """
         if not lpts:
             return None
         # 1. ПУТЬ ФРЕЗЫ не пересекает геометрию. Мерить по осевой нельзя:
@@ -646,7 +679,10 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
         #    на контуре, она его и обрабатывает.
         cpath = cutter(lpts)
         eps = max(attach_eps, cut_half_width * 1.2)
+        crosses = False
         for i in range(len(cpath) - 1):
+            if crosses:
+                break
             a, b = cpath[i], cpath[i + 1]
             if (math.hypot(a[0] - point[0], a[1] - point[1]) < eps
                     or math.hypot(b[0] - point[0], b[1] - point[1]) < eps):
@@ -657,8 +693,20 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
                     if abs(c[0] - a[0]) > reach or abs(c[1] - a[1]) > reach:
                         continue
                     if _seg_cross(a, b, c, d):
-                        return None
-        # 2. зазор до чужих стенок
+                        crosses = True
+                        break
+                if crosses:
+                    break
+        # 2. КОНЧИК (точка врезания) — не ближе полуширины реза к любому
+        #    металлу, без исключений (v1.7.47). Это и есть то, что видно
+        #    на картинке: «расстояние от кончика до лезвия». Укорочение
+        #    тянет кончик К стыку, то есть К металлу, поэтому выполняется
+        #    это условие удлинением и увеличением угла — см. перебор ниже.
+        _tipp = lpts[-1] if is_exit else lpts[0]
+        _dt = min((math.hypot(q[0] - _tipp[0], q[1] - _tipp[1])
+                   for q in all_metal), default=reach)
+
+        # 3. зазор до чужих стенок
         worst = reach
         for p in lpts:
             for q in far:
@@ -670,15 +718,48 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
         # В 1.7.45 флаг path_is_cutter убирал вычитание — требование «не
         # ближе эквидистанты» превращалось в «не ближе 0.05 мм», и во
         # вьювере укорочение вообще не срабатывало.
-        clr = worst - cut_half_width
-        return clr if clr >= margin_mm else None
+        return crosses, _dt, worst - cut_half_width
 
     other = 'left' if prefer == 'right' else 'right'
+    # Порядок перебора (v1.7.47): кончик уводится от металла ДЛИНОЙ и
+    # КРУТИЗНОЙ, а пересечения лечатся укорочением и пологостью. Поэтому
+    # идём от исходных значений в обе стороны.
+    _angles = (angle_deg, angle_deg * 1.3, angle_deg * 1.6,
+               min(85.0, angle_deg * 1.9), angle_deg * 0.7,
+               angle_deg * 0.5, angle_deg * 0.35)
+    _shrinks = (1.0, 1.3, 1.6, 2.0, 2.5, 0.8, 0.6, 0.45, 0.3, 0.2, 0.12)
+    _need_tip = cut_half_width + margin_mm
+    best = None
     for side in (prefer, other):
-        for ang in (angle_deg, angle_deg * 0.7, angle_deg * 0.5,
-                    angle_deg * 0.35):
-            for shrink in (1.0, 0.8, 0.6, 0.45, 0.3, 0.2, 0.12):
-                clr = ok(probe(side, shrink, ang))
-                if clr is not None:
+        for ang in _angles:
+            for shrink in _shrinks:
+                ev = evaluate(probe(side, shrink, ang))
+                if ev is None:
+                    continue
+                crosses, tip, clr = ev
+                if not crosses and tip >= _need_tip and clr >= margin_mm:
                     return side, shrink, ang, clr
-    return prefer, 0.12, angle_deg * 0.35, -1.0
+                # Полного решения нет — запоминаем лучший вариант.
+                # Приоритет: (1) не режет геометрию, (2) заходит со
+                # стороны реза, (3) вообще не доходит до чужой стенки,
+                # (4) кончик как можно дальше от металла, (5) запас до
+                # чужой стенки.
+                #
+                # Кончик стоит ВЫШЕ запаса до стенки намеренно: кончик,
+                # не добирающий до полуширины реза, РЕЖЕТ лезвие, а
+                # стенка с зазором 18 мкм вместо 50 — всего лишь тесно.
+                #
+                # Аварийный возврат вырожденной длины ставил кончик
+                # прямо на металл (v1.7.47), выбор только по кончику —
+                # на чужую стенку, а без пункта (2) лид уходил налево,
+                # где стоит металл, который этот проход не снимает.
+                key = (0 if crosses else 1,
+                       1 if side == prefer else 0,
+                       1 if clr > 0 else 0,
+                       tip, clr)
+                if best is None or key > best[0]:
+                    best = (key, side, shrink, ang,
+                            min(clr, tip - cut_half_width))
+    if best is not None:
+        return best[1], best[2], best[3], best[4]
+    return prefer, 1.0, angle_deg, -1.0

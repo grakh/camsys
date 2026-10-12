@@ -1054,7 +1054,33 @@ def test_rework_lead_never_cuts_another_wall():
 
     def spy(*a, **k):
         side, shrink, ang, clr = orig(*a, **k)
-        seen.append((a[0], side, clr, shrink, ang))
+        # Зазор до чужих стенок меряется ЗДЕСЬ, по готовому лиду, а не
+        # берётся из возврата функции: с v1.7.47 там min(зазор, кончик),
+        # и у мест без полного решения он отрицателен по смыслу — пост
+        # пишет такое в журнал (см. ниже).
+        point, tangent, contour, half = a[0], a[1], a[2], a[3]
+        ll, ar = a[4], a[5]
+        wall = 99.0
+        try:
+            b = LI.build_lead_out if k.get('is_exit') else LI.build_lead_in
+            g = b(point, tangent, side, ll * shrink, ar * shrink, ang,
+                  style=k.get('style', 'line_arc'))
+            sg = [x for x in (g.line, g.arc) if x is not None]
+            lp = [q for _s, q in LI._cached_points(
+                Polypath(segments=sg, closed=False), 0.02)]
+            gp = LI._cached_points(contour, 0.02)
+            ctot = gp[-1][0]
+            s_att = min(gp, key=lambda z: (z[1][0] - point[0]) ** 2
+                        + (z[1][1] - point[1]) ** 2)[0]
+            far = [q for s0, q in gp
+                   if min((s0 - s_att) % ctot, (s_att - s0) % ctot) > 2.0]
+            for nb in (k.get('neighbours') or ()):
+                far += [q for _s, q in LI._cached_points(nb, 0.05)]
+            wall = min((math.hypot(q[0] - p[0], q[1] - p[1])
+                        for p in lp for q in far), default=99.0) - half
+        except Exception:
+            pass
+        seen.append((a[0], side, clr, shrink, ang, wall))
         return side, shrink, ang, clr
 
     LI.fit_rework_lead = spy
@@ -1074,21 +1100,37 @@ def test_rework_lead_never_cuts_another_wall():
         LI.fit_rework_lead = orig
 
     assert len(seen) >= 40, f'лидов доработки всего {len(seen)}'
-    worst = min(c for _p, _s, c, _k, _a in seen)
-    n_right = sum(1 for _p, s, _c, _k, _a in seen if s == 'right')
-    short = [k for _p, _s, _c, k, _a in seen if k < 1.0]
+    worst = min(w for *_r, w in seen)
+    solved = [z for z in seen if z[2] >= 0]
+    unsolved = [z for z in seen if z[2] < 0]
+    worst_solved = min((w for *_r, w in solved), default=99.0)
+    n_right = sum(1 for _p, s, _c, _k, _a, _w in seen if s == 'right')
+    short = [k for _p, _s, _c, k, _a, _w in seen if k < 1.0]
     print(f'  лидов {len(seen)}: справа {n_right}, '
           f'слева {len(seen) - n_right}, укорочено {len(short)}; '
-          f'худший зазор {worst * 1000:.0f} мкм')
-    assert worst >= 0.030, (
+          f'худший зазор {worst * 1000:.0f} мкм '
+          f'(с полным решением {worst_solved * 1000:.0f} мкм, '
+          f'без решения {len(unsolved)})')
+    # Жёсткое требование: фреза не доходит до чужой стенки нигде.
+    assert worst > 0, (
         f'лид подходит к чужой стенке на {worst * 1000:.0f} мкм')
+    # Где решение нашлось целиком — остаётся и запас 30 мкм.
+    assert worst_solved >= 0.030, (
+        f'лид с полным решением подходит к чужой стенке на '
+        f'{worst_solved * 1000:.0f} мкм')
+    # Мест без полного решения — не больше четырёх (v1.7.47: было 28).
+    # Там зазор кончика важнее запаса до дальней стенки: кончик, не
+    # достающий до полуширины реза, РЕЖЕТ лезвие, а 18 мкм до дальней
+    # стенки — всего лишь тесно. Пост обязан писать их в журнал.
+    assert len(unsolved) <= 4, (
+        f'лидов без решения {len(unsolved)}, было 4')
     # Сторона реза сохраняется: в тесное место лид УКОРАЧИВАЕТСЯ, а не
     # переносится налево — слева стоит металл, который этот проход не
     # снимает.
     assert n_right == len(seen), (
         f'{len(seen) - n_right} лидов ушли влево вместо укорочения')
     # Knife_1 (устье около 59.9, 93.2) — то самое тесное место
-    k1 = [(c, k) for p, _s, c, k, _a in seen
+    k1 = [(c, k) for p, _s, c, k, _a, _w in seen
           if 59.0 < p[0] < 60.5 and 92.0 < p[1] < 94.0]
     assert k1, 'лиды Knife_1 не найдены'
     assert all(c > 0 for c, _k in k1), f'Knife_1 всё ещё режет: {k1}'

@@ -448,10 +448,13 @@ class MtxAndersonGVM(PostProcessor):
             _pside = op.attributes.get('pocket_side', 'OUTSIDE')
             _ppar = _nfs(geom.polypath, _pside)
             _ptot = sum(x.length() for x in _ppar.segments)
-            _pad = 0.5     # выходим на уже снятый металл, чтобы не было уступа
-            _s0 = (float(op.attributes['pocket_s0']) - _pad) % _ptot
-            _s1 = (float(op.attributes['pocket_s1']) + _pad) % _ptot
-            _segs = _sfw(_ppar, _s0, _s1)
+            # Концы фрагмента отодвигаются до ПОЛОГИХ участков (v1.7.47):
+            # лид начинается на краю, и если край попал на бугор — заход
+            # сходит с него прямо в лезвие.
+            from ..geometry.path_offset import (
+                pocket_fragment_with_gentle_ends as _pfge)
+            _segs = _pfge(_ppar, float(op.attributes['pocket_s0']),
+                          float(op.attributes['pocket_s1']), pad_mm=0.5)
             if not _segs:
                 return line_no
             polypath = _PP(segments=_segs, closed=False)
@@ -881,6 +884,13 @@ class MtxAndersonGVM(PostProcessor):
             _ll *= _shrink_in
             _ar *= _shrink_in
             _ang = _ang_in
+            if _clr_in < 0:
+                _mach_log(options, geom, tp,
+                          f"ЛИД ДОРАБОТКИ: заход подходит к металлу ближе "
+                          f"полуширины реза на {abs(_clr_in) * 1000:.0f} мкм "
+                          f"({contour_start_point[0]:.1f} "
+                          f"{contour_start_point[1]:.1f}) — места нет ни "
+                          f"длиной, ни углом, нужна ручная правка")
         elif tp.side in (ContourSide.INSIDE, ContourSide.OUTSIDE):
             lead_side = pick_lead_side_for_pass(
                 contour_start_point, contour_start_tangent, _side_ref,
@@ -903,6 +913,13 @@ class MtxAndersonGVM(PostProcessor):
                 tp.exit.approach_angle, is_exit=True, neighbours=_nb,
                 style=('line' if tp.exit.style == LeadStyle.LINE
                        else 'line_arc'))
+            if _clr_out < 0:
+                _mach_log(options, geom, tp,
+                          f"ЛИД ДОРАБОТКИ: выход подходит к металлу ближе "
+                          f"полуширины реза на {abs(_clr_out) * 1000:.0f} мкм "
+                          f"({contour_end_point[0]:.1f} "
+                          f"{contour_end_point[1]:.1f}) — места нет ни "
+                          f"длиной, ни углом, нужна ручная правка")
         elif tp.side in (ContourSide.INSIDE, ContourSide.OUTSIDE):
             lead_out_side = pick_lead_side_for_pass(
                 contour_end_point, contour_end_tangent, _side_ref, tp.side.name,
