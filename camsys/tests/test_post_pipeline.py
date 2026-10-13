@@ -291,6 +291,60 @@ def test_point_at_s_matches_slow_version():
     assert worst < 1e-9, f'точка уехала на {worst * 1000:.4f} мкм'
 
 
+def test_leads_are_real_arcs_not_g12_g13():
+    """Лиды пишутся дугами G2/G3 с радиусом, а не циклами G12/G13.
+
+    Станок обрабатывает канонические циклы G12/G13 не всегда корректно —
+    редко, но выскакивает. Anderson переделал свой пост
+    (AEC_GVM_MTX_3D_V2_17.amp, правка V2_14 от 2026-10-06), и слоты
+    `;50,10` / `;50,15` теперь пишутся шаблоном
+
+        N[N] G2 X[AX] Y[AY] R[R] F[FC] ;50,10 G12
+
+    то есть настоящей дугой; `G12` осталось маркером в конце строки.
+    Эталон нового поста (124173_90_all_R.anc) подтверждает: подача на
+    строке дуги не печатается (модальная, стоит строкой выше), а буква
+    G2 подчиняется модальности — на выходе её нет, если контур
+    закончился дугой того же направления.
+    """
+    import re
+    from camsys.core.cutting_macro import CuttingMacroParams
+    from camsys.post.package_export import PackageExporter
+    p = CuttingMacroParams()
+    p.knife_angle, p.tip_diameter, p.bottom = 90.0, 0.8, 0.25
+    files = PackageExporter(_tri_project(), p).generate(
+        only_stages=('rough_all',))
+    text = list(files.values())[0]
+    lines = text.splitlines()
+
+    # 1. Ни одной команды G12/G13 — только маркеры в конце строки.
+    cmds = [l for l in lines if re.match(r'^N?\d+\s+G1[23]\b', l)]
+    assert not cmds, f'остались команды G12/G13: {cmds[:3]}'
+
+    # 2. Заход и выход — дуги с радиусом и со своими тегами.
+    ins = [l for l in lines if ';50,10' in l or ';60,10' in l]
+    outs = [l for l in lines if ';50,15' in l or ';60,15' in l]
+    assert ins, 'не найдено ни одного захода'
+    assert outs, 'не найдено ни одного выхода'
+    print(f'  заходов {len(ins)}, выходов {len(outs)}')
+    for l in ins + outs:
+        assert re.search(r'\bR\d', l), f'у дуги лида нет радиуса: {l}'
+        # Подача на строке дуги не печатается — она модальная.
+        assert not re.search(r'\bF\d', l), (
+            f'на строке дуги лида напечатана подача: {l}')
+        # Направление и тег обязаны соответствовать друг другу:
+        # блок $50 поста — это G2, $60 — G3.
+        if ';60,' in l:
+            assert ' G2 ' not in f' {l} ', f'тег ;60 при G2: {l}'
+        if ';50,' in l:
+            assert ' G3 ' not in f' {l} ', f'тег ;50 при G3: {l}'
+    # 3. Маркер роли сохранён — по нему оператор читает заход/выход.
+    assert all(l.rstrip().endswith('G12') for l in ins), (
+        'у захода пропал маркер G12')
+    assert all(l.rstrip().endswith('G13') for l in outs), (
+        'у выхода пропал маркер G13')
+
+
 if __name__ == "__main__":
     import inspect
     tests = [(n,f) for n,f in inspect.getmembers(sys.modules[__name__])

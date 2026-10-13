@@ -14,9 +14,9 @@ AEC_GVM_MTX_3D_V2_13.amp. Базируется на эталоне 118917_60_all
        - G0 в точку входа
        - G1 Z=0 F=plunge (опускание на подложку)
        - G42/G41 + начало контура
-       - G12 (плавный вход) если EntryExitConfig.enabled
+       - дуга захода G2/G3 если EntryExitConfig.enabled
        - G1/G2/G3 по сегментам
-       - G13 (плавный выход)
+       - дуга выхода G2/G3
        - Подъём Z
     7. Опционально: сверление меток реперов
     8. Концовка с COR()/ATR()/TRS() и M30
@@ -461,7 +461,7 @@ class MtxAndersonGVM(PostProcessor):
                        line_no: int, options: PostOptions) -> int:
         """Выводит один ToolPath как PART в текущий SHAPE.
         
-        Включает Lead-In (G12) и Lead-Out (G13), если они включены 
+        Включает Lead-In и Lead-Out дугами G2/G3, если они включены 
         в tp.entry / tp.exit (LINE_ARC_TANGENTIAL).
         
         Returns:
@@ -1500,14 +1500,35 @@ class MtxAndersonGVM(PostProcessor):
             line_no += 1
             arc = lead_in_geom.arc
             if arc is not None:
-                # LINE_ARC_TANGENTIAL: дуга G12 (активация компенсации)
-                # См. эталон .amp $50/$60: блоки с "+ IN" эмиттят G12.
-                # Комментарий ;50,10 — маркер из эталонного POST AlphaCAM
-                # (номер строки шаблона Lead-in arc), полезен оператору при
-                # трассировке. Парный ;50,15 идёт на G13 (lead-out arc).
-                g_arc = "G12"
+                # Дуга захода — ОБЫЧНАЯ G2/G3 с радиусом (v1.7.50).
+                #
+                # Раньше здесь был канонический цикл G12: станок сам
+                # достраивал дугу подхода. Он её обрабатывает не всегда
+                # корректно — редко, но выскакивает, поэтому Anderson
+                # переделал свой пост (AEC_GVM_MTX_3D_V2_17.amp,
+                # правка V2_14 от 2026-10-06), и теперь слот `;50,10`
+                # пишется шаблоном
+                #     N[N] G2 X[AX] Y[AY] R[R] F[FC] ;50,10 G12
+                # то есть настоящей дугой, а `G12` осталось в конце
+                # строки комментарием-маркером.
+                #
+                # Направление задаёт сам блок поста: `$50` — это G2,
+                # `$60` — G3, поэтому у дуги против часовой и тег
+                # меняется на `;60,10`. Намотку берём из своей же
+                # геометрии лида.
+                #
+                # `SCLN(2)` со строки дуги ушёл: он стоит строкой выше,
+                # на включении компенсации (G41/G42).
+                # Подача на строке дуги НЕ печатается: она модальная и
+                # уже стоит строкой выше, на включении компенсации.
+                # Маркер `G12` в конце строки сохраняется — по нему
+                # оператор видит, что это заход (эталон 124173_90_all_R
+                # нового поста: `G2 X.. Y.. R1.3 ;50,10 G12`).
+                g_arc = "G3" if arc.ccw else "G2"
+                tag_in = ";60,10 G12" if arc.ccw else ";50,10 G12"
                 w(f"N{line_no} {g_arc} X{self.format_coord(arc.b[0])} "
-                  f"Y{self.format_coord(arc.b[1])} SCLN(2) ;50,10")
+                  f"Y{self.format_coord(arc.b[1])} "
+                  f"R{self.format_coord(arc.radius)} {tag_in}")
                 line_no += 1
             # LINE (Альфакам-стиль): дуги нет, прямая уже доходит до 
             # contour_start_point — больше ничего не нужно.
@@ -1637,10 +1658,22 @@ class MtxAndersonGVM(PostProcessor):
         if lead_out_geom is not None:
             arc = lead_out_geom.arc
             if arc is not None:
-                # LINE_ARC_TANGENTIAL: дуга G13 (деактивация компенсации)
-                g_arc = "G13"
-                w(f"N{line_no} {g_arc} X{self.format_coord(arc.b[0])} "
-                  f"Y{self.format_coord(arc.b[1])} SCLN(1) ;50,15")
+                # Дуга выхода — обычная G2/G3 с радиусом (v1.7.50),
+                # как и заход. Слот `;50,15` в новом посте:
+                #     N[N] G2 X[AX] Y[AY] R[R] F[FC] ;50,15 G13
+                # `SCLN(1)` ушёл на следующую строку (`;40,18`), где он
+                # и так стоит.
+                # G2/G3 здесь МОДАЛЬНЫЙ: если контур закончился дугой
+                # того же направления, буква не печатается. В эталоне
+                # нового поста есть оба варианта — `N503 G2 ... ;50,15
+                # G13` и `N728 X.. R1.3 ;50,15 G13` без G2.
+                g_arc = "G3" if arc.ccw else "G2"
+                g_prefix = f"{g_arc} " if last_g != g_arc else ""
+                tag_out = ";60,15 G13" if arc.ccw else ";50,15 G13"
+                w(f"N{line_no} {g_prefix}X{self.format_coord(arc.b[0])} "
+                  f"Y{self.format_coord(arc.b[1])} "
+                  f"R{self.format_coord(arc.radius)} {tag_out}")
+                last_g = g_arc
                 line_no += 1
             # Прямой отъезд с отменой компенсации G40
             line_end = lead_out_geom.line.b
