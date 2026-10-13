@@ -63,26 +63,80 @@ def _all_segments(prj):
     return out
 
 
-def test_dxf_keeps_arcs_as_arcs():
-    """В DXF дуга остаётся дугой — ни одна не раскладывается в отрезки.
+def _arc_from_bulge(p0, p1, bulge):
+    """Восстанавливает дугу из пары вершин и bulge — обратная операция
+    к записи. Возвращает (радиус, центр, ccw)."""
+    th = 4.0 * math.atan(bulge)
+    d = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+    r = d / (2 * math.sin(abs(th) / 2))
+    mx, my = (p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2
+    h = math.sqrt(max(0.0, r * r - (d / 2) ** 2))
+    ux, uy = -(p1[1] - p0[1]) / d, (p1[0] - p0[0]) / d
+    sgn = 1.0 if (abs(th) <= math.pi) == (th > 0) else -1.0
+    return r, (mx + sgn * h * ux, my + sgn * h * uy), th > 0
 
-    Это и есть причина выбрать DXF, а не PDF: в PDF дуги окружности нет
-    вообще, только Безье, и чужой импортёр приближает их заново.
+
+def _segments_of(polys):
+    """Разворачивает полилинии обратно в сегменты (a, b, bulge)."""
+    out = []
+    for e in polys:
+        vs = e['vertices']
+        n = len(vs)
+        last = n if e.get('closed') else n - 1
+        for k in range(last):
+            a = (vs[k]['10'], vs[k]['20'])
+            b = (vs[(k + 1) % n]['10'], vs[(k + 1) % n]['20'])
+            out.append((a, b, vs[k].get('42', 0.0)))
+    return out
+
+
+def test_dxf_writes_contour_as_one_entity():
+    """Контур — ОДНА полилиния, а не россыпь отдельных сегментов.
+
+    Сначала каждый сегмент писался своей сущностью LINE/ARC. Файл
+    читался, но альфа видела не контур, а сотни отдельных элементов, на
+    каждом своя стрелка направления — работать с таким нельзя
+    (v1.7.52). Полилиния держит контур целым.
     """
     prj = _demo_project()
     ents = parse_dxf_entities(build_dxf(prj))
+    polys = [e for e in ents if e['type'] == 'POLYLINE']
+    singles = [e for e in ents if e['type'] in ('LINE', 'ARC')]
+    n_src = sum(1 for _ in _all_segments(prj))
+    print(f'  сегментов {n_src} -> полилиний {len(polys)}, '
+          f'одиночных сущностей {len(singles)}')
+    assert len(polys) == 2, (
+        f'контуров в проекте 2, а полилиний {len(polys)}')
+    assert not singles, (
+        f'{len(singles)} сегментов выгружены по отдельности — '
+        f'альфа соберёт из них россыпь')
+    assert all(e.get('closed') for e in polys), (
+        'замкнутый контур выгружен разомкнутым')
+    circles = [e for e in ents if e['type'] == 'CIRCLE']
+    assert len(circles) == len(prj.fiducials), (
+        'реперы не выгружены — без них в чужом CAM не привязаться')
+
+
+def test_dxf_keeps_arcs_as_arcs():
+    """Дуга остаётся дугой: у её вершины есть bulge, у прямой — нет.
+
+    bulge = tan(Δθ/4) — это ТОЧНОЕ представление дуги окружности, а не
+    приближение. Именно поэтому DXF, а не PDF: в PDF дуги нет вообще.
+    """
+    prj = _demo_project()
+    polys = [e for e in parse_dxf_entities(build_dxf(prj))
+             if e['type'] == 'POLYLINE']
+    segs = _segments_of(polys)
     src = _all_segments(prj)
     n_arc_src = sum(1 for s in src if isinstance(s, Arc))
-    n_line_src = sum(1 for s in src if isinstance(s, Line))
-    n_arc = sum(1 for e in ents if e['type'] == 'ARC')
-    n_line = sum(1 for e in ents if e['type'] == 'LINE')
-    n_circle = sum(1 for e in ents if e['type'] == 'CIRCLE')
-    print(f'  дуг {n_arc_src} -> {n_arc}, прямых {n_line_src} -> {n_line}, '
-          f'реперов {n_circle}')
-    assert n_arc == n_arc_src, 'дуги потерялись или размножились'
-    assert n_line == n_line_src, 'прямые потерялись или размножились'
-    assert n_circle == len(prj.fiducials), (
-        'реперы не выгружены — без них в чужом CAM не привязаться')
+    n_bulge = sum(1 for _a, _b, bl in segs if abs(bl) > 1e-12)
+    print(f'  сегментов {len(segs)} (ожидалось {len(src)}), '
+          f'с дугой {n_bulge} (ожидалось {n_arc_src})')
+    assert len(segs) == len(src), 'число сегментов изменилось'
+    assert n_bulge == n_arc_src, 'дуги потеряны или появились лишние'
+    for (_a, _b, bl), sg in zip(segs, src):
+        if isinstance(sg, Line):
+            assert abs(bl) <= 1e-12, 'прямая выгружена с кривизной'
 
 
 def test_dxf_geometry_is_exact():
@@ -90,33 +144,43 @@ def test_dxf_geometry_is_exact():
 
     Допуск 0.001 мм = 1 мкм: это допуск биарк-фита и половина допуска на
     разброс высоты вершины (±2 мкм — брак изделия). Реально расхождение
-    на три порядка меньше — только округление записи.
+    на шесть порядков меньше — только округление записи.
+
+    Меряется отклонение САМОЙ КРИВОЙ, а не радиуса: на пологой дуге
+    радиус огромен, и абсолютная ошибка радиуса там ничего не говорит.
     """
     prj = _demo_project()
-    ents = parse_dxf_entities(build_dxf(prj))
+    polys = [e for e in parse_dxf_entities(build_dxf(prj))
+             if e['type'] == 'POLYLINE']
+    segs = _segments_of(polys)
     src = _all_segments(prj)
-    src_l = [s for s in src if isinstance(s, Line)]
-    src_a = [s for s in src if isinstance(s, Arc)]
-    got_l = [e for e in ents if e['type'] == 'LINE']
-    got_a = [e for e in ents if e['type'] == 'ARC']
 
-    worst = 0.0
-    for sg, e in zip(src_l, got_l):
-        worst = max(worst, abs(e['10'] - sg.a[0]), abs(e['20'] - sg.a[1]),
-                    abs(e['11'] - sg.b[0]), abs(e['21'] - sg.b[1]))
-    for sg, e in zip(src_a, got_a):
-        cx, cy, r = e['10'], e['20'], e['40']
-        a0, a1 = math.radians(e['50']), math.radians(e['51'])
-        p0 = (cx + r * math.cos(a0), cy + r * math.sin(a0))
-        p1 = (cx + r * math.cos(a1), cy + r * math.sin(a1))
-        # В DXF дуга идёт ПРОТИВ часовой от начального угла к конечному,
-        # поэтому у нашей дуги по часовой концы переставлены местами.
-        want0, want1 = (sg.a, sg.b) if sg.ccw else (sg.b, sg.a)
-        worst = max(worst, abs(r - sg.radius),
-                    math.hypot(p0[0] - want0[0], p0[1] - want0[1]),
-                    math.hypot(p1[0] - want1[0], p1[1] - want1[1]))
-    print(f'  худшее расхождение: {worst * 1e6:.3f} нм')
-    assert worst < 0.001, f'геометрия уехала на {worst * 1000:.4f} мкм'
+    worst_pt = 0.0
+    worst_curve = 0.0
+    for (a, b, bl), sg in zip(segs, src):
+        worst_pt = max(worst_pt,
+                       math.hypot(a[0] - sg.a[0], a[1] - sg.a[1]),
+                       math.hypot(b[0] - sg.b[0], b[1] - sg.b[1]))
+        if not isinstance(sg, Arc):
+            continue
+        r, c, ccw = _arc_from_bulge(a, b, bl)
+        assert ccw == sg.ccw, 'дуга выгружена в обратную сторону'
+        a0 = math.atan2(a[1] - c[1], a[0] - c[0])
+        a1 = math.atan2(b[1] - c[1], b[0] - c[0])
+        sw = (a1 - a0) % (2 * math.pi)
+        if not ccw:
+            sw -= 2 * math.pi
+        for t in range(21):
+            ang = a0 + sw * t / 20.0
+            p = (c[0] + r * math.cos(ang), c[1] + r * math.sin(ang))
+            worst_curve = max(worst_curve, abs(
+                math.hypot(p[0] - sg.center[0], p[1] - sg.center[1])
+                - sg.radius))
+    print(f'  вершины {worst_pt * 1e6:.3f} нм, кривая '
+          f'{worst_curve * 1e6:.3f} нм')
+    assert worst_pt < 0.001, f'вершины уехали на {worst_pt * 1000:.4f} мкм'
+    assert worst_curve < 0.001, (
+        f'кривая уехала на {worst_curve * 1000:.4f} мкм')
 
 
 def test_dxf_has_layers_and_millimetres():

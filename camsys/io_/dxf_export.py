@@ -45,6 +45,86 @@ def _angle_deg(center: Tuple[float, float], p: Tuple[float, float]) -> float:
     return a + 360.0 if a < 0 else a
 
 
+# Точность bulge — отдельная: это тангенс четверти разворота, и на
+# пологих дугах малая погрешность тут заметно двигает радиус.
+_BPREC = 12
+
+
+def _bulge(seg: Arc) -> float:
+    """Bulge дуги для полилинии: tan(Δθ/4), со знаком (+ против часовой).
+
+    Это ТОЧНОЕ представление дуги окружности, а не приближение: по двум
+    вершинам и bulge восстанавливаются и центр, и радиус.
+    """
+    cx, cy = seg.center
+    a0 = math.atan2(seg.a[1] - cy, seg.a[0] - cx)
+    a1 = math.atan2(seg.b[1] - cy, seg.b[0] - cx)
+    sweep = (a1 - a0) % (2 * math.pi)
+    if not seg.ccw:
+        sweep -= 2 * math.pi
+    return math.tan(sweep / 4.0)
+
+
+def _contiguous_runs(segments, eps: float = 1e-6):
+    """Режет список сегментов на связные куски.
+
+    Полилиния соединяет вершины подряд, поэтому несвязные сегменты в неё
+    складывать нельзя — получится отрезок через всю деталь.
+    """
+    runs: List[List[Any]] = []
+    cur: List[Any] = []
+    for seg in segments:
+        if cur and (abs(seg.a[0] - cur[-1].b[0]) > eps
+                    or abs(seg.a[1] - cur[-1].b[1]) > eps):
+            runs.append(cur)
+            cur = []
+        cur.append(seg)
+    if cur:
+        runs.append(cur)
+    return runs
+
+
+def _polyline_entity(segs, layer: str, closed: bool) -> List[str]:
+    """Контур ОДНОЙ полилинией с bulge-дугами.
+
+    Раньше каждый сегмент писался отдельной сущностью LINE/ARC. Файл
+    читался, но альфа видела не контур, а россыпь из сотен отдельных
+    элементов — на каждом своя стрелка направления, и работать с этим
+    нельзя (v1.7.52). Полилиния держит контур целым И сохраняет дуги
+    точно: bulge — это не аппроксимация.
+    """
+    out: List[str] = []
+    out += _pair(0, "POLYLINE")
+    out += _pair(8, layer)
+    out += _pair(66, 1)                 # дальше идут VERTEX
+    out += _pair(70, 1 if closed else 0)
+    out += _pair(10, _f(0.0))
+    out += _pair(20, _f(0.0))
+    out += _pair(30, _f(0.0))
+
+    n = len(segs)
+    for i, seg in enumerate(segs):
+        out += _pair(0, "VERTEX")
+        out += _pair(8, layer)
+        out += _pair(10, _f(seg.a[0]))
+        out += _pair(20, _f(seg.a[1]))
+        out += _pair(30, _f(0.0))
+        if isinstance(seg, Arc) and seg.radius > 0:
+            out += _pair(42, f"{_bulge(seg):.{_BPREC}f}")
+    if not closed:
+        # Последняя вершина разомкнутого контура — конец последнего
+        # сегмента, иначе он потеряется.
+        last = segs[n - 1]
+        out += _pair(0, "VERTEX")
+        out += _pair(8, layer)
+        out += _pair(10, _f(last.b[0]))
+        out += _pair(20, _f(last.b[1]))
+        out += _pair(30, _f(0.0))
+    out += _pair(0, "SEQEND")
+    out += _pair(8, layer)
+    return out
+
+
 def _arc_entity(seg: Arc, layer: str) -> List[str]:
     """Дуга DXF. В DXF дуга ВСЕГДА идёт против часовой от начального угла
     к конечному, поэтому для нашей дуги по часовой углы меняются местами.
@@ -155,18 +235,23 @@ def build_dxf(project,
             pp = getattr(geom, 'polypath', None)
             if pp is None or not pp.segments:
                 continue
-            for seg in pp.segments:
-                if isinstance(seg, Arc):
-                    # Вырожденная дуга (радиус в ноль) в DXF недопустима.
-                    if seg.radius <= 0:
-                        continue
-                    entities += _arc_entity(seg, lname)
-                    counts['ARC'] += 1
-                elif isinstance(seg, Line):
-                    entities += _line_entity(seg, lname)
-                    counts['LINE'] += 1
-                else:
-                    continue
+            good = [s for s in pp.segments
+                    if isinstance(s, Line)
+                    or (isinstance(s, Arc) and s.radius > 0)]
+            if not good:
+                continue
+            runs = _contiguous_runs(good)
+            for run in runs:
+                # Замкнутым считаем только контур, который замкнут и не
+                # разорван: иначе полилиния соединит концы напрямую.
+                is_closed = bool(getattr(pp, 'closed', False)) and len(runs) == 1
+                if is_closed and (abs(run[-1].b[0] - run[0].a[0]) > 1e-6
+                                  or abs(run[-1].b[1] - run[0].a[1]) > 1e-6):
+                    is_closed = False
+                entities += _polyline_entity(run, lname, is_closed)
+                counts['POLYLINE'] = counts.get('POLYLINE', 0) + 1
+                for seg in run:
+                    counts['ARC' if isinstance(seg, Arc) else 'LINE'] += 1
                 emitted = True
         if emitted and lname not in used_layers:
             used_layers.append(lname)
@@ -234,8 +319,8 @@ def export_project_dxf(project, path: str, **kwargs) -> dict:
         fh.write(text)
     return {
         'path': path,
-        'lines': text.count("\r\nLINE\r\n"),
-        'arcs': text.count("\r\nARC\r\n"),
+        'contours': text.count("\r\nPOLYLINE\r\n"),
+        'vertices': text.count("\r\nVERTEX\r\n"),
         'circles': text.count("\r\nCIRCLE\r\n"),
         'bytes': len(text),
     }
@@ -264,6 +349,37 @@ def parse_dxf_entities(text: str) -> List[dict]:
                 in_entities = True
         elif code == '0' and value == 'ENDSEC':
             in_entities = False
+        elif in_entities and code == '0' and value == 'POLYLINE':
+            ent = {'type': 'POLYLINE', 'vertices': []}
+            j = i + 2
+            while j + 1 < len(rows) and rows[j].strip() != '0':
+                c, v = rows[j].strip(), rows[j + 1].strip()
+                if c == '8':
+                    ent['layer'] = v
+                elif c == '70':
+                    ent['closed'] = bool(int(v) & 1)
+                j += 2
+            # Вершины до SEQEND
+            while j + 1 < len(rows):
+                c, v = rows[j].strip(), rows[j + 1].strip()
+                if c == '0' and v == 'SEQEND':
+                    j += 2
+                    break
+                if c == '0' and v == 'VERTEX':
+                    vx = {}
+                    k = j + 2
+                    while k + 1 < len(rows) and rows[k].strip() != '0':
+                        c2, v2 = rows[k].strip(), rows[k + 1].strip()
+                        if c2 in ('10', '20', '42'):
+                            vx[c2] = float(v2)
+                        k += 2
+                    ent['vertices'].append(vx)
+                    j = k
+                    continue
+                j += 2
+            out.append(ent)
+            i = j
+            continue
         elif in_entities and code == '0' and value in ('LINE', 'ARC', 'CIRCLE'):
             ent: dict = {'type': value}
             j = i + 2

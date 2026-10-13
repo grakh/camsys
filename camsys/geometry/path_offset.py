@@ -1494,10 +1494,80 @@ def corner_pad_for_angle(interior_angle_deg: float,
     return max(min_pad_mm, min(max_pad_mm, main_half_width / half + extra_mm))
 
 
+def _support_intersections(seg) -> Tuple[str, tuple]:
+    """Опора сегмента: прямая (точка + направление) или окружность."""
+    if isinstance(seg, Arc):
+        return 'circle', (seg.center, seg.radius)
+    dx, dy = seg.b[0] - seg.a[0], seg.b[1] - seg.a[1]
+    L = math.hypot(dx, dy)
+    if L < 1e-12:
+        return 'none', ()
+    return 'line', (seg.a, (dx / L, dy / L))
+
+
+def _intersect_supports(s1, s2) -> List[Point]:
+    """Все точки пересечения ОПОР двух сегментов (бесконечных прямых и
+    полных окружностей). Нужно, чтобы продлить оба до общей точки."""
+    k1, d1 = _support_intersections(s1)
+    k2, d2 = _support_intersections(s2)
+    if k1 == 'none' or k2 == 'none':
+        return []
+    if k1 == 'line' and k2 == 'line':
+        (p1, u1), (p2, u2) = d1, d2
+        det = u1[0] * (-u2[1]) - u1[1] * (-u2[0])
+        if abs(det) < 1e-12:
+            return []
+        rx, ry = p2[0] - p1[0], p2[1] - p1[1]
+        t = (rx * (-u2[1]) - ry * (-u2[0])) / det
+        return [(p1[0] + u1[0] * t, p1[1] + u1[1] * t)]
+    if k1 == 'circle' and k2 == 'circle':
+        (c1, r1), (c2, r2) = d1, d2
+        dx, dy = c2[0] - c1[0], c2[1] - c1[1]
+        d = math.hypot(dx, dy)
+        if d < 1e-12 or d > r1 + r2 or d < abs(r1 - r2):
+            return []
+        a = (r1 * r1 - r2 * r2 + d * d) / (2 * d)
+        h2 = r1 * r1 - a * a
+        if h2 < 0:
+            return []
+        h = math.sqrt(h2)
+        xm, ym = c1[0] + a * dx / d, c1[1] + a * dy / d
+        return [(xm + h * dy / d, ym - h * dx / d),
+                (xm - h * dy / d, ym + h * dx / d)]
+    # прямая и окружность
+    if k1 == 'line':
+        (p0, u), (c, r) = d1, d2
+    else:
+        (p0, u), (c, r) = d2, d1
+    fx, fy = p0[0] - c[0], p0[1] - c[1]
+    b = 2 * (fx * u[0] + fy * u[1])
+    cc = fx * fx + fy * fy - r * r
+    disc = b * b - 4 * cc
+    if disc < 0:
+        return []
+    sq = math.sqrt(disc)
+    return [(p0[0] + u[0] * t, p0[1] + u[1] * t)
+            for t in ((-b - sq) / 2, (-b + sq) / 2)]
+
+
+def _with_end(seg, pt: Point):
+    """Тот же сегмент с новым концом."""
+    if isinstance(seg, Arc):
+        return Arc(a=seg.a, b=pt, center=seg.center, ccw=seg.ccw)
+    return Line(a=seg.a, b=pt)
+
+
+def _with_start(seg, pt: Point):
+    if isinstance(seg, Arc):
+        return Arc(a=pt, b=seg.b, center=seg.center, ccw=seg.ccw)
+    return Line(a=pt, b=seg.b)
+
+
 def _round_offset_corners(src: Polypath, offset_segs: List[Segment],
                           offset: float,
                           eps: float = 1e-6,
-                          r_tol: float = 0.01) -> List[Segment]:
+                          r_tol: float = 0.01,
+                          max_miter: float = 12.0) -> List[Segment]:
     """Вставляет дуги обкатки в выпуклых углах эквидистанты (v1.7.48).
 
     Сегменты смещаются КАЖДЫЙ ОТДЕЛЬНО, и в выпуклом углу их концы
@@ -1523,6 +1593,7 @@ def _round_offset_corners(src: Polypath, offset_segs: List[Segment],
         pairs.append((len(segs) - 1, 0))
     out: List[Segment] = []
     inserts: dict = {}
+    miters: dict = {}
     for i, j in pairs:
         p1 = offset_segs[i].b
         p2 = offset_segs[j].a
@@ -1544,16 +1615,44 @@ def _round_offset_corners(src: Polypath, offset_segs: List[Segment],
         # микрон и под допуск не попадает.
         if abs(r1 - offset) > r_tol or abs(r2 - offset) > r_tol:
             continue
+        # ── ОСТРЫЙ УГОЛ, А НЕ ОБКАТКА (v1.7.53) ──
+        # В 1.7.48 сюда ставилась дуга обкатки радиуса смещения. Разрыв
+        # она закрывала и лезвие не резала, но альфа на путях делает
+        # ОСТРЫЕ углы: обе смещённые опоры продлеваются до пересечения.
+        # Пользователь это и показал на своём ноже в альфе.
+        #
+        # На безопасность замена не влияет и даже улучшает её: точка
+        # пересечения лежит ДАЛЬШЕ от вершины, чем дуга (на
+        # смещение/sin(A/2) против смещения), то есть от лезвия
+        # отодвигается, а не приближается.
+        cand = [q for q in _intersect_supports(offset_segs[i], offset_segs[j])
+                if math.hypot(q[0] - v[0], q[1] - v[1]) >= offset - r_tol]
+        if cand:
+            # Из двух корней берём тот, что ближе к самому разрыву, —
+            # второй лежит на другой стороне контура.
+            mid = ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
+            x = min(cand, key=lambda q: (q[0] - mid[0]) ** 2
+                    + (q[1] - mid[1]) ** 2)
+            # Игольчатый угол даёт шип длиной смещение/sin(A/2); дальше
+            # предела он бесполезен и только мешает смотреть.
+            if math.hypot(x[0] - v[0], x[1] - v[1]) <= offset * max_miter:
+                miters[i] = x
+                continue
         a0 = math.atan2(p1[1] - v[1], p1[0] - v[0])
         a1 = math.atan2(p2[1] - v[1], p2[0] - v[0])
         sw = (a1 - a0) % (2 * math.pi)
-        # Обкатка идёт КОРОТКОЙ стороной: разворот выпуклого угла всегда
+        # Запасной путь — дуга обкатки: разворот выпуклого угла всегда
         # меньше 180°, и только короткая дуга лежит снаружи контура.
         ccw = sw < math.pi
         inserts[i] = Arc(a=p1, b=p2, center=v, ccw=ccw)
-    if not inserts:
+    if not inserts and not miters:
         return offset_segs
     for i, sg in enumerate(offset_segs):
+        j = (i + 1) % len(offset_segs)
+        if i in miters:
+            sg = _with_end(sg, miters[i])
+        if (i - 1) % len(offset_segs) in miters:
+            sg = _with_start(sg, miters[(i - 1) % len(offset_segs)])
         out.append(sg)
         if i in inserts:
             out.append(inserts[i])

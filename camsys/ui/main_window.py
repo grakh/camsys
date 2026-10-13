@@ -2844,7 +2844,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_dir = str(base.parent)
         self.statusBar().showMessage(
             f"Геометрия выгружена: {base.name} "
-            f"(прямых {info['lines']}, дуг {info['arcs']}) и {pdf_path.name}",
+            f"(контуров {info['contours']}, вершин {info['vertices']}) "
+            f"и {pdf_path.name}",
             8000)
 
     def action_export(self):
