@@ -1045,7 +1045,7 @@ class MainWindow(QtWidgets.QMainWindow):
         a_export.setShortcut("Ctrl+E")
         a_export.triggered.connect(self.action_export)
 
-        a_export_geom = m_file.addAction("Экспорт &геометрии (DXF + PDF)...")
+        a_export_geom = m_file.addAction("Экспорт &геометрии (DXF)...")
         a_export_geom.triggered.connect(self.action_export_geometry)
 
         m_file.addSeparator()
@@ -2806,16 +2806,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.params_panel.btn_show_paths.setChecked(False)
     
     def action_export_geometry(self):
-        """Выгружает геометрию проекта в DXF и PDF рядом с ней.
+        """Выгружает геометрию проекта в DXF.
 
         Нужно, чтобы доделать деталь отдельно, если на станке что-то
         пошло не так. Выгружается геометрия ПОСЛЕ биарк-фита и слияния
         дуг — ровно та, по которой считался рез. По исходному `.ai` в
         размер не попасть: альфа раскладывает кривые иначе.
 
-        DXF — основной: в нём дуга остаётся дугой и переносится точно.
-        PDF — для глаза и печати: в PDF дуги нет вообще, только Безье,
-        поэтому там приближение (меньше микрона, но оно есть).
+        Формат DXF: в нём дуга остаётся дугой и переносится точно.
+        Выгрузка в PDF была и убрана (v1.7.54): в PDF дуги окружности
+        нет вообще, только кривые Безье, и импорт альфы раскладывал их
+        в частую ломаную — контур приходил рябым, с видимыми фасетами.
         """
         if self.session.project is None:
             QtWidgets.QMessageBox.information(
@@ -2831,12 +2832,9 @@ class MainWindow(QtWidgets.QMainWindow):
         base = Path(path)
         if base.suffix.lower() != ".dxf":
             base = base.with_suffix(".dxf")
-        pdf_path = base.with_suffix(".pdf")
         try:
             from ..io_.dxf_export import export_project_dxf
-            from ..io_.pdf_export import export_project_pdf
             info = export_project_dxf(self.session.project, str(base))
-            export_project_pdf(self.session.project, str(pdf_path))
         except Exception as e:
             QtWidgets.QMessageBox.critical(
                 self, "Экспорт геометрии", f"Не удалось выгрузить:\n{e}")
@@ -2844,8 +2842,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_dir = str(base.parent)
         self.statusBar().showMessage(
             f"Геометрия выгружена: {base.name} "
-            f"(контуров {info['contours']}, вершин {info['vertices']}) "
-            f"и {pdf_path.name}",
+            f"(контуров {info['contours']}, вершин {info['vertices']})",
             8000)
 
     def action_export(self):

@@ -218,7 +218,11 @@ class MtxAndersonGVM(PostProcessor):
         w("N42 CLN(1)")
         w("N43 CLN(CollErr0)")
         w("N44 CLN(DLA80)")
-        w("N45 COR(CAN[SD.WZRec.UD.Ed[1].Geo.Ang],MAN30,FF0.1)")
+        # Eckenspitzenfunktion: вершину угла формирует стойка. То же
+        # число MAN используется геометрией как предел продления опор в
+        # эквидистанте, поэтому берётся из одного места (v1.7.54).
+        from ..geometry.path_offset import CORNER_TIP_ANGLE_DEG as _MAN
+        w(f"N45 COR(CAN[SD.WZRec.UD.Ed[1].Geo.Ang],MAN{_MAN:g},FF0.1)")
         w("N46 ;")
         w("N47 G53 G153 G0 Z50")
         w("N48 ATR()")

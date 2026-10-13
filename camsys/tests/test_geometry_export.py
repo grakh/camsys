@@ -1,4 +1,4 @@
-"""Тесты выгрузки геометрии в DXF и PDF (v1.7.51).
+"""Тесты выгрузки геометрии в DXF (v1.7.51).
 
 Смысл выгрузки: если на станке что-то пошло не так, деталь надо доделать
 отдельно. Для этого нужна ТА ЖЕ геометрия, по которой считался рез, —
@@ -13,7 +13,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
 from camsys.geometry.primitives import Line, Arc, Polypath
 from camsys.io_.dxf_export import (
     build_dxf, parse_dxf_entities, project_bounds)
-from camsys.io_.pdf_export import build_pdf, PT_PER_MM
 
 
 def _demo_project():
@@ -198,67 +197,10 @@ def test_dxf_has_layers_and_millimetres():
     assert text.rstrip().endswith("EOF"), 'файл не закрыт'
 
 
-def test_pdf_arc_error_is_measured_and_small():
-    """В PDF дуга приближается Безье, и приближение КОНТРОЛИРУЕТСЯ.
-
-    У PDF нет дуги окружности. Экспортёр режет дугу, пока ЗАМЕРЕННОЕ
-    отклонение не станет меньше допуска. Проверяем это на дуге большого
-    радиуса — там приближение всего одной кривой дало бы десятки микрон.
-    """
-    from camsys.io_.pdf_export import _arc_bezier_pieces
-    big = Arc(a=(100.0, 0.0), b=(0.0, 100.0), center=(0.0, 0.0), ccw=True)
-    for tol in (0.01, 0.0005):
-        pieces = _arc_bezier_pieces(big, tol)
-        worst = 0.0
-        for p0, p1, p2, p3 in pieces:
-            for i in range(1, 32):
-                t = i / 32.0
-                mt = 1 - t
-                x = (mt ** 3 * p0[0] + 3 * mt * mt * t * p1[0]
-                     + 3 * mt * t * t * p2[0] + t ** 3 * p3[0])
-                y = (mt ** 3 * p0[1] + 3 * mt * mt * t * p1[1]
-                     + 3 * mt * t * t * p2[1] + t ** 3 * p3[1])
-                worst = max(worst, abs(math.hypot(x, y) - 100.0))
-        print(f'  R100, допуск {tol * 1000:.2f} мкм: кусков {len(pieces)}, '
-              f'отклонение {worst * 1000:.4f} мкм')
-        assert worst <= tol * 1.5, (
-            f'приближение дуги {worst * 1000:.3f} мкм при допуске '
-            f'{tol * 1000:.3f} мкм')
-
-
-def test_pdf_is_readable_by_our_own_importer():
-    """PDF читается НАШИМ же импортёром, со слоями.
-
-    Если свой экспорт не грузится обратно, проверить его нечем. Слои
-    пишутся как OCG — той же конструкцией, какую читает `ai_parser`.
-    """
-    import tempfile
-    from camsys.io_.ai_parser import list_layers, get_layer_paths
-    prj = _demo_project()
-    data = build_pdf(prj)
-    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as fh:
-        fh.write(data)
-        path = fh.name
-    try:
-        layers = list_layers(path)
-        print(f'  PDF {len(data)} байт, слои: {layers}')
-        assert 'Knife' in layers, f'слой ножей не виден: {layers}'
-        paths = get_layer_paths(path, 'Knife')
-        assert len(paths) == 2, f'контуров в Knife {len(paths)}, ожидалось 2'
-        # Координаты обязаны быть АБСОЛЮТНЫМИ — теми же, что в `.anc`,
-        # иначе в чужом CAM система координат поедет.
-        xs = [p[0] for pth in paths for p in pth.all_anchors()]
-        ys = [p[1] for pth in paths for p in pth.all_anchors()]
-        assert 9.0 < min(xs) < 11.0, f'X уехал: min {min(xs):.2f}, ждали ~10'
-        assert 19.0 < min(ys) < 21.0, f'Y уехал: min {min(ys):.2f}, ждали ~20'
-    finally:
-        os.unlink(path)
-
-
 def test_export_covers_everything_in_bounds():
     """Габариты считаются с учётом выпуклости дуг, а не только их концов.
 
-    Иначе дуга, выпирающая за свои концы, окажется за краем листа PDF.
+    Иначе дуга, выпирающая за свои концы, окажется за габаритами файла.
     """
     prj = _demo_project()
     x0, y0, x1, y1 = project_bounds(prj)
