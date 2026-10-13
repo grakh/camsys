@@ -749,8 +749,8 @@ class CamSession:
                         op.attributes['stitch_filtered_out'] = prev
 
     def compute_anc_tangents(self, order_number: Optional[str] = None,
-                             only_op_id: Optional[str] = None
-                             ) -> Dict[str, Any]:
+                             only_op_id: Optional[str] = None,
+                             on_part=None) -> Dict[str, Any]:
         """Возвращает точки касания лид-in контурам, извлечённые из
         реально сгенерированного .anc-файла.
 
@@ -768,6 +768,9 @@ class CamSession:
         Args:
             order_number: если задан — применяет stitch-фильтр для
                 этого заказа. Иначе — весь проект.
+            on_part: callable(сделано, всего, имя) — зовётся перед
+                каждым проходом. Нужен GUI, чтобы двигать индикатор
+                подготовки и прокачивать очередь событий (v1.7.48).
             only_op_id: если задан — считает тангенс ТОЛЬКО для этого
                 ножа (остальные BLADE временно исключаются из генерации).
                 Резко ускоряет пересчёт при правке одного выделенного
@@ -834,7 +837,14 @@ class CamSession:
         try:
             exporter = PackageExporter(
                 self.project, self.cutting_params, post_name=self.post_name)
-            files = exporter.generate()
+            if on_part is not None:
+                exporter._on_part = on_part
+            # Нужен ОДИН файл — `_all_R.anc`. Остальные шесть программ
+            # пакета здесь просто выбрасывались: на заказе 124173 (31
+            # нож) полная генерация занимала 395 с, из них 330 с уходило
+            # на выброшенное. А вьювер зовёт это на каждую перестройку
+            # путей — отсюда и «проект очень долго думает» (v1.7.48).
+            files = exporter.generate(only_stages=('rough_all',))
             all_r_content = None
             for name, content in files.items():
                 if '_all_R.anc' in name:

@@ -2532,8 +2532,30 @@ class MainWindow(QtWidgets.QMainWindow):
             prep_progress.setWindowModality(QtCore.Qt.WindowModal)
             prep_progress.setMinimumDuration(0)  # показывать НЕМЕДЛЕННО
             prep_progress.setCancelButton(None)  # отменять нельзя
+            # Диалог не должен закрыться сам, когда полоска дойдёт до
+            # конца: после последнего прохода идёт ещё разбор .anc и
+            # построение путей — окно нужно держать до конца.
+            prep_progress.setAutoClose(False)
+            prep_progress.setAutoReset(False)
             prep_progress.show()
             QtWidgets.QApplication.processEvents()
+
+            # ── ЖИВОЙ ИНДИКАТОР (v1.7.48) ──
+            # Полоска стояла пустой и не двигалась: счёт идёт в GUI-потоке,
+            # и пока он занят, Qt не перерисовывает окно — ни «бегунка»
+            # крутилки, ни чего-либо ещё. Пост теперь зовёт `_tick` перед
+            # каждым проходом: здесь полоска переводится в ЧЕСТНЫЙ режим
+            # (0..всего проходов) и очередь событий прокачивается.
+            # Если проходов почему-то нет — остаётся крутилка (0,0).
+            _prep_state = {'total': 0}
+
+            def _tick(done, total, name=''):
+                if total and total != _prep_state['total']:
+                    _prep_state['total'] = total
+                    prep_progress.setRange(0, total)
+                if total:
+                    prep_progress.setValue(done)
+                QtWidgets.QApplication.processEvents()
 
             extras = {
                 'tool_radius': tool_radius,
@@ -2587,7 +2609,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         _only = self._selected_op_id
                     try:
                         part = self.session.compute_anc_tangents(
-                            order_number=pass_order, only_op_id=_only)
+                            order_number=pass_order, only_op_id=_only,
+                            on_part=_tick)
                         merged_tangents.update(part)
                     except Exception:
                         continue

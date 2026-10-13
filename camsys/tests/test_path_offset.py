@@ -428,3 +428,119 @@ def test_radius_ratio_default_is_two():
     from camsys.geometry.path_offset import merge_segments_to_arcs
     sig = inspect.signature(merge_segments_to_arcs)
     assert sig.parameters['max_radius_ratio'].default == 2.0
+
+# ── Нож заказа 124136: длинный «лист» с острой вершиной 43.3°
+#    и тупым изломом 130.2°. Именно на нём эквидистанта резала лезвие.
+_K124136 = [
+    ('L', (15.3021, 1.2622), (15.2954, 1.2407), None, None),
+    ('A', (15.2954, 1.2407), (15.0408, 0.7345), (13.5861, 1.7833), False),
+    ('A', (15.0408, 0.7345), (14.6484, 0.3406), (13.6134, 1.7637), False),
+    ('A', (14.6484, 0.3406), (14.1623, 0.0906), (13.6004, 1.7816), False),
+    ('A', (14.1623, 0.0906), (13.6239, 0.0), (13.6011, 1.7793), False),
+    ('A', (13.6239, 0.0), (11.5703, 2.4561), (79.2093, 56.925), False),
+    ('A', (11.5703, 2.4561), (9.2977, 5.3872), (89.9286, 65.5571), False),
+    ('A', (9.2977, 5.3872), (7.4825, 7.8942), (95.3308, 69.5884), False),
+    ('A', (7.4825, 7.8942), (5.5502, 10.7319), (104.9216, 76.3238), False),
+    ('A', (5.5502, 10.7319), (2.7301, 15.205), (111.0978, 80.4005), False),
+    ('A', (2.7301, 15.205), (0.0, 19.9655), (115.1947, 82.8653), False),
+    ('L', (0.0, 19.9655), (17.5274, 14.2617), None, None),
+    ('L', (17.5274, 14.2617), (17.5634, 14.2498), None, None),
+    ('A', (17.5634, 14.2498), (18.5922, 13.3798), (17.012, 12.5544), False),
+    ('A', (18.5922, 13.3798), (18.7212, 12.0093), (16.9777, 12.5365), False),
+    ('L', (18.7212, 12.0093), (18.6358, 11.7334), None, None),
+    ('L', (18.6358, 11.7334), (18.4924, 11.2773), None, None),
+    ('L', (18.4924, 11.2773), (18.0669, 9.9337), None, None),
+    ('L', (18.0669, 9.9337), (16.9054, 6.2853), None, None),
+    ('L', (16.9054, 6.2853), (15.3021, 1.2622), None, None),
+]
+
+
+def _knife_124136():
+    segs = []
+    for kind, a, b, c, ccw in _K124136:
+        segs.append(Line(a=a, b=b) if kind == 'L'
+                    else Arc(a=a, b=b, center=c, ccw=ccw))
+    return Polypath(segments=segs, closed=True)
+
+
+def _nearest_dist_fn(points, cell):
+    """Ближайшее расстояние до набора точек через сетку (без numpy)."""
+    import math as _m
+    grid = {}
+    for q in points:
+        grid.setdefault((int(q[0] / cell), int(q[1] / cell)), []).append(q)
+
+    def dist(p):
+        gx, gy = int(p[0] / cell), int(p[1] / cell)
+        best = float('inf')
+        r = 1
+        while True:
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    if max(abs(dx), abs(dy)) != r and r > 1:
+                        continue
+                    for q in grid.get((gx + dx, gy + dy), ()):
+                        d = _m.hypot(q[0] - p[0], q[1] - p[1])
+                        if d < best:
+                            best = d
+            if best <= (r - 1) * cell or r > 40:
+                return best
+            r += 1
+    return dist
+
+
+def test_equidistant_never_cuts_the_blade():
+    """Эквидистанта не подходит к лезвию ближе смещения (v1.7.48).
+
+    Сегменты смещаются КАЖДЫЙ ОТДЕЛЬНО, и в выпуклом углу их концы
+    расходятся: на ноже заказа 124136 при смещении 0.65 мм и угле 43.3°
+    разрыв 1.21 мм. Через разрыв рисовалась ПРЯМАЯ, и она проходила в
+    0.234 мм от лезвия вместо 0.650 — основной путь срезал вершину ножа
+    на 416 мкм. На втором проходе то же на изломе 130.2°, 329 мкм.
+
+    В станке этого нет: в `.anc` идёт осевая плюс G42, и компенсация
+    обкатывает выпуклый угол дугой радиуса смещения. Её и ставим.
+    """
+    import math
+    from geometry.path_offset import (
+        bridge_radii_for_tool, bridge_narrow_pits, offset_polypath_uniform,
+        trim_self_intersections, join_polypath_corners, _exact_axis_points)
+    from geometry.direction import normalize_for_side
+
+    poly = _knife_124136()
+    tip, absd, angle = 0.8, 0.25, 90.0
+    eq = tip + 2 * absd * math.tan(math.radians(angle / 2))
+    off = eq / 2.0
+    r_m, r_b = bridge_radii_for_tool(tip, absd, eq)
+    blade = [q for _s, q in _exact_axis_points(poly, 0.01)[0]]
+    dist = _nearest_dist_fn(blade, off)
+
+    for side, inward in (('INSIDE', False), ('OUTSIDE', True)):
+        pp = normalize_for_side(poly, side)
+        tr, _br = bridge_narrow_pits(pp, r_b, r_mouth=r_m)
+        o = offset_polypath_uniform(tr, off, inward=inward)
+        o = join_polypath_corners(trim_self_intersections(o), tol=0.01)
+
+        worst = min(dist(q) for _s, q in _exact_axis_points(o, 0.01)[0])
+        # Разрывы между сегментами рисуются ПРЯМОЙ — проверяем и их.
+        segs = o.segments
+        worst_gap = 0.0
+        for i in range(len(segs) - 1):
+            A, B = segs[i].b, segs[i + 1].a
+            g = math.hypot(B[0] - A[0], B[1] - A[1])
+            if g <= 0.05:
+                continue
+            worst_gap = max(worst_gap, g)
+            n = max(2, int(g / 0.01))
+            for k in range(n + 1):
+                P = (A[0] + (B[0] - A[0]) * k / n,
+                     A[1] + (B[1] - A[1]) * k / n)
+                worst = min(worst, dist(P))
+        print(f'  {side}: ближайшая к лезвию {worst:.4f} мм '
+              f'(надо {off:.3f}), худший разрыв {worst_gap:.2f} мм')
+        assert worst_gap < 0.05, (
+            f'{side}: в эквидистанте разрыв {worst_gap:.2f} мм — '
+            f'его нарисуют прямой через лезвие')
+        assert worst > off - 0.003, (
+            f'{side}: эквидистанта врезается в лезвие на '
+            f'{(off - worst) * 1000:.0f} мкм')

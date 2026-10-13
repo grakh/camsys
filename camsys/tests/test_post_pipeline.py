@@ -174,6 +174,123 @@ def test_compare_to_reference():
         print(f'  {k:4} {ref_counts[k]:>8} {gen_counts[k]:>8}  {ratio:.2f}x')
 
 
+def _tri_project():
+    """Треугольный нож с двумя острыми вершинами — быстрый проект
+    для проверки генерации (целый заказ в тестах слишком долгий)."""
+    import math
+    from camsys.geometry.primitives import Line, Polypath
+    from camsys.core.project import Project, Geometry
+    A1, A2 = 18.0, 28.0
+    A3 = 180.0 - A1 - A2
+    c = 60.0
+    a = c * math.sin(math.radians(A1)) / math.sin(math.radians(A3))
+    V = [(0.0, 0.0), (c, 0.0),
+         (c - a * math.cos(math.radians(A2)),
+          -a * math.sin(math.radians(A2)))]
+    poly = Polypath(
+        segments=[Line(a=V[i], b=V[(i + 1) % 3]) for i in range(3)],
+        closed=True)
+    prj = Project(name="TRI")
+    lay = prj.add_layer("Knife")
+    g = Geometry(name="Knife_1", polypath=poly, source_layer="Knife")
+    lay.geometries.append(g)
+    prj.add_blade_operation(g.id)
+    return prj
+
+
+def test_only_stages_generates_nothing_extra():
+    """`only_stages` сужает генерацию, не трогая галки (v1.7.48).
+
+    Вьюверу от пакета нужен один `_all_R.anc` — ради точек касания
+    лидов. Он же генерировал все семь программ и шесть выбрасывал: на
+    заказе 124173 это 395 с вместо 65, и так на КАЖДУЮ перестройку
+    путей. Отсюда «проект очень долго думает».
+    """
+    from camsys.core.cutting_macro import CuttingMacroParams
+    from camsys.post.package_export import PackageExporter
+    p = CuttingMacroParams()
+    p.knife_angle, p.tip_diameter, p.bottom = 90.0, 0.8, 0.25
+    full = PackageExporter(_tri_project(), p).generate()
+    one = PackageExporter(_tri_project(), p).generate(
+        only_stages=('rough_all',))
+    print(f'  весь пакет: {len(full)} файлов, only_stages: {len(one)}')
+    assert len(one) == 1, f'ожидался один файл, получено {sorted(one)}'
+    name = list(one)[0]
+    assert '_all_R.anc' in name, name
+    # Содержимое того же файла не должно зависеть от фильтра — иначе
+    # вьювер и экспорт разъехались бы. Сравниваем без строки с датой.
+    def body(t):
+        return [ln for ln in t.splitlines()
+                if 'NC-Program created on' not in ln]
+    assert body(one[name]) == body(full[name]), (
+        'с фильтром _all_R.anc получился другим')
+
+
+def test_post_reports_progress_per_pass():
+    """Пост зовёт `on_part` перед каждым проходом (v1.7.48).
+
+    Без этого GUI-поток занят счётом, Qt не перерисовывает окно, и
+    индикатор подготовки стоит пустым — «висит не двигаясь».
+    """
+    from camsys.core.cutting_macro import CuttingMacroParams
+    from camsys.post.package_export import PackageExporter
+    p = CuttingMacroParams()
+    p.knife_angle, p.tip_diameter, p.bottom = 90.0, 0.8, 0.25
+    ticks = []
+    ex = PackageExporter(_tri_project(), p)
+    ex._on_part = lambda done, total, name='': ticks.append((done, total))
+    ex.generate(only_stages=('rough_all',))
+    print(f'  тиков {len(ticks)}, всего проходов '
+          f'{ticks[0][1] if ticks else 0}')
+    assert ticks, 'пост не отчитался ни одним проходом'
+    total = ticks[0][1]
+    assert total > 0, 'общее число проходов не посчитано'
+    assert [d for d, _t in ticks] == list(range(len(ticks))), (
+        'счётчик проходов идёт не по порядку')
+    assert len(ticks) == total, (
+        f'тиков {len(ticks)}, а проходов заявлено {total}')
+
+
+def test_point_at_s_matches_slow_version():
+    """Индекс длин не сдвигает точку на контуре (v1.7.48).
+
+    `_point_at_s` раньше на каждый вызов складывал длины всех сегментов
+    заново. Обрезка карманов делала 157 тысяч таких вызовов и 63
+    миллиона `Arc.length()`. Теперь длины считаются один раз, но ТОЧКА
+    обязана получаться та же — на ней стоит устье моста, а это микроны.
+    """
+    import math
+    from camsys.geometry.primitives import Line, Arc, Polypath
+    from camsys.geometry.path_offset import _point_at_s, _length_index
+    segs = [Line(a=(0, 0), b=(10, 0)),
+            Arc(a=(10, 0), b=(12, 2), center=(10, 2), ccw=False),
+            Line(a=(12, 2), b=(12, 9)),
+            Arc(a=(12, 9), b=(0, 9), center=(6, 9), ccw=False),
+            Line(a=(0, 9), b=(0, 0))]
+    poly = Polypath(segments=segs, closed=True)
+    total = sum(s.length() for s in segs)
+    idx = _length_index(poly)
+    assert abs(idx[2] - total) < 1e-9, 'индекс насчитал другую длину'
+    worst = 0.0
+    for k in range(2000):
+        s = total * k / 2000.0
+        # медленный эталон — как было до v1.7.48
+        c = 0.0
+        ref = None
+        for seg in segs:
+            L = seg.length()
+            if c + L >= s - 1e-12:
+                from camsys.geometry.path_offset import _seg_point_at
+                ref = _seg_point_at(seg, 0.0 if L < 1e-12 else (s - c) / L)
+                break
+            c += L
+        got = _point_at_s(poly, s, idx)
+        worst = max(worst, math.hypot(got[0] - ref[0], got[1] - ref[1]))
+    print(f'  максимальное расхождение с медленной версией: '
+          f'{worst * 1e6:.3f} нм')
+    assert worst < 1e-9, f'точка уехала на {worst * 1000:.4f} мкм'
+
+
 if __name__ == "__main__":
     import inspect
     tests = [(n,f) for n,f in inspect.getmembers(sys.modules[__name__])

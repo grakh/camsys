@@ -50,13 +50,23 @@ class PackageExporter:
     #  ОСНОВНОЙ МЕТОД
     # ─────────────────────────────────────────────────────────────────────
     
-    def generate(self, progress_callback=None) -> Dict[str, str]:
+    def generate(self, progress_callback=None,
+                 only_stages=None) -> Dict[str, str]:
         """Возвращает словарь {имя_файла: содержимое}.
         
         Args:
             progress_callback: опциональный callable(current, total, stage_name) -> bool.
                 Вызывается перед началом каждого этапа генерации. current=N-1, 
                 total=число включённых этапов. Возвращает False → отмена.
+            only_stages: если задан — множество имён этапов, которые
+                реально нужны вызывающему ('rough_all', 'rough_revers',
+                'finish_group', 'sv', 'corner', 'corner3d'). Остальные
+                пропускаются. Галки пользователя при этом НЕ меняются:
+                фильтр только сужает, включить выключенный этап им
+                нельзя. Нужен вьюверу (v1.7.48): ему от всего пакета
+                нужен один `_all_R.anc` ради точек касания лидов, а
+                генерация остальных шести программ занимала 330 с из
+                395 и каждый раз выбрасывалась.
         """
         files: Dict[str, str] = {}
         
@@ -143,13 +153,15 @@ class PackageExporter:
                     pass
         
         try:
-            return self._generate_impl(files, prefix, angle, progress_callback)
+            return self._generate_impl(files, prefix, angle, progress_callback,
+                                       only_stages)
         finally:
             # Восстанавливаем исходный список операций
             self.project.operations = _all_ops
     
     def _generate_impl(self, files: dict, prefix: str, angle: int,
-                       progress_callback=None) -> Dict[str, str]:
+                       progress_callback=None,
+                       only_stages=None) -> Dict[str, str]:
         from ..core.project import OperationKind
         # ── ПРОВЕРКА СОВМЕСТИМОСТИ ФРЕЗЫ С МАКЕТОМ ──
         # Формула эквидистанты: tip + 2 * bottom * tan(angle/2)
@@ -187,13 +199,23 @@ class PackageExporter:
         
         # ── Прогресс: считаем этапы ──
         p = self.params
-        stages = []
-        if p.generate_rough_all:  stages.append('rough_all')
-        if p.generate_reverse:    stages.append('rough_revers')
-        if p.generate_finish_per_op: stages.append('finish_group')
-        if p.generate_sv:         stages.append('sv')
-        if p.generate_corner:     stages.append('corner')
-        if p.generate_corner_3d:  stages.append('corner3d')
+
+        def want(stage: str) -> bool:
+            """Этап включён галкой И нужен вызывающему."""
+            on = {
+                'rough_all': p.generate_rough_all,
+                'rough_revers': p.generate_reverse,
+                'finish_group': p.generate_finish_per_op,
+                'sv': p.generate_sv,
+                'corner': p.generate_corner,
+                'corner3d': p.generate_corner_3d,
+            }[stage]
+            if not on:
+                return False
+            return only_stages is None or stage in only_stages
+
+        stages = [st for st in ('rough_all', 'rough_revers', 'finish_group',
+                                'sv', 'corner', 'corner3d') if want(st)]
         total_stages = len(stages)
         current_stage = [0]  # mutable для closure
         
@@ -204,14 +226,14 @@ class PackageExporter:
             return result if result is not None else True
         
         # ── 1. Черновая всех элементов (_all_R.anc) ──
-        if self.params.generate_rough_all:
+        if want('rough_all'):
             if not _report("Черновая всех"): return files
             name = f"{prefix}_{angle}_all_R.anc"
             content = self._generate_rough_all()
             files[name] = content
         
         # ── 2. Черновая в реверсе (_revers_R.anc) ──
-        if self.params.generate_reverse:
+        if want('rough_revers'):
             if not _report("Реверс черновая"): return files
             name = f"{prefix}_{angle}_revers_R.anc"
             content = self._generate_rough_all(reverse=True)
@@ -228,7 +250,7 @@ class PackageExporter:
         total_n = getattr(self, '_total_blade_count', len(active_blades))
         active_n = len(active_blades)
         use_dop = (
-            self.params.generate_finish_per_op
+            want('finish_group')
             and total_n > 0
             and 0 < active_n < total_n * self.params.dop_threshold_ratio
         )
@@ -237,7 +259,7 @@ class PackageExporter:
         # Детали группируются в программы по накопленной длине путей.
         # Порядок обхода задаётся направлением (горизонталь=строки,
         # вертикаль=столбцы). Длинная строка делится, короткие объединяются.
-        if self.params.generate_finish_per_op and not use_dop:
+        if want('finish_group') and not use_dop:
             if not _report("Чистовые"): return files
             from ..core.macros import assign_program_numbers
             
@@ -271,7 +293,7 @@ class PackageExporter:
                 files[name] = content
         
         # ── 4. 4 угловых элемента для контроля сведения (_SV.anc) ──
-        if self.params.generate_sv:
+        if want('sv'):
             if not _report("4 угловых"): return files
             name = f"{prefix}_{angle}_SV.anc"
             content = self._generate_sv()
@@ -279,7 +301,7 @@ class PackageExporter:
         
         # ── 5. Острые углы тонкой 2D-фрезой (_corner.anc) ──
         # ── 6. Самые острые углы 3D-фрезой (_corner3D.anc) ──
-        if self.params.generate_corner or self.params.generate_corner_3d:
+        if want('corner') or want('corner3d'):
             corner_ops_2d, corner_ops_3d = self._build_corner_operations()
             
             # Перенос lead_override с уже добавленных corner-ops в проекте 
@@ -305,7 +327,7 @@ class PackageExporter:
             corner_ops_2d = [op for op in corner_ops_2d if _corner_not_excluded(op)]
             corner_ops_3d = [op for op in corner_ops_3d if _corner_not_excluded(op)]
             
-            if self.params.generate_corner:
+            if want('corner'):
                 if not _report("Углы 2D"): return files
                 name = f"{prefix}_{angle}_corner.anc"
                 if corner_ops_2d:
@@ -317,7 +339,7 @@ class PackageExporter:
                     )
                 files[name] = content
             
-            if self.params.generate_corner_3d:
+            if want('corner3d'):
                 if not _report("Углы 3D"): return files
                 name = f"{prefix}_{angle}_corner3D.anc"
                 if corner_ops_3d:
@@ -415,6 +437,14 @@ class PackageExporter:
         if not hasattr(self, 'machinability_report'):
             self.machinability_report = []
         opts.extras['machinability_report'] = self.machinability_report
+        # ── Тик прогресса на каждый проход (v1.7.48) ──
+        # Подготовка данных во вьювере блокирует GUI-поток, и Qt не
+        # перерисовывает окно: «градусник» стоял пустым и выглядел
+        # зависшим. Пост зовёт этот колбэк перед каждым проходом, GUI
+        # двигает полоску и прокачивает очередь событий.
+        _op = getattr(self, '_on_part', None)
+        if _op is not None:
+            opts.extras['on_part'] = _op
         # Эквидистанта ТОНКОЙ фрезы T3 (v1.7.29). Пост её не получал, и
         # лиды угловых проходов масштабировались по ОСНОВНОЙ фрезе —
         # выходили примерно на четверть длиннее, чем нужно, и дотягивались

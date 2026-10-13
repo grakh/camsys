@@ -291,7 +291,23 @@ class MtxAndersonGVM(PostProcessor):
         
         # Группируем операции по sequence_number в SHAPE'ы
         shape_groups = self._group_by_shape(project)
-        
+
+        # ── ТИК ПРОГРЕССА (v1.7.48) ──
+        # Один проход — один тик. GUI на нём двигает полоску и прокачивает
+        # очередь событий: без этого поток занят счётом, Qt не
+        # перерисовывает окно, и «градусник» выглядит зависшим. Общее
+        # число проходов известно заранее — считаем до генерации, чтобы
+        # полоска была ЧЕСТНОЙ, а не бегущей по кругу.
+        _on_part = options.extras.get('on_part')
+        _parts_total = 0
+        if _on_part is not None:
+            for _sn, _ops in shape_groups:
+                for _o in _ops:
+                    if not _o.enabled or _o.kind == OperationKind.FIDUCIAL_DRILL:
+                        continue
+                    _parts_total += sum(1 for _t in _o.toolpaths if _t.visible)
+        _parts_done = [0]
+
         line_no = 96  # счётчик строк N (следующая после #IHOCNS?=TRUE)
         for shape_idx, (shape_num, ops) in enumerate(shape_groups, start=1):
             w(f"{line_no} .SHAPE{shape_num}")
@@ -350,6 +366,13 @@ class MtxAndersonGVM(PostProcessor):
                     if not tp.visible:
                         continue
                     part_num += 1
+                    if _on_part is not None:
+                        try:
+                            _on_part(_parts_done[0], _parts_total,
+                                     getattr(op, 'name', ''))
+                        except Exception:
+                            pass
+                        _parts_done[0] += 1
                     line_no = self._emit_toolpath(
                         out, project, op, tp,
                         shape_num=shape_num, part_num=part_num,
@@ -387,6 +410,39 @@ class MtxAndersonGVM(PostProcessor):
     #  ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
     # ─────────────────────────────────────────────────────────────────────
     
+    def _project_contours_cache(self, project):
+        """Кэш контуров ножей проекта — на ОДИН проект, с проверкой его же.
+
+        Было: `self._contours_cache[id(project)]`. `self` — это синглтон
+        из реестра постов, он живёт всю сессию, а `_generate_rough_all`
+        каждый раз работает с `copy.deepcopy(self.project)` — новый
+        объект, который после генерации освобождается. Python
+        переиспользует адреса, поэтому очередной deepcopy попадал на
+        `id` уже умершего проекта и получал ЧУЖОЙ кэш контуров: лид
+        считался на геометрии другой программы, и точка старта прохода
+        уезжала (v1.7.48, тот же класс ошибки, что в `_cached_points`
+        в v1.7.46).
+
+        Теперь кэш на один проект и хранит ССЫЛКУ на него: пока запись
+        жива, адрес занят и переиспользован быть не может, а смена
+        проекта сравнением `is` ловится сразу.
+        """
+        from ..geometry.lead_collision import build_contours_cache
+        from ..core.project import OperationKind
+        entry = getattr(self, '_contours_cache_entry', None)
+        if entry is not None and entry[0] is project:
+            return entry[1]
+        all_geoms = []
+        for other_op in project.operations:
+            if other_op.kind == OperationKind.BLADE_FORMING:
+                for gid in other_op.geometry_ids:
+                    g_other = project.get_geometry(gid)
+                    if g_other is not None and g_other.is_closed:
+                        all_geoms.append(g_other)
+        data = build_contours_cache(all_geoms)
+        self._contours_cache_entry = (project, data)
+        return data
+
     def _group_by_shape(self, project):
         """Группирует операции по их sequence_number → SHAPE.
         
@@ -948,29 +1004,18 @@ class MtxAndersonGVM(PostProcessor):
         
         # Bbox'ы СОСЕДНИХ ножей на листе (для проверки OUTSIDE заходов)
         # Кэшируется на уровне проекта чтобы не пересчитывать для каждого PART
-        if not hasattr(self, '_neighbor_bboxes_cache'):
-            self._neighbor_bboxes_cache = {}
-        cache_key = id(project)
-        if cache_key not in self._neighbor_bboxes_cache:
-            neighbors = []
-            for other_op in project.operations:
-                if other_op is op or other_op.kind != OperationKind.BLADE_FORMING:
-                    continue
-                for gid in other_op.geometry_ids:
-                    g_other = project.get_geometry(gid)
-                    if g_other and g_other.polypath:
-                        neighbors.append(polypath_bbox(g_other.polypath))
-            self._neighbor_bboxes_cache[cache_key] = neighbors
-        else:
-            # Пересчитаем без текущей операции
-            neighbors = []
-            for other_op in project.operations:
-                if other_op is op or other_op.kind != OperationKind.BLADE_FORMING:
-                    continue
-                for gid in other_op.geometry_ids:
-                    g_other = project.get_geometry(gid)
-                    if g_other and g_other.polypath:
-                        neighbors.append(polypath_bbox(g_other.polypath))
+        # Соседи считаются БЕЗ текущей операции, поэтому кэш по проекту
+        # всё равно не переиспользовался — ветки if и else были одинаковы,
+        # а словарь по `id(project)` ещё и держал чужие данные (см.
+        # `_project_contours_cache`). Убрали (v1.7.48).
+        neighbors = []
+        for other_op in project.operations:
+            if other_op is op or other_op.kind != OperationKind.BLADE_FORMING:
+                continue
+            for gid in other_op.geometry_ids:
+                g_other = project.get_geometry(gid)
+                if g_other and g_other.polypath:
+                    neighbors.append(polypath_bbox(g_other.polypath))
         
         def _point_safely_inside(p):
             """True если точка валидна для INSIDE захода.
@@ -1145,18 +1190,8 @@ class MtxAndersonGVM(PostProcessor):
             
             # Кеш контуров для коллизий — все замкнутые ножи проекта. 
             # Кешируется на уровне self для переиспользования между toolpath'ами.
-            if not hasattr(self, '_contours_cache') or id(project) not in self._contours_cache:
-                if not hasattr(self, '_contours_cache'):
-                    self._contours_cache = {}
-                all_geoms = []
-                for other_op in project.operations:
-                    if other_op.kind == OperationKind.BLADE_FORMING:
-                        for gid in other_op.geometry_ids:
-                            g_other = project.get_geometry(gid)
-                            if g_other is not None and g_other.is_closed:
-                                all_geoms.append(g_other)
-                self._contours_cache[id(project)] = build_contours_cache(all_geoms)
-            contours_lines_cache, contours_bboxes_cache = self._contours_cache[id(project)]
+            contours_lines_cache, contours_bboxes_cache = \
+                self._project_contours_cache(project)
             
             # Сторона захода:
             # - INSIDE/OUTSIDE: НЕ задаём forced_side, чтобы plan_lead_in 
@@ -1355,19 +1390,8 @@ class MtxAndersonGVM(PostProcessor):
             )
             
             # Тот же кеш контуров — может быть уже построен в lead-in блоке
-            if not hasattr(self, '_contours_cache') or id(project) not in self._contours_cache:
-                from ..geometry.lead_collision import build_contours_cache
-                if not hasattr(self, '_contours_cache'):
-                    self._contours_cache = {}
-                all_geoms = []
-                for other_op in project.operations:
-                    if other_op.kind == OperationKind.BLADE_FORMING:
-                        for gid in other_op.geometry_ids:
-                            g_other = project.get_geometry(gid)
-                            if g_other is not None and g_other.is_closed:
-                                all_geoms.append(g_other)
-                self._contours_cache[id(project)] = build_contours_cache(all_geoms)
-            contours_lines_cache, contours_bboxes_cache = self._contours_cache[id(project)]
+            contours_lines_cache, contours_bboxes_cache = \
+                self._project_contours_cache(project)
             
             _lead_out_poly, _coll_out, lead_out_geom = plan_lead_out(
                 polypath, req_out,

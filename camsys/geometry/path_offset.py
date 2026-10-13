@@ -12,6 +12,7 @@ geometry/path_offset.py — операции над Polypath по парамет
 from __future__ import annotations
 from typing import List, Tuple, Optional
 import math
+import bisect
 
 from .primitives import Line, Arc, Polypath, Segment, Point, EPS
 from .direction import is_ccw
@@ -1449,8 +1450,76 @@ def offset_polypath_uniform(polypath: Polypath, offset: float,
             ))
         else:
             new_segments.append(seg)
-    
+
+    new_segments = _round_offset_corners(
+        polypath, new_segments, abs_offset)
     return Polypath(segments=new_segments, closed=polypath.closed)
+
+
+def _round_offset_corners(src: Polypath, offset_segs: List[Segment],
+                          offset: float,
+                          eps: float = 1e-6,
+                          r_tol: float = 0.01) -> List[Segment]:
+    """Вставляет дуги обкатки в выпуклых углах эквидистанты (v1.7.48).
+
+    Сегменты смещаются КАЖДЫЙ ОТДЕЛЬНО, и в выпуклом углу их концы
+    расходятся: при смещении 0.65 мм и внутреннем угле 43° разрыв
+    получается 1.21 мм. Вьювер рисовал через такой разрыв ПРЯМУЮ — и
+    она проходила в 0.234 мм от лезвия вместо 0.650, то есть на
+    картинке основной путь срезал вершину ножа на 416 мкм (заказ
+    124136, Knife_1, угол 43.3°).
+
+    В станке этого среза нет: в `.anc` пишется ОСЕВАЯ плюс G41/G42, и
+    компенсация обкатывает выпуклый угол дугой радиуса смещения. Эту
+    же дугу и ставим — её центр ровно в исходной вершине, так что все
+    её точки отстоят от лезвия на смещение, ни микроном меньше.
+
+    Вогнутые углы не трогаем: там смещённые сегменты не расходятся, а
+    ПЕРЕСЕКАЮТСЯ, и петлю убирает trim_self_intersections.
+    """
+    segs = src.segments
+    if len(segs) != len(offset_segs) or len(segs) < 2:
+        return offset_segs
+    pairs = [(i, i + 1) for i in range(len(segs) - 1)]
+    if src.closed:
+        pairs.append((len(segs) - 1, 0))
+    out: List[Segment] = []
+    inserts: dict = {}
+    for i, j in pairs:
+        p1 = offset_segs[i].b
+        p2 = offset_segs[j].a
+        if math.hypot(p2[0] - p1[0], p2[1] - p1[1]) <= eps:
+            continue
+        v = segs[i].b          # исходная вершина — она же центр дуги
+        r1 = math.hypot(p1[0] - v[0], p1[1] - v[1])
+        r2 = math.hypot(p2[0] - v[0], p2[1] - v[1])
+        # Оба конца обязаны лежать на окружности радиуса смещения вокруг
+        # вершины. Если нет — это не выпуклый угол (например, стык после
+        # обрезки кармана), и дуга обкатки там не при чём.
+        #
+        # Допуск 0.01 мм — как у `join_polypath_corners`. Нанометровый
+        # допуск здесь не годится: координаты приходят из биарк-фита с
+        # точностью 1 мкм, и стык дуги с дугой сходится не точнее. На
+        # ноже 124136 из-за этого оставался разрыв 0.56 мм на изломе
+        # 130.2°, то есть ровно тот срез лезвия, который и чиним. При
+        # этом стык после обрезки кармана отстоит от вершины на сотни
+        # микрон и под допуск не попадает.
+        if abs(r1 - offset) > r_tol or abs(r2 - offset) > r_tol:
+            continue
+        a0 = math.atan2(p1[1] - v[1], p1[0] - v[0])
+        a1 = math.atan2(p2[1] - v[1], p2[0] - v[0])
+        sw = (a1 - a0) % (2 * math.pi)
+        # Обкатка идёт КОРОТКОЙ стороной: разворот выпуклого угла всегда
+        # меньше 180°, и только короткая дуга лежит снаружи контура.
+        ccw = sw < math.pi
+        inserts[i] = Arc(a=p1, b=p2, center=v, ccw=ccw)
+    if not inserts:
+        return offset_segs
+    for i, sg in enumerate(offset_segs):
+        out.append(sg)
+        if i in inserts:
+            out.append(inserts[i])
+    return out
 
 
 def offset_polypath_shapely_clean(polypath: Polypath, offset: float,
@@ -2299,18 +2368,42 @@ def _seg_point_at(seg, f: float) -> Point:
     return (cx + seg.radius * math.cos(ang), cy + seg.radius * math.sin(ang))
 
 
-def _point_at_s(polypath: Polypath, s: float) -> Point:
-    """Точка контура по длине s (с заворотом). Точно, без хорд."""
-    segs = polypath.segments
-    total = sum(x.length() for x in segs)
-    s = s % total
+def _length_index(polypath: Polypath):
+    """Накопленные длины сегментов: (starts, ends, total).
+
+    Считается ОДИН раз на контур и передаётся в `_point_at_s`. Без него
+    каждый вызов `_point_at_s` заново складывал длины всех сегментов, а
+    `Arc.length()` — это atan2 на каждый вызов. На заказе 124173 обрезка
+    карманов делала 157 тысяч таких вызовов и 63 МИЛЛИОНА `length()`:
+    подготовка данных во вьювере занимала минуту (v1.7.48).
+
+    Контур при этом не меняется — индекс живёт только внутри одного
+    вызова и не кэшируется между ними, поэтому устареть не может.
+    """
+    starts: List[float] = []
+    ends: List[float] = []
     c = 0.0
-    for seg in segs:
-        L = seg.length()
-        if c + L >= s - 1e-12:
-            return _seg_point_at(seg, 0.0 if L < 1e-12 else (s - c) / L)
-        c += L
-    return _seg_point_at(segs[-1], 1.0)
+    for seg in polypath.segments:
+        starts.append(c)
+        c += seg.length()
+        ends.append(c)
+    return starts, ends, c
+
+
+def _point_at_s(polypath: Polypath, s: float, index=None) -> Point:
+    """Точка контура по длине s (с заворотом). Точно, без хорд.
+
+    `index` — результат `_length_index()` для этого же контура. Если не
+    передан, считается на месте (прежнее поведение, O(n) на вызов).
+    """
+    segs = polypath.segments
+    starts, ends, total = index if index is not None else _length_index(polypath)
+    s = s % total
+    i = bisect.bisect_left(ends, s - 1e-12)
+    if i >= len(segs):
+        return _seg_point_at(segs[-1], 1.0)
+    L = ends[i] - starts[i]
+    return _seg_point_at(segs[i], 0.0 if L < 1e-12 else (s - starts[i]) / L)
 
 
 def _subpath_forward(polypath: Polypath, s0: float, s1: float) -> List[Segment]:
@@ -2472,6 +2565,10 @@ def _bridge_one(polypath: Polypath, r_bridge: float,
     n = len(pts)
     if n < 8:
         return polypath, []
+    # Индекс длин — один раз на контур. Поиск устья делает десятки тысяч
+    # обращений `_point_at_s`, и без индекса каждое из них пересчитывало
+    # длины всех сегментов заново (v1.7.48).
+    lidx = _length_index(polypath)
     _rm = float(r_mouth) if (r_mouth and float(r_mouth) > 0) else r_bridge
     diam = 2.0 * _rm
     cell = diam + 0.1
@@ -2531,8 +2628,8 @@ def _bridge_one(polypath: Polypath, r_bridge: float,
                     db = tot_in - da
                     sa = sa0 - da * fine_step_mm
                     sb = sb0 + db * fine_step_mm
-                    A = _point_at_s(polypath, sa)
-                    B = _point_at_s(polypath, sb)
+                    A = _point_at_s(polypath, sa, lidx)
+                    B = _point_at_s(polypath, sb, lidx)
                     if math.hypot(B[0] - A[0], B[1] - A[1]) <= diam - mouth_margin_mm:
                         found = (sa, sb, A, B)
                         break
@@ -2577,7 +2674,8 @@ def _bridge_one(polypath: Polypath, r_bridge: float,
     # Knife_19, 1.2562 на Knife_14, 1.2869 на Knife_10 и 1.2893 на
     # Knife_3. Сдвигаем устье внутрь кармана, пока дуга не перестанет
     # выходить за контур.
-    br = _fit_mouth_to_arc(polypath, br, r_bridge, total, fine_step_mm)
+    br = _fit_mouth_to_arc(polypath, br, r_bridge, total, fine_step_mm,
+                           index=lidx)
     if br is None:
         return polypath, []
     bridges = [br]
@@ -2622,7 +2720,7 @@ def _bridge_one(polypath: Polypath, r_bridge: float,
     _am = _seg_point_at(Arc(a=A, b=B, center=(cx, cy), ccw=ccw), 0.5)
     _ex, _ey = B[0] - A[0], B[1] - A[1]
     _side_arc = _ex * (_am[1] - A[1]) - _ey * (_am[0] - A[0])
-    _pit = _point_at_s(polypath, br['sA'] + br['skip'] * 0.5)
+    _pit = _point_at_s(polypath, br['sA'] + br['skip'] * 0.5, lidx)
     _side_pit = _ex * (_pit[1] - A[1]) - _ey * (_pit[0] - A[0])
     if _side_arc * _side_pit <= 0:
         return polypath, []
@@ -2703,7 +2801,8 @@ def arc_penetration_mm(center, r_bridge: float, A, B, samples) -> float:
 def _fit_mouth_to_arc(polypath: Polypath, br: dict, r_bridge: float,
                       total: float, fine_step_mm: float = 0.002,
                       max_shrink_mm: float = 0.60,
-                      tol_mm: float = 0.0005) -> Optional[dict]:
+                      tol_mm: float = 0.0005,
+                      index=None) -> Optional[dict]:
     """Сдвигает устье внутрь кармана, пока дуга не перестанет резать контур.
 
     Зазор < диаметра фрезы находит, ГДЕ карман, но устье по нему выходит
@@ -2780,8 +2879,8 @@ def _fit_mouth_to_arc(polypath: Polypath, br: dict, r_bridge: float,
         skip = (sb - sa) % total
         if skip < 0.2:
             break
-        A = _point_at_s(polypath, sa)
-        B = _point_at_s(polypath, sb)
+        A = _point_at_s(polypath, sa, index)
+        B = _point_at_s(polypath, sb, index)
         res = _bridge_center(A, B, r_bridge)
         if res is None:
             continue
