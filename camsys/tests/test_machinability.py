@@ -1267,3 +1267,113 @@ def test_rework_lead_cutter_never_crosses_geometry():
     assert full_bad >= 1, 'проверка ничего не ловит — критерий сломан'
     assert fit_bad == 0, (
         f'{fit_bad} лидов режут лезвие даже после подбора')
+
+def test_lead_cutter_never_reaches_another_blade():
+    """Проверка коллизий лидов меряет ПУТЬ ФРЕЗЫ, а не осевую (v1.7.55).
+
+    В `.anc` пишется осевая плюс G41/G42, а металл снимает фреза, центр
+    которой стойка отводит на полуэквидистанту вправо по ходу. Проверка
+    мерила осевую — и центр фрезы оказывался на полуэквидистанту ближе
+    к соседнему лезвию, чем думала проверка.
+
+    Заказ 126387 (99 простых прямоугольников), пятка 1.2, угол 90:
+    осевая проходила в 1.139 мм при требуемых 1.020 — «всё хорошо», а
+    центр фрезы в 0.551 при нужных 0.850, то есть врезание в СОСЕДНЕЕ
+    лезвие на 299 мкм. Так резали 77 заходов и 77 выходов из 198. Флаг
+    коллизии не поднимался ни разу, поэтому автоподбор ничего и не
+    пробовал.
+
+    Свой контур при этом проверяется по-прежнему по осевой: лид к нему
+    пристыкован, фреза идёт ровно по его эквидистанте — она его и режет.
+    """
+    ai = '/mnt/user-data/uploads/126387.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет 126387.ai')
+        return
+    import camsys.geometry.lead_collision as LC
+    import camsys.post.mtx_anderson  # noqa: F401
+    from camsys.core.session import CamSession
+    import camsys.core.macros as macros_mod
+    from camsys.post.package_export import PackageExporter
+    from camsys.geometry.path_offset import _exact_axis_points
+
+    tip = 1.2
+    s = CamSession()
+    s.load_ai(ai)
+    knives = [g for g in s.project.get_layer_by_name('Knife').geometries
+              if g.polypath]
+    for g in knives:
+        s.project.add_blade_operation(g.id)
+    macros_mod.sort_operations_by_grid(s.project)
+    p = s.cutting_params
+    p.knife_angle, p.tip_diameter, p.bottom = 90.0, tip, 0.25
+    half = (tip + 2 * 0.25 * math.tan(math.radians(45))) / 2
+
+    cell = max(1.0, half * 4)
+    grid = {}
+    for g in knives:
+        for _t, q in _exact_axis_points(g.polypath, 0.02)[0]:
+            grid.setdefault((int(q[0] / cell), int(q[1] / cell)), []).append(
+                (q, g.id))
+
+    def nearest(pt, skip):
+        gx, gy = int(pt[0] / cell), int(pt[1] / cell)
+        best = 9e9
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for q, gid in grid.get((gx + dx, gy + dy), ()):
+                    if gid == skip:
+                        continue
+                    d = math.hypot(q[0] - pt[0], q[1] - pt[1])
+                    if d < best:
+                        best = d
+        return best
+
+    leads = []
+    _in, _out = LC.plan_lead_in, LC.plan_lead_out
+
+    def f_in(polypath, req, cl, cb, gid, toff, **k):
+        r = _in(polypath, req, cl, cb, gid, toff, **k)
+        leads.append((r[1], gid))
+        return r
+
+    def f_out(polypath, req, cl, cb, gid, toff, **k):
+        r = _out(polypath, req, cl, cb, gid, toff, **k)
+        leads.append((r[0], gid))
+        return r
+
+    LC.plan_lead_in, LC.plan_lead_out = f_in, f_out
+    try:
+        PackageExporter(s.project, p).generate(only_stages=('rough_all',))
+    finally:
+        LC.plan_lead_in, LC.plan_lead_out = _in, _out
+
+    assert len(leads) >= 100, f'лидов всего {len(leads)}'
+    bad = 0
+    worst = 9e9
+    for lead, gid in leads:
+        if not lead or not getattr(lead, 'segments', None):
+            continue
+        pts = [q for _t, q in _exact_axis_points(lead, 0.02)[0]]
+        cut = []
+        for i in range(len(pts) - 1):
+            x0, y0 = pts[i]
+            x1, y1 = pts[i + 1]
+            dx, dy = x1 - x0, y1 - y0
+            L = math.hypot(dx, dy)
+            if L < 1e-12:
+                continue
+            nx, ny = dy / L, -dx / L
+            cut.append((x0 + nx * half, y0 + ny * half))
+        if not cut:
+            continue
+        d = min(nearest(q, gid) for q in cut)
+        worst = min(worst, d)
+        if d < half - 0.002:
+            bad += 1
+    print(f'  лидов {len(leads)}, режут чужое лезвие {bad}, '
+          f'худший зазор по фрезе {worst:.3f} мм (надо {half:.3f})')
+    assert bad == 0, (
+        f'{bad} лидов режут соседнее лезвие, худший зазор {worst:.3f} мм '
+        f'при нужных {half:.3f}')
+

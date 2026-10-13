@@ -227,12 +227,47 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
             lead_pts.extend(pts)
     if len(lead_pts) < 2:
         return False
-    lead_lines = [(lead_pts[i], lead_pts[i+1]) for i in range(len(lead_pts)-1)]
+    # ── ПРОВЕРЯЕМ ПУТЬ ФРЕЗЫ, А НЕ ОСЕВУЮ (v1.7.55) ──
+    # В `.anc` пишется ОСЕВАЯ плюс G41/G42, а металл снимает фреза,
+    # центр которой стойка отводит на полуэквидистанту вправо по ходу.
+    # Проверка мерила осевую и требовала от неё tool_offset*safety —
+    # но центр фрезы при этом оказывается на tool_offset БЛИЖЕ к
+    # соседнему лезвию. На заказе 126387 с пяткой 1.2 осевая проходила
+    # в 1.139 мм (проверка требовала 1.020 и была довольна), а центр
+    # фрезы — в 0.551 при нужных 0.850: врезание в соседнее лезвие на
+    # 299 мкм, и так у 77 заходов из 198. Флаг коллизии не поднялся ни
+    # разу, поэтому автоподбор ничего и не пробовал.
+    #
+    # Тот же класс ошибки был в лидах доработки и починен в v1.7.45.
+    lead_lines = [(lead_pts[i], lead_pts[i + 1])
+                  for i in range(len(lead_pts) - 1)]
+    cut_lines = []
+    for _i in range(len(lead_pts) - 1):
+        _x0, _y0 = lead_pts[_i]
+        _x1, _y1 = lead_pts[_i + 1]
+        _dx, _dy = _x1 - _x0, _y1 - _y0
+        _L = math.hypot(_dx, _dy)
+        if _L < 1e-12:
+            continue
+        _nx, _ny = _dy / _L * tool_offset, -_dx / _L * tool_offset
+        cut_lines.append(((_x0 + _nx, _y0 + _ny), (_x1 + _nx, _y1 + _ny)))
+    if not lead_lines or not cut_lines:
+        return False
+    # Центр фрезы не должен подходить к ЧУЖОМУ лезвию ближе своего же
+    # радиуса; запас 50 мкм — как у лидов доработки.
+    #
+    # К СВОЕМУ контуру это требование неприменимо: лид к нему и
+    # пристыкован, фреза идёт ровно по его эквидистанте — она его и
+    # режет. Поэтому свой контур проверяется по-старому, по осевой.
+    cut_clear = tool_offset + 0.05
     
     # Lead bbox — для пре-фильтра далёких контуров
     xs = [p[0] for p in lead_pts]
     ys = [p[1] for p in lead_pts]
-    lead_bb = (min(xs), min(ys), max(xs), max(ys))
+    # Габарит берём по ОСЕВОЙ и расширяем на смещение фрезы: путь центра
+    # уходит от осевой на tool_offset в сторону.
+    lead_bb = (min(xs) - tool_offset, min(ys) - tool_offset,
+               max(xs) + tool_offset, max(ys) + tool_offset)
     
     # Адаптивный skip_radius для собственного контура: 0.8 × размер lead'а
     lead_span = max(lead_bb[2]-lead_bb[0], lead_bb[3]-lead_bb[1])
@@ -301,7 +336,7 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
             # стыковки, при пороге пропуска 1.79 мм.
             _near_join = is_own and _ci in _skip_idx
             
-            for (la, lb) in lead_lines:
+            for (la, lb) in (lead_lines if is_own else cut_lines):
                 # 1. Явное пересечение — реальная коллизия, всегда проверяется
                 if _segments_intersect_2d(la, lb, ca, cb):
                     if _near_join:
@@ -322,8 +357,9 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
                 # выпуклого изгиба (тангенс срезает материал).
                 if _near_join:
                     continue
+                _lim = safe_offset if is_own else cut_clear
                 for p in (la, lb, ((la[0]+lb[0])/2, (la[1]+lb[1])/2)):
-                    if _point_to_segment_distance(p, ca, cb) < safe_offset:
+                    if _point_to_segment_distance(p, ca, cb) < _lim:
                         return True
     return False
 
