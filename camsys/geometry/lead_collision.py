@@ -165,7 +165,8 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
                            tool_offset: float,
                            safety_factor: float = 1.2,
                            skip_radius: Optional[float] = None,
-                           contours_bboxes: Optional[List[Tuple[str, Tuple]]] = None
+                           contours_bboxes: Optional[List[Tuple[str, Tuple]]] = None,
+                           path_is_cutter: bool = False
                            ) -> bool:
     """Проверка коллизии lead'а с упрощёнными line-only контурами.
     
@@ -192,6 +193,11 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
         skip_radius: радиус игнорирования сегментов около entry_point 
             на СВОЕМ контуре. None → 2 * safe_offset.
         contours_bboxes: опц. bbox-индекс [(id, (x0,y0,x1,y1))] для prefilter.
+        path_is_cutter: переданный лид УЖЕ построен на эквидистанте, то
+            есть сам является путём фрезы. Так его строит вьювер: он
+            передаёт сюда `polypath_offset`, а не осевую. Тогда смещать
+            второй раз нельзя — получится двойное смещение (v1.7.56).
+            Пост передаёт ОСЕВУЮ и оставляет флаг выключенным.
     
     Returns:
         True если коллизия обнаружена
@@ -241,16 +247,20 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
     # Тот же класс ошибки был в лидах доработки и починен в v1.7.45.
     lead_lines = [(lead_pts[i], lead_pts[i + 1])
                   for i in range(len(lead_pts) - 1)]
-    cut_lines = []
-    for _i in range(len(lead_pts) - 1):
-        _x0, _y0 = lead_pts[_i]
-        _x1, _y1 = lead_pts[_i + 1]
-        _dx, _dy = _x1 - _x0, _y1 - _y0
-        _L = math.hypot(_dx, _dy)
-        if _L < 1e-12:
-            continue
-        _nx, _ny = _dy / _L * tool_offset, -_dx / _L * tool_offset
-        cut_lines.append(((_x0 + _nx, _y0 + _ny), (_x1 + _nx, _y1 + _ny)))
+    if path_is_cutter:
+        cut_lines = lead_lines
+    else:
+        cut_lines = []
+        for _i in range(len(lead_pts) - 1):
+            _x0, _y0 = lead_pts[_i]
+            _x1, _y1 = lead_pts[_i + 1]
+            _dx, _dy = _x1 - _x0, _y1 - _y0
+            _L = math.hypot(_dx, _dy)
+            if _L < 1e-12:
+                continue
+            _nx, _ny = _dy / _L * tool_offset, -_dx / _L * tool_offset
+            cut_lines.append(((_x0 + _nx, _y0 + _ny),
+                              (_x1 + _nx, _y1 + _ny)))
     if not lead_lines or not cut_lines:
         return False
     # Центр фрезы не должен подходить к ЧУЖОМУ лезвию ближе своего же
@@ -266,8 +276,9 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
     ys = [p[1] for p in lead_pts]
     # Габарит берём по ОСЕВОЙ и расширяем на смещение фрезы: путь центра
     # уходит от осевой на tool_offset в сторону.
-    lead_bb = (min(xs) - tool_offset, min(ys) - tool_offset,
-               max(xs) + tool_offset, max(ys) + tool_offset)
+    _bb_pad = 0.0 if path_is_cutter else tool_offset
+    lead_bb = (min(xs) - _bb_pad, min(ys) - _bb_pad,
+               max(xs) + _bb_pad, max(ys) + _bb_pad)
     
     # Адаптивный skip_radius для собственного контура: 0.8 × размер lead'а
     lead_span = max(lead_bb[2]-lead_bb[0], lead_bb[3]-lead_bb[1])
@@ -738,6 +749,7 @@ def plan_lead_in(polypath: Polypath,
                   fallback_safety_factor: float = 1.2,
                   exit_request: Optional[LeadGeometryRequest] = None,
                   overlap: float = 0.0,
+                  path_is_cutter: bool = False,
                   ) -> Tuple[Polypath, Optional[Polypath], bool, object]:
     """ПЛАНИРОВАНИЕ lead-in с ТРЁХФАЗНЫМ подбором безопасности.
     
@@ -762,7 +774,7 @@ def plan_lead_in(polypath: Polypath,
             return lead_crosses_contours(
                 lead, contours_lines, own_geom_id, entry_pt,
                 tool_offset=tool_offset, safety_factor=sf,
-                contours_bboxes=contours_bboxes)
+                contours_bboxes=contours_bboxes, path_is_cutter=path_is_cutter)
         return _check
     
     def _make_scorer(sf):
@@ -806,7 +818,7 @@ def plan_lead_in(polypath: Polypath,
             if lead_crosses_contours(
                     lead_out, contours_lines, own_geom_id, join_pt,
                     tool_offset=tool_offset, safety_factor=sf,
-                    contours_bboxes=contours_bboxes):
+                    contours_bboxes=contours_bboxes, path_is_cutter=path_is_cutter):
                 return True
             # Заход и выход не должны пересекаться между собой (v1.7.17)
             return leads_cross_each_other(lead_in, lead_out)
@@ -936,7 +948,8 @@ def plan_lead_out(polypath: Polypath,
                    own_geom_id: str,
                    tool_offset: float,
                    safety_factor: float = 1.2,
-                   fallback_safety_factor: float = 1.0
+                   fallback_safety_factor: float = 1.0,
+                   path_is_cutter: bool = False
                    ) -> Tuple[Optional[Polypath], bool, object]:
     """ПЛАНИРОВАНИЕ lead-out: построение + проверка коллизии.
     
@@ -957,7 +970,7 @@ def plan_lead_out(polypath: Polypath,
     coll = lead_crosses_contours(
         lead, contours_lines, own_geom_id, join_pt,
         tool_offset=tool_offset, safety_factor=safety_factor,
-        contours_bboxes=contours_bboxes)
+        contours_bboxes=contours_bboxes, path_is_cutter=path_is_cutter)
     
     # Мягкая — для определения «реально ли есть пересечение» (а не просто
     # тесный зазор в пределах safety запаса)
@@ -965,7 +978,7 @@ def plan_lead_out(polypath: Polypath,
         coll = lead_crosses_contours(
             lead, contours_lines, own_geom_id, join_pt,
             tool_offset=tool_offset, safety_factor=fallback_safety_factor,
-            contours_bboxes=contours_bboxes)
+            contours_bboxes=contours_bboxes, path_is_cutter=path_is_cutter)
     
     geom = _polypath_to_lead_geometry(lead, request.is_entry)
     return lead, coll, geom

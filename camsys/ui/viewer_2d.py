@@ -1580,6 +1580,10 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
                 forced_side=None,
             )
         
+        # path_is_cutter: сюда уходит УЖЕ смещённый путь (эквидистанта),
+        # а не осевая — он сам и есть путь фрезы. Пост передаёт осевую,
+        # и проверка смещает её сама. Без этого флага вьювер получал
+        # двойное смещение и уводил заходы не туда (v1.7.56).
         polypath_offset, lead_in_poly, lead_in_collision, _ = plan_lead_in(
             polypath_offset, req_in,
             contours_lines_cache, contours_bboxes_cache,
@@ -1587,7 +1591,8 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
             auto_avoid=(this_op_auto_avoid and project is not None),
             safety_factor=1.2,
             exit_request=exit_req,
-            overlap=pending_overlap)
+            overlap=pending_overlap,
+            path_is_cutter=True)
         # ── СОХРАНЯЕМ ТОЧКУ ЗАХОДА ДЛЯ ЭМИТТЕРА ──
         # Эмиттер возьмёт её как старт контура (см. mtx_anderson), чтобы
         # .anc давал те же заходы, что видны в превью: логичнее и меньше
@@ -1644,7 +1649,8 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         lead_out_poly, lead_out_collision, _ = plan_lead_out(
             polypath_offset, req_out,
             contours_lines_cache, contours_bboxes_cache,
-            geom.id, effective_tool_offset)
+            geom.id, effective_tool_offset,
+            path_is_cutter=True)
     
     return {
         'contour': polypath_offset,
