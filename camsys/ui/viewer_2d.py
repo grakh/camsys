@@ -913,8 +913,13 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
     elif is_3d_corner:
         pt = op.attributes['corner3d_point']
         seg_hint = op.attributes['corner3d_segment_index']
+        # Припуск от остроты угла — той же функцией, что и в посте
+        # (v1.7.49), иначе картинка разойдётся с `.anc`.
+        from ..geometry.path_offset import corner_pad_for_angle as _cpfa
         polypath = extract_subpath_around_point(
-            geom.polypath, pt, seg_hint, pad_mm=1.5
+            geom.polypath, pt, seg_hint,
+            pad_mm=_cpfa(op.attributes.get('corner3d_interior_angle'),
+                         options_extras.get('tool_equidistant', 1.3) / 2.0)
         )
     elif is_2d_corner:
         first_idx = op.attributes['corner_first_idx']

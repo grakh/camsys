@@ -521,12 +521,37 @@ class MtxAndersonGVM(PostProcessor):
             and op.attributes.get('corner_is_3d')
             and 'corner3d_point' in op.attributes):
             # 3D угол — фрагмент вокруг точки острого излома
-            from ..geometry.path_offset import extract_subpath_around_point
+            from ..geometry.path_offset import (
+                extract_subpath_around_point, corner_pad_for_angle)
             pt = op.attributes['corner3d_point']
             seg_hint = op.attributes['corner3d_segment_index']
+            # Припуск считается от остроты угла (v1.7.49): в клине фреза
+            # встаёт не ближе T/sin(A/2) от вершины, и фрагмент обязан
+            # доставать дальше упора ОСНОВНОЙ фрезы — иначе полоса между
+            # упорами не снимается никем.
+            _pad3d = corner_pad_for_angle(
+                op.attributes.get('corner3d_interior_angle'),
+                options.extras.get('tool_equidistant', 1.3) / 2.0)
             polypath = extract_subpath_around_point(
-                geom.polypath, pt, seg_hint, pad_mm=1.5
+                geom.polypath, pt, seg_hint, pad_mm=_pad3d
             )
+            # Упор основной фрезы в клине. Если припуск до него не
+            # достал (сработал потолок на игольчатом угле), полоса
+            # между упорами остаётся несрезанной — это в журнал.
+            try:
+                import math as _m3d
+                _ang3d = float(op.attributes.get('corner3d_interior_angle'))
+                _sin3d = _m3d.sin(_m3d.radians(_ang3d / 2.0))
+                _stop3d = ((options.extras.get('tool_equidistant', 1.3) / 2.0)
+                           / _sin3d) if _sin3d > 1e-6 else None
+                if _stop3d is not None and _pad3d <= _stop3d:
+                    _mach_log(options, geom, tp,
+                              f"УГОЛ 3D {_ang3d:.1f}°: фрагмент {_pad3d:.2f} мм "
+                              f"не достаёт до упора основной фрезы "
+                              f"{_stop3d:.2f} мм — полоса между упорами "
+                              f"остаётся несрезанной, нужна ручная правка")
+            except (TypeError, ValueError):
+                pass
             is_corner_rework = True
             if not polypath.segments:
                 return line_no

@@ -544,3 +544,65 @@ def test_equidistant_never_cuts_the_blade():
         assert worst > off - 0.003, (
             f'{side}: эквидистанта врезается в лезвие на '
             f'{(off - worst) * 1000:.0f} мкм')
+
+def test_corner_pad_covers_what_the_main_tool_left():
+    """Припуск фрагмента угла считается от его остроты (v1.7.49).
+
+    Фреза с полушириной реза T встаёт в клине с внутренним углом A не
+    ближе T/sin(A/2) от вершины. Доработке принадлежит полоса от упора
+    ТОНКОЙ фрезы до упора ОСНОВНОЙ, и фрагмент обязан её перекрывать.
+
+    Было: припуск всегда 1.5 мм. На ноже 124136 с углом 43.3° основная
+    фреза встаёт в 1.760 мм от вершины, T3 — в 1.490 мм, а фрагмент
+    кончался в 1.500 мм. Путь доработки выходил 0.210 мм — короче
+    собственного захода, а полоса 1.50…1.76 мм не снималась НИКЕМ.
+    """
+    import math
+    from geometry.corner_detect import detect_pointed_corners
+    from geometry.path_offset import (
+        extract_subpath_around_point, offset_right_of_travel,
+        trim_self_intersections, join_polypath_corners, despike_polypath,
+        corner_pad_for_angle)
+
+    poly = _knife_124136()
+    main_half = (0.8 + 2 * 0.25 * math.tan(math.radians(45))) / 2
+    t3_half = (0.6 + 2 * 0.25 * math.tan(math.radians(45))) / 2
+
+    def t3_path_len(pc, pad):
+        frag = extract_subpath_around_point(poly, pc.point,
+                                            pc.segment_index, pad)
+        o = despike_polypath(join_polypath_corners(trim_self_intersections(
+            offset_right_of_travel(frag, t3_half)), tol=0.01))
+        return sum(x.length() for x in o.segments)
+
+    corners = detect_pointed_corners(poly, sharp_threshold_deg=30.0)
+    assert len(corners) == 2, f'углов найдено {len(corners)}, ожидалось 2'
+    seen = {}
+    for pc in corners:
+        pad = corner_pad_for_angle(pc.interior_angle, main_half)
+        stop_main = main_half / math.sin(math.radians(pc.interior_angle / 2))
+        was, now = t3_path_len(pc, 1.5), t3_path_len(pc, pad)
+        print(f'  угол {pc.interior_angle:.1f}°: упор основной '
+              f'{stop_main:.3f} мм, припуск 1.50 -> {pad:.2f} мм, '
+              f'путь T3 {was:.3f} -> {now:.3f} мм')
+        seen[round(pc.interior_angle)] = (pad, was, now, stop_main)
+        # Фрагмент обязан доставать ДАЛЬШЕ упора основной фрезы —
+        # иначе между упорами остаётся несрезанный металл.
+        assert pad > stop_main, (
+            f'припуск {pad:.2f} не достаёт до упора основной фрезы '
+            f'{stop_main:.3f} мм')
+        # Проход доработки не может быть короче собственного захода.
+        assert now >= 1.0, (
+            f'путь доработки всего {now:.3f} мм')
+    # Тупой угол не трогаем вообще: там 1.5 мм и так перекрывали упор.
+    pad_blunt, was_blunt, now_blunt, _st = seen[130]
+    assert abs(pad_blunt - 1.5) < 1e-9, (
+        f'у тупого угла припуск изменился на {pad_blunt:.2f}')
+    assert abs(now_blunt - was_blunt) < 1e-9, (
+        'у тупого угла путь доработки изменился, а не должен')
+    # Острый — вырос в разы.
+    _pad_sharp, was_sharp, now_sharp, _st2 = seen[43]
+    assert now_sharp > was_sharp * 5, (
+        f'у острого угла путь вырос лишь с {was_sharp:.3f} до '
+        f'{now_sharp:.3f} мм')
+
