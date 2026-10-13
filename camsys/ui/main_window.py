@@ -1044,7 +1044,10 @@ class MainWindow(QtWidgets.QMainWindow):
         a_export = m_file.addAction("&Экспорт пакета...")
         a_export.setShortcut("Ctrl+E")
         a_export.triggered.connect(self.action_export)
-        
+
+        a_export_geom = m_file.addAction("Экспорт &геометрии (DXF + PDF)...")
+        a_export_geom.triggered.connect(self.action_export_geometry)
+
         m_file.addSeparator()
         
         a_save_state = m_file.addAction("Сохранить настройки...")
@@ -2802,6 +2805,48 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self.params_panel.btn_show_paths.setChecked(False)
     
+    def action_export_geometry(self):
+        """Выгружает геометрию проекта в DXF и PDF рядом с ней.
+
+        Нужно, чтобы доделать деталь отдельно, если на станке что-то
+        пошло не так. Выгружается геометрия ПОСЛЕ биарк-фита и слияния
+        дуг — ровно та, по которой считался рез. По исходному `.ai` в
+        размер не попасть: альфа раскладывает кривые иначе.
+
+        DXF — основной: в нём дуга остаётся дугой и переносится точно.
+        PDF — для глаза и печати: в PDF дуги нет вообще, только Безье,
+        поэтому там приближение (меньше микрона, но оно есть).
+        """
+        if self.session.project is None:
+            QtWidgets.QMessageBox.information(
+                self, "Экспорт геометрии", "Сначала откройте .ai")
+            return
+        name = (self.session.project.name or "geometry")
+        start = str(Path(self._last_dir or str(Path.home()))
+                    / f"{name}.dxf")
+        path, _flt = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Экспорт геометрии", start, "DXF (*.dxf)")
+        if not path:
+            return
+        base = Path(path)
+        if base.suffix.lower() != ".dxf":
+            base = base.with_suffix(".dxf")
+        pdf_path = base.with_suffix(".pdf")
+        try:
+            from ..io_.dxf_export import export_project_dxf
+            from ..io_.pdf_export import export_project_pdf
+            info = export_project_dxf(self.session.project, str(base))
+            export_project_pdf(self.session.project, str(pdf_path))
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Экспорт геометрии", f"Не удалось выгрузить:\n{e}")
+            return
+        self._last_dir = str(base.parent)
+        self.statusBar().showMessage(
+            f"Геометрия выгружена: {base.name} "
+            f"(прямых {info['lines']}, дуг {info['arcs']}) и {pdf_path.name}",
+            8000)
+
     def action_export(self):
         # Снимаем подсветку автоподбора с полей лидов (юзер начал экспорт)
         try:
