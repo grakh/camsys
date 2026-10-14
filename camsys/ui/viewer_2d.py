@@ -834,27 +834,6 @@ class ToolpathItem(QtWidgets.QGraphicsPathItem):
         painter.restore()
 
 
-def _end_curvature_radius(polypath, at_start: bool) -> float:
-    """Радиус кривизны на конце фрагмента (мм). Линия = бесконечность
-    (пологая), дуга = её радиус. Смотрим 1-2 крайних сегмента: если конец
-    угла — дуга малого радиуса, значит кривизна крутая и лид сядет плохо.
-
-    at_start=True — начало фрагмента (там будет заход/lead-in);
-    at_start=False — конец (lead-out).
-    """
-    from ..geometry.primitives import Arc as _ArcC
-    if not polypath or not polypath.segments:
-        return float('inf')
-    segs = polypath.segments
-    # КРАЙНИЙ сегмент (там начинается лид). Скругление угла в середине
-    # фрагмента не смотрим — важна кривизна именно на краю (зоне pad),
-    # куда сядет заход/выход.
-    edge = segs[0] if at_start else segs[-1]
-    if isinstance(edge, _ArcC):
-        return edge.radius
-    return float('inf')  # край — линия, пологий
-
-
 def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=None):
     """Прогоняет ту же логику что эмиттер для одного toolpath, и возвращает
     геометрию для визуализации: dict с ключами 'contour', 'lead_in', 'lead_out'.
@@ -892,65 +871,20 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
                     and (('corner_first_idx' in op.attributes) or is_pocket)
                     and not op.attributes.get('corner_is_3d'))
 
-    if is_pocket:
-        # ── ПРОТОЧКА КАРМАНА (v1.7.38) ──
-        # Тот же участок, что выброшен из основного прохода. Считаем его
-        # ТОЙ ЖЕ формулой, что и пост: контур, нормализованный под свой
-        # проход, от устья до устья плюс выход на уже снятый металл.
-        from ..geometry.path_offset import _subpath_forward as _sfwv
-        from ..geometry.primitives import Polypath as _PPv
-        _pside = op.attributes.get('pocket_side', 'OUTSIDE')
-        _ppar = normalize_for_side(geom.polypath, _pside)
-        _ptot = sum(x.length() for x in _ppar.segments)
-        # Концы — до пологих участков, той же функцией, что и в посте.
-        from ..geometry.path_offset import (
-            pocket_fragment_with_gentle_ends as _pfge_v)
-        _segs_v = _pfge_v(_ppar, float(op.attributes['pocket_s0']),
-                          float(op.attributes['pocket_s1']), pad_mm=0.5)
-        if not _segs_v:
+    if op.kind == OperationKind.CORNER_REWORK:
+        # ── УЧАСТОК ДОРАБОТКИ — ОБЩЕЙ ФУНКЦИЕЙ С ПОСТОМ (v1.7.58) ──
+        # Раньше вьювер вырезал этот участок сам и брал для 2D-угла
+        # припуск 3.0 мм с удлинением до 5.0, а пост — 1.5. Это разные
+        # кривые, и лид крепится к ним в разных местах: на 124173 из 56
+        # лидов доработки картинка совпадала с программой у 12.
+        # Припуск оставлен постовский — он лучше по замеру зазора лида
+        # до металла (см. rework_fragment).
+        from ..geometry.path_offset import rework_fragment
+        polypath = rework_fragment(
+            geom, op, tp.side.name,
+            options_extras.get('tool_equidistant', 1.3) / 2.0)
+        if polypath is None or not polypath.segments:
             return None
-        polypath = _PPv(segments=_segs_v, closed=False)
-    elif is_3d_corner:
-        pt = op.attributes['corner3d_point']
-        seg_hint = op.attributes['corner3d_segment_index']
-        # Припуск от остроты угла — той же функцией, что и в посте
-        # (v1.7.49), иначе картинка разойдётся с `.anc`.
-        from ..geometry.path_offset import corner_pad_for_angle as _cpfa
-        polypath = extract_subpath_around_point(
-            geom.polypath, pt, seg_hint,
-            pad_mm=_cpfa(op.attributes.get('corner3d_interior_angle'),
-                         options_extras.get('tool_equidistant', 1.3) / 2.0)
-        )
-    elif is_2d_corner:
-        first_idx = op.attributes['corner_first_idx']
-        last_idx = op.attributes['corner_last_idx']
-        # Базовый pad 3.0мм (было 1.5): лид начинается ДАЛЬШЕ от
-        # скругления → переход угол→заход/выход более ПОЛОГИЙ, поворот
-        # лида не жмётся к острию.
-        _base_pad = 3.0
-        polypath = extract_subpath_around_indices(
-            geom.polypath, first_idx, last_idx, pad_mm=_base_pad
-        )
-        # ── АДАПТИВНОЕ УДЛИНЕНИЕ угла по кривизне концов ──
-        # Если на конце фрагмента (где начнётся заход/выход) кривизна ещё
-        # КРУТАЯ (радиус < порога), поворот лида создаёт тесную петлю и
-        # подрежет лезвие. Продлеваем pad, пока оба конца не выйдут на
-        # ПОЛОГИЙ участок (радиус >= порога) — тогда лид садится на мягкую
-        # кривую. Элементы разные, поэтому удлинение подбирается под каждый.
-        try:
-            _R_MIN = 1.5  # порог радиуса кривизны на концах (мм)
-            _PAD_MAX = 5.0  # предел, чтобы не залезть на соседний угол
-            _pad = _base_pad
-            while _pad < _PAD_MAX:
-                _r_start = _end_curvature_radius(polypath, at_start=True)
-                _r_end = _end_curvature_radius(polypath, at_start=False)
-                if _r_start >= _R_MIN and _r_end >= _R_MIN:
-                    break  # оба конца пологие — достаточно
-                _pad = min(_pad + 1.0, _PAD_MAX)
-                polypath = extract_subpath_around_indices(
-                    geom.polypath, first_idx, last_idx, pad_mm=_pad)
-        except Exception:
-            pass
     else:
         polypath = geom.polypath
     
@@ -1010,23 +944,11 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
             lead_out_radius_mult = ov_out.get('length', lead_out_radius_mult)
     
     # ── Нормализация направления и точка старта ──
+    # Фрагмент доработки уже развёрнут под свою сторону внутри
+    # rework_fragment — второй раз его разворачивать нельзя.
     is_corner = is_3d_corner or is_2d_corner
     if is_corner:
-        # Развернуть фрагмент под CW (центр справа).
-        # CORNER_REWORK ноги имеют side=OUTSIDE (внутренний рез = CW). 
-        # G-code emitter выдаст G42 (комп. вправо). Внутренний рез blade 
-        # тоже идёт CW, углы должны продолжать это направление — тогда 
-        # фреза с G42 уходит в ту же сторону = ВНУТРЬ ножа = крючок в угол.
-        # Направление фрагмента — по намотке РОДИТЕЛЬСКОГО контура, той
-        # же функцией, что и в посте (v1.7.37). Прежний признак «центр
-        # bbox ножа справа от касательной» на ложках и языках врал.
-        _corner_outside = (tp.side != ContourSide.INSIDE)
-        if not is_pocket:
-            # Карман уже вырезан из контура, нормализованного под свой
-            # проход, — разворачивать его второй раз нельзя.
-            from ..geometry.direction import orient_corner_fragment as _ocf
-            polypath = _ocf(polypath, geom.polypath,
-                            'OUTSIDE' if _corner_outside else 'INSIDE')
+        pass
     elif geom.is_closed and tp.side in (ContourSide.OUTSIDE, ContourSide.INSIDE):
         side_name = "OUTSIDE" if tp.side == ContourSide.OUTSIDE else "INSIDE"
         polypath = normalize_for_side(polypath, side_name)
@@ -1205,7 +1127,142 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         from ..geometry.path_offset import merge_collinear_lines
         polypath_for_vis = merge_collinear_lines(polypath_for_vis, angle_tol_deg=1.0)
     
-    _corner_mid_ref = None
+    # ════════════════════════════════════════════════════════════════
+    # ПЛАНИРОВАНИЕ ЛИДОВ — ТЕМ ЖЕ КОДОМ, ЧТО И ПОСТ (v1.7.58)
+    # ════════════════════════════════════════════════════════════════
+    # Лиды считаются НА ОСЕВОЙ — потому что в `.anc` уходит осевая, а
+    # путь фрезы из неё делает стойка по G42. Нарисовать надо СМЕЩЕНИЕ
+    # результата, а не результат, посчитанный по смещённой кривой: это
+    # разные кривые. Прежний вьювер строил лид на ЭКВИДИСТАНТЕ, и на
+    # заказе 126387 с пяткой 1.2 из 396 лидов 126 рисовались не там, где
+    # пройдёт фреза (худший подходил к лезвию на 0.302 мм при нужных
+    # 0.850). Поэтому порядок здесь такой: сперва план на осевой, потом
+    # эквидистанта ОТ РЕЗУЛЬТАТА.
+    is_corner_view = bool(is_3d_corner or is_2d_corner)
+    effective_tool_offset = (corner_tool_offset if is_corner_view
+                             else tool_offset)
+    effective_tool_radius = (corner_tool_radius if is_corner_view
+                             else tool_radius)
+
+    # ── ПЕРЕБЕГ ──
+    # Применяется ПОСЛЕ подбора позиции: раньше он разомкнул бы контур, и
+    # сдвиг старта тащил бы перебег вместе с собой.
+    pending_overlap = 0.0
+    if (cutting_params is not None and not is_corner_view
+            and tp.side in (ContourSide.OUTSIDE, ContourSide.INSIDE)
+            and src is not None and getattr(src, 'overlap', 0.0) > 1e-9):
+        pending_overlap = src.overlap
+
+    # ── РЕЖИМ ПРИМЕНЕНИЯ ПАРАМЕТРОВ ──
+    #   0 Авто      → автоподбор двигает все заходы
+    #   1 Все       → юзерские поля точно, автоподбор выключен
+    #   2 Выделенные→ поля к выделенному ножу, остальные автоподбором
+    # Ручная правка элемента (lead_override) побеждает автоподбор: иначе
+    # заданный вручную заход «возвращался к умолчанию» после пересчёта.
+    _lead_mode = int(options_extras.get('lead_mode', 0))
+    _sel_op_id = str(options_extras.get('selected_op_id', ''))
+    if _lead_mode == 2:
+        _no_avoid_view = (op.id == _sel_op_id)
+    elif _lead_mode == 1:
+        _no_avoid_view = True
+    else:
+        _no_avoid_view = not bool(options_extras.get('auto_avoid_all', True))
+    try:
+        if op.attributes.get('lead_override'):
+            _no_avoid_view = True
+    except Exception:
+        pass
+
+    _plan = None
+    _lead_journal = []
+    if project is not None and polypath_for_vis and polypath_for_vis.segments:
+        from ..geometry.lead_collision import (
+            PassLeadParams, plan_pass_leads, build_contours_cache)
+        _knife_layer = project.get_layer_by_name("Knife")
+        _geoms = list(getattr(_knife_layer, 'geometries', ())
+                      if _knife_layer is not None else ())
+        _cl_full, _cb_full = build_contours_cache(_geoms)
+        _nb_view = [g.polypath for g in _geoms
+                    if (g is not None and g.is_closed
+                        and g.polypath is not None and g is not geom)]
+        # ── КАКИЕ КОНТУРЫ ВИДИТ ПРОВЕРКА КОЛЛИЗИЙ ──
+        # У доработки — НИКАКИХ, и это не упрощение, а повторение поста:
+        # программу доработки он собирает на проекте, из которого
+        # операции основного прохода выброшены, а кеш контуров строит
+        # ровно по ним (`_project_contours_cache`). Значит в корнер-
+        # программе список пустой, и лид угла подбирается без оглядки на
+        # ножи — безопасность там держит только замер `fit_rework_lead`
+        # (ему соседи передаются). Пока это так, вьювер обязан считать
+        # так же, иначе картинка расходится: на 124173 с полным списком
+        # у 8 лидов из 56 заход уходил на 421 мкм в сторону от того, что
+        # уйдёт в станок.
+        #
+        # Замерено, опасности на этом заказе нет: ни один лид доработки
+        # не подходит к ЧУЖОМУ ножу ближе полуширины реза T3 (ближайший
+        # 5.3 мм при нужных 0.55). Но запас этот случайный — пробел в
+        # посте остаётся, и он записан в очередь.
+        if is_corner_view:
+            _cl_cache, _cb_cache = [], []
+        else:
+            _cl_cache, _cb_cache = _cl_full, _cb_full
+        _vp = PassLeadParams(
+            pass_side=tp.side.name,
+            is_corner_rework=is_corner_view,
+            # ── ЗАЗОР, КОТОРЫЙ ТРЕБУЕТ ПРОВЕРКА ──
+            # Здесь ОСНОВНАЯ фреза, а не T3, — потому что так считает
+            # пост, и картинка обязана показывать его результат. Сам по
+            # себе этот зазор в посте завышен: угол режет ТОНКАЯ T3
+            # (полуширина 0.55 при 90°/0.8), а проверка требует 0.65 от
+            # основной. Лишние 0.1 мм только осторожнее, программа от
+            # них безопасна, но позиция лида выходит не оптимальной.
+            # Править это надо в посте и с замерами на станке — пока
+            # вьювер повторяет его значение, иначе картинка опять
+            # разойдётся: на 124173 так расходились 8 лидов из 56 на
+            # 421 мкм.
+            tool_offset=tool_offset,
+            # Масштаб множителей «x_tool_rad» — ЭКВИДИСТАНТА фрезы этого
+            # прохода (у доработки режет тонкая T3).
+            lead_scale=effective_tool_offset * 2.0,
+            length_mult=(float(getattr(cutting_params,
+                                       'corner_lead_length_mult', 0.5)
+                               or 1.0) if (is_corner_view and cutting_params)
+                         else (0.5 if is_corner_view else 1.0)),
+            radius_mult=(float(getattr(cutting_params,
+                                       'corner_lead_radius_mult', 0.5)
+                               or 1.0) if (is_corner_view and cutting_params)
+                         else (0.5 if is_corner_view else 1.0)),
+            extra_mm=((float(getattr(cutting_params,
+                                     'corner_lead_extra_diam', 1.0) or 0.0)
+                       * float(getattr(cutting_params,
+                                       'corner_tip_diameter', 0.6) or 0.6))
+                      if (is_corner_view and cutting_params)
+                      else (0.6 if is_corner_view else 0.0)),
+            entry_enabled=(tp.entry.enabled and tp.entry.style in (
+                LeadStyle.LINE_ARC_TANGENTIAL, LeadStyle.LINE)),
+            entry_style=('line' if tp.entry.style == LeadStyle.LINE
+                         else 'line_arc'),
+            entry_angle=lead_in_angle,
+            entry_length=lead_in_length_mult,
+            entry_radius=lead_in_radius_mult,
+            exit_enabled=(tp.exit.enabled and tp.exit.style in (
+                LeadStyle.LINE_ARC_TANGENTIAL, LeadStyle.LINE)),
+            exit_style=('line' if tp.exit.style == LeadStyle.LINE
+                        else 'line_arc'),
+            exit_angle=lead_out_angle,
+            exit_length=lead_out_length_mult,
+            exit_radius=lead_out_radius_mult,
+            overlap=pending_overlap,
+            no_avoid=_no_avoid_view,
+        )
+        _plan = plan_pass_leads(
+            polypath_for_vis, geom, _vp, _cl_cache, _cb_cache,
+            neighbours=_nb_view, log=_lead_journal.append)
+        # Осевая после подбора — по ней и считается эквидистанта. Берём
+        # ЗАМКНУТУЮ (до перебега): у разомкнутого контура намотка
+        # неопределена, и оффсет мог бы уйти в другую сторону.
+        polypath_for_vis = (_plan.axis_rerooted or _plan.axis)
+        polypath = _plan.axis
+
     if is_3d_corner or is_2d_corner:
         # CORNER: эквидистанта фрезы. Направление (внутрь/наружу тела)
         # выбирается по ВЫПУКЛОСТИ угла — АБСОЛЮТНЫМ геометрическим
@@ -1259,41 +1316,33 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
             except Exception:
                 _convex = True
 
-        # ЗНАК эквидистанты угла: зависит от ВЫПУКЛОСТИ, не только tp.side.
-        # Все corner-операции помечены tp.side=OUTSIDE, но физически:
-        #   ВЫПУКЛЫЙ угол (горб) → рез ИЗНУТРИ → путь ВНУТРИ тела (OUTSIDE)
-        #   ВОГНУТЫЙ угол (линия ушла ВНУТРЬ элемента, внешний контур) →
-        #     это сторона INSIDE → путь и лиды ОТ элемента (СНАРУЖИ).
-        # _convex определён выше абсолютным критерием (центр дуги в теле).
-        #   выпуклый → угол ВНУТРИ тела (_main_side_inside=True)
-        #   вогнутый → угол СНАРУЖИ (_main_side_inside=False)
-        _main_side_inside = _convex
+        # ── ДИАГНОСТИКА (правый клик «Диагностика угла») ──
+        # Признаки пишем прямо на op, чтобы юзер прочитал их в
+        # приложении и прислал — так видно, где превью расходится с
+        # ожиданием, без гадания.
         try:
-            from ..geometry.path_offset import (
-                offset_polypath_uniform as _ofu2,
-                _point_in_polypath as _pip3,
-                trim_self_intersections as _tsi2,
-                join_polypath_corners as _jpc2)
-            # Фрагмент уже развёрнут под сторону, а G42 всегда кладёт
-            # фрезу СПРАВА ПО ХОДУ — независимо от стороны. Поэтому
-            # эквидистанта угла считается явной функцией «вправо по
-            # ходу», а не через `inward` (v1.7.37).
-            #
-            # Через `inward` это и ломалось: «внутрь» определено для
-            # ЗАМКНУТОГО контура, а у разомкнутого фрагмента
-            # offset_polypath_uniform безусловно принимает намотку за
-            # CCW. inward=True давал ЛЕВУЮ нормаль, и все углы со
-            # стороной OUTSIDE (16 из 26 на заказе 124173) рисовались
-            # зеркально — рез показывался не с той стороны контура.
-            from ..geometry.path_offset import (
-                offset_right_of_travel as _ort)
-            _inward = _corner_outside   # только для диагностики ниже
-            _eq_try = _ort(polypath_for_vis, corner_tool_offset)
-            _eq_try = _tsi2(_eq_try)
-            _eq_try = _jpc2(_eq_try, tol=0.01)
+            _rr = _rounding_arc.radius if _rounding_arc is not None else None
+            _rc = _rounding_arc.center if _rounding_arc is not None else None
+            _ap = op.attributes.get('corner_apex', (0, 0))
+            op.attributes['_diag'] = {
+                'convex': _convex,
+                'rounding_R': (round(_rr, 3) if _rr is not None else None),
+                'rounding_center': ([round(_rc[0], 2), round(_rc[1], 2)]
+                                    if _rc is not None else None),
+                'corner_radius': op.attributes.get('corner_radius'),
+                'apex': [round(_ap[0], 1), round(_ap[1], 1)],
+            }
         except Exception:
-            _inward = _corner_outside
+            pass
 
+        # ЭКВИДИСТАНТА УГЛА — «вправо по ходу» (v1.7.37). Фрагмент уже
+        # развёрнут под свою сторону, а G42 всегда кладёт фрезу справа по
+        # ходу, независимо от стороны. Через `inward` это считать нельзя:
+        # «внутрь» определено для ЗАМКНУТОГО контура, а у разомкнутого
+        # фрагмента offset_polypath_uniform безусловно принимает намотку
+        # за CCW — inward=True давал ЛЕВУЮ нормаль, и все углы со
+        # стороной OUTSIDE (16 из 26 на заказе 124173) рисовались
+        # зеркально.
         from ..geometry.path_offset import offset_right_of_travel as _ort2
         polypath_offset = _ort2(polypath_for_vis, corner_tool_offset)
         polypath_offset = trim_self_intersections(polypath_offset)
@@ -1301,12 +1350,6 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         # Стыкуем линии через их пересечение — острый угол на
         # эквидистанте (фреза заходит и выходит под прямым углом).
         polypath_offset = join_polypath_corners(polypath_offset, tol=0.01)
-        # Эталон стороны «тела» угла фиксируем ДО despike: despike меняет
-        # число сегментов, поэтому segments[len//2] ПОСЛЕ него укажет на
-        # другую точку и может развернуть сторону лида (регрессия). Старт и
-        # касательную на конце despike сохраняет, а середину фиксируем тут.
-        _corner_mid_ref = polypath_offset.segments[
-            len(polypath_offset.segments) // 2].a
         # ── УБИРАЕМ ПЕТЛИ В ТОЧКАХ ИЗЛОМА ──
         # Пооссегментный оффсет сырого биарк-фрагмента даёт микро-петли на
         # стыках offset-дуг (сегмент k+1 стартует «позади» конца k).
@@ -1335,323 +1378,96 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
     else:
         polypath_offset = polypath
     
-    # ── OVERLAP откладывается на ПОСЛЕ авто-подбора (см. ниже) ──
-    # Если применить overlap здесь, polypath перестанет быть замкнутым 
-    # (открытая ломаная с расширением), и shift_start_along_contour в 
-    # auto_avoid сместит вместе со стартом и сам overlap-кусок.
-    # Сохраним значение, применим в конце.
-    pending_overlap = 0.0
-    if (cutting_params is not None 
-            and not (is_3d_corner or is_2d_corner)
-            and tp.side in (ContourSide.OUTSIDE, ContourSide.INSIDE)
-            and src is not None and getattr(src, 'overlap', 0.0) > 1e-9):
-        pending_overlap = src.overlap
-    
-    lead_in_poly = None
-    lead_out_poly = None
-    
-    # Lead-in/out строится от точки на ЭКВИДИСТАНТЕ (реальная траектория 
-    # фрезы), а не на программной геометрии. Иначе заход «висит в воздухе»
-    # на видимом смещении от пути фрезы.
-    # Для CORNER операций используется ТОНКАЯ фреза → меньший tool_radius
-    # → пропорционально меньшие lead-дуги и линии.
-    effective_tool_radius = corner_tool_radius if (is_3d_corner or is_2d_corner) else tool_radius
-    # Для lead-in line используем tool_offset (фактический боковой зазор) 
-    # и формулу Alpha CAM: line_length = factor × tool_offset / sin(angle).
-    # Это даёт корректную lateral clearance от контура.
-    effective_tool_offset = corner_tool_offset if (is_3d_corner or is_2d_corner) else tool_offset
-    import math as _m_view
 
-    # ── МАСШТАБ ЛИДОВ (v1.7.12) ──
-    # Множители «x_tool_rad» AlphaCAM считает от ЭКВИДИСТАНТЫ, а не от её
-    # половины. В посте это исправлено в v1.7.11 (lead_scale = tool_eq);
-    # здесь оставалось старое tool_offset, из-за чего ВЬЮВЕР рисовал лиды
-    # вдвое короче, чем уходит в программу, и выход выглядел почти прямой
-    # линией — дуга была слишком мелкой, чтобы её заметить.
-    _lead_scale_view = effective_tool_offset * 2.0
-
-    # ── МНОЖИТЕЛИ И ЗАПАС ЛИДА ДОРАБОТКИ (v1.7.39) ──
-    # Пост домножает длину и радиус лида угла/кармана на свои множители
-    # (corner_lead_length_mult / corner_lead_radius_mult, по умолчанию
-    # 0.5), а вьювер этого не делал — и рисовал лиды вдвое длиннее, чем
-    # уходит в программу. Плюс общий запас длины прямой части.
-    _c_lmult = 1.0
-    _c_rmult = 1.0
-    _lead_extra_view = 0.0
-    if is_3d_corner or is_2d_corner:
-        _c_lmult = float(getattr(cutting_params, 'corner_lead_length_mult',
-                                 0.5) or 1.0) if cutting_params else 0.5
-        _c_rmult = float(getattr(cutting_params, 'corner_lead_radius_mult',
-                                 0.5) or 1.0) if cutting_params else 0.5
-        _extra_d = float(getattr(cutting_params, 'corner_lead_extra_diam',
-                                 1.0) or 0.0) if cutting_params else 1.0
-        _c_tip = float(getattr(cutting_params, 'corner_tip_diameter',
-                               0.6) or 0.6) if cutting_params else 0.6
-        _lead_extra_view = _extra_d * _c_tip
-
-    def _line_len_alpha_view(user_factor: float, angle_deg: float) -> float:
-        ang_rad = _m_view.radians(max(5.0, min(175.0, angle_deg)))
-        sin_a = _m_view.sin(ang_rad)
-        if sin_a < 0.05: sin_a = 0.05
-        return (user_factor * _c_lmult * _lead_scale_view
-                + _lead_extra_view) / sin_a
-    
-    # Сторона захода для 2D/3D углов — выбирается по bbox центру 
-    # (передаётся как forced_side в LeadGeometryRequest).
-    # Для OUTSIDE/INSIDE — авто-подбор стороны через pick_lead_side_for_pass 
-    # внутри plan_lead_in.
-    forced_lead_side = None
-    # Укорочение лида — только для доработки; у обычных проходов 1.0.
-    # Объявляем ДО ветки, иначе обычный проход падает на NameError.
-    _lead_shrink_view = 1.0
-    if is_3d_corner or is_2d_corner:
-        # СТОРОНА ЛИДА УГЛА: кончик лида должен быть с ТОЙ ЖЕ стороны от
-        # контура, что и сама ЭКВИДИСТАНТА УГЛА (она уже построена
-        # правильно с _inward). Определяем ВЕКТОРНО, без point_in_polypath
-        # (который врёт на полосах, особенно после удлинения угла, когда
-        # старт лида уходит на пологий участок).
-        #
-        # Берём среднюю точку эквидистанты угла (эталон стороны) и
-        # стартовую точку; сравниваем на какой стороне от касательной
-        # лежит эквидистанта. Лид строим в ТУ ЖЕ сторону.
-        # ── СТОРОНА ЛИДА ДОРАБОТКИ — ПО ЗАМЕРУ ЗАЗОРА (v1.7.39) ──
-        # Эмиттер пишет G42, фреза снимает металл справа по ходу, и
-        # заходить она обязана оттуда же. Но в узкой щели справа может не
-        # быть места: лид ложится на встречную стенку. Поэтому сторона
-        # меряется — той же функцией, что и в посте, чтобы картинка и
-        # программа не разошлись.
-        forced_lead_side = "right"
+    # ── ПЕРЕБЕГ НА ЭКВИДИСТАНТЕ ──
+    # Осевую plan_pass_leads уже продлил; эквидистанту продлеваем здесь,
+    # после оффсета: оффсет считается по ЗАМКНУТОМУ контуру.
+    if pending_overlap > 1e-9:
+        from ..geometry.path_offset import apply_overlap
         try:
-            from ..geometry.lead_inout import fit_rework_lead as _plsc_view
-            # Соседи — из слоя Knife (в операциях доработки BLADE_FORMING
-            # нет, список получался пустым), и только ножи: контуры
-            # других слоёв лежат прямо на линии и всё забраковали бы.
-            _nb_view = []
-            _klay_v = project.get_layer_by_name("Knife")
-            for _go in (getattr(_klay_v, 'geometries', ()) if _klay_v else ()):
-                if (_go is not None and _go.is_closed
-                        and _go.polypath is not None and _go is not geom):
-                    _nb_view.append(_go.polypath)
-            # Подбору скармливаем ОСЕВУЮ, как и в посте (v1.7.43).
-            # Раньше сюда шла эквидистанта — путь, уже смещённый на
-            # полуширину реза, — а fit_rework_lead смещает его ещё раз,
-            # чтобы получить путь фрезы. Мерилась кривая на 0.55 мм
-            # дальше настоящей, пересечений она не находила, и лид не
-            # укорачивался: ровно те места (59,93 и 93,239), где в
-            # программе он укорачивался, в картинке оставались длинными.
-            # Вьювер строит лид от ЭКВИДИСТАНТЫ — это уже путь фрезы.
-            # Значит и решение о длине/угле/стороне принимаем для ЭТОЙ
-            # кривой (path_is_cutter=True), иначе решение считается для
-            # одной кривой, а рисуется другая (v1.7.45).
-            _sp_v = polypath_offset.segments[0].a
-            _tan_v = polypath_offset.segments[0].tangent_at_start()
-            forced_lead_side, _shrink_v, _ang_v, _clr_v = _plsc_view(
-                _sp_v, _tan_v, geom.polypath,
-                effective_tool_offset,
-                _line_len_alpha_view(lead_in_length_mult, lead_in_angle),
-                lead_in_radius_mult * _c_rmult * _lead_scale_view,
-                lead_in_angle, is_exit=False, neighbours=_nb_view,
-                path_is_cutter=True)
-            if _ang_v and abs(_ang_v - lead_in_angle) > 1e-6:
-                lead_in_angle = _ang_v
-                lead_out_angle = _ang_v
-            # Укорочение применяется к ИТОГОВОЙ длине, как в посте
-            # (v1.7.45). Раньше вьювер умножал на него МНОЖИТЕЛЬ, а запас
-            # длины (corner_lead_extra, 0.6 мм) прибавляется ПОСЛЕ него и
-            # не уменьшался: при укорочении ×0.6 лид выходил на треть
-            # длиннее программного.
-            _lead_shrink_view = _shrink_v
-        except Exception:
-            forced_lead_side = "right"
-        # ── ДИАГНОСТИКА (для правого клика «Диагностика угла») ──
-        # Пишем вычисленные признаки прямо на op, чтобы юзер мог их
-        # прочитать в приложении и прислать — так видно, где превью
-        # расходится с ожиданием без гадания.
-        try:
-            _rr = _rounding_arc.radius if _rounding_arc is not None else None
-            _rc = _rounding_arc.center if _rounding_arc is not None else None
-            op.attributes['_diag'] = {
-                'convex': _convex,
-                'inward': _inward,
-                'forced_lead_side': forced_lead_side,
-                'rounding_R': (round(_rr, 3) if _rr is not None else None),
-                'rounding_center': ([round(_rc[0], 2), round(_rc[1], 2)]
-                                    if _rc is not None else None),
-                'corner_radius': op.attributes.get('corner_radius'),
-                'apex': [round(op.attributes.get('corner_apex', (0, 0))[0], 1),
-                         round(op.attributes.get('corner_apex', (0, 0))[1], 1)],
-            }
+            if polypath_offset is not None and polypath_offset.closed:
+                polypath_offset = apply_overlap(polypath_offset,
+                                                pending_overlap)
         except Exception:
             pass
-    # ОСНОВНОЙ путь (не corner): forced_lead_side=None. Основные лиды
-    # строит auto-подбор — их НЕ трогаем, проблема только в углах.
-    # ── LEAD-OUT откладывается на ПОСЛЕ автоподбора + overlap ──
-    lead_out_to_build = (tp.exit.enabled 
-                         and tp.exit.style in (LeadStyle.LINE_ARC_TANGENTIAL, LeadStyle.LINE)
-                         and polypath_offset and polypath_offset.segments)
-    
-    # ── ПЛАНИРОВАНИЕ LEAD-IN ЕДИНОЙ ФУНКЦИЕЙ ──
-    # plan_lead_in делает всё:
-    #   1) построение line+arc на старте polypath'а
-    #   2) проверка коллизий (line-only апроксимация + bbox prefilter)
-    #   3) автоподбор позиции (сдвиги ±1..±8мм) если коллизия
-    #   4) если не помогло — варианты угла + укорачивание
-    # Тот же код использует и mtx_anderson.py → одинаковые результаты.
+
+    # ── ЛИДЫ: РИСУЕМ ПУТЬ ФРЕЗЫ, А НЕ ОСЕВУЮ ──
+    # plan_pass_leads вернул лид в координатах ОСЕВОЙ — ровно то, что
+    # уйдёт в `.anc`. Стойка по G42 смещает его на полуэквидистанту
+    # ВПРАВО ПО ХОДУ; это смещение и есть то, что едет фреза, и его
+    # показываем.
+    from ..geometry.path_offset import cutter_path_of_lead as _cut_lead
+    # Знак смещения — сторона компенсации, как её пишет эмиттер:
+    # G42 (справа по ходу) для всех проходов, кроме LEFT → G41 (слева).
+    _lead_sgn = (-1.0 if tp.side == ContourSide.LEFT else 1.0)
+    lead_in_poly = None
+    lead_out_poly = None
     lead_in_collision = False
     lead_out_collision = False
-    
-    auto_avoid_all = bool(options_extras.get('auto_avoid_all', True))
-    
-    # Режим применения lead'а: 0=Авто, 1=Все, 2=Выделенные.
-    # Selected режим означает: юзерские поля применяются ТОЛЬКО к 
-    # выделенному ножу, остальные строятся автоалгоритмом.
-    lead_mode = int(options_extras.get('lead_mode', 0))
-    selected_op_id = str(options_extras.get('selected_op_id', ''))
-    
-    # Для конкретного op определяем: использовать юзерские поля точно 
-    # (auto_avoid=False) или автосдвиг (auto_avoid=True):
-    #   mode=0 Auto     → все → auto_avoid=True
-    #   mode=1 All      → все → auto_avoid=False (юзерские поля точно)
-    #   mode=2 Selected → выделенный op → False (поля к нему), остальные → True
-    if lead_mode == 2:
-        this_op_auto_avoid = (op.id != selected_op_id)
-    elif lead_mode == 1:
-        this_op_auto_avoid = False
-    else:
-        this_op_auto_avoid = True
-    # (Legacy: если auto_avoid_all задан из старого кода — respect его)
-    if not auto_avoid_all and lead_mode == 0:
-        this_op_auto_avoid = False
-    # РУЧНАЯ НАСТРОЙКА ЭЛЕМЕНТА ПОБЕЖДАЕТ АВТО-ПОДБОР.
-    # Если у операции есть lead_override (оператор задал заход вручную) —
-    # авто-подбор не двигает лид, иначе ручные заходы «возвращались к
-    # умолчанию» после пересчёта/загрузки сборки. В эмиттере такая защита
-    # (_has_user_override) уже была, во вьювере — не было.
-    try:
-        if op.attributes.get('lead_override'):
-            this_op_auto_avoid = False
-    except Exception:
-        pass
-    
-    # Кеш контуров для коллизий — строится ОДИН раз, переиспользуется для 
-    # lead-in и lead-out.
-    contours_lines_cache = []
-    contours_bboxes_cache = []
-    if project is not None and (tp.entry.enabled or lead_out_to_build):
-        from ..geometry.lead_collision import build_contours_cache
-        knife_layer = project.get_layer_by_name("Knife")
-        if knife_layer is not None:
-            contours_lines_cache, contours_bboxes_cache = build_contours_cache(
-                knife_layer.geometries)
-    
-    if (tp.entry.enabled 
-            and tp.entry.style in (LeadStyle.LINE_ARC_TANGENTIAL, LeadStyle.LINE)
-            and polypath_offset and polypath_offset.segments):
-        from ..geometry.lead_collision import LeadGeometryRequest, plan_lead_in
-        
-        req_in = LeadGeometryRequest(
-            is_entry=True,
-            pass_side=tp.side.name,
-            angle_deg=lead_in_angle,
-            line_length=(_line_len_alpha_view(lead_in_length_mult,
-                                              lead_in_angle)
-                             * _lead_shrink_view),
-            arc_radius=(lead_in_radius_mult * _c_rmult
-                            * _lead_scale_view * _lead_shrink_view),
-            style=('line' if tp.entry.style == LeadStyle.LINE else 'line_arc'),
-            forced_side=forced_lead_side,
-        )
-        
-        # Опциональный exit_request — чтобы plan_lead_in при поиске сдвига 
-        # учитывал коллизию ОБОИХ leads (in + out). Без этого может выйти:
-        # lead-in OK, но lead-out на той же точке коллизирует → не сдвигается.
-        exit_req = None
-        if lead_out_to_build:
-            exit_req = LeadGeometryRequest(
-                is_entry=False,
-                pass_side=tp.side.name,
-                angle_deg=lead_out_angle,
-                line_length=(_line_len_alpha_view(lead_out_length_mult,
-                                              lead_out_angle)
-                             * _lead_shrink_view),
-                arc_radius=(lead_out_radius_mult * _c_rmult
-                            * _lead_scale_view * _lead_shrink_view),
-                style=('line' if tp.exit.style == LeadStyle.LINE else 'line_arc'),
-                forced_side=None,
-            )
-        
-        # path_is_cutter: сюда уходит УЖЕ смещённый путь (эквидистанта),
-        # а не осевая — он сам и есть путь фрезы. Пост передаёт осевую,
-        # и проверка смещает её сама. Без этого флага вьювер получал
-        # двойное смещение и уводил заходы не туда (v1.7.56).
-        polypath_offset, lead_in_poly, lead_in_collision, _ = plan_lead_in(
-            polypath_offset, req_in,
-            contours_lines_cache, contours_bboxes_cache,
-            geom.id, effective_tool_offset,
-            auto_avoid=(this_op_auto_avoid and project is not None),
-            safety_factor=1.2,
-            exit_request=exit_req,
-            overlap=pending_overlap,
-            path_is_cutter=True)
-        # ── СОХРАНЯЕМ ТОЧКУ ЗАХОДА ДЛЯ ЭМИТТЕРА ──
-        # Эмиттер возьмёт её как старт контура (см. mtx_anderson), чтобы
-        # .anc давал те же заходы, что видны в превью: логичнее и меньше
-        # холостых перемещений станка. Эмиттер проверяет валидность re-root
-        # и откатывается на свой авто-подбор, если контур поехал.
+    if _plan is not None:
+        lead_in_collision = bool(_plan.lead_in_collision)
+        lead_out_collision = bool(_plan.lead_out_collision)
+        # ── ПРЕДУПРЕЖДЕНИЕ ДЛЯ ЛИДА ДОРАБОТКИ ──
+        # Подбор его не видел (список контуров пуст, см. выше), но
+        # ПОКАЗАТЬ опасность надо: рисуем ту кривую, что уйдёт в станок,
+        # и если она подходит к ножу — красим красным. Так картинка и
+        # правдива, и предупреждает.
+        if is_corner_view:
+            from ..geometry.lead_collision import lead_crosses_contours
+            for _L, _is_in in ((_plan.lead_in, True),
+                               (_plan.lead_out, False)):
+                if not _L or not _L.segments:
+                    continue
+                _jp = _L.segments[-1].b if _is_in else _L.segments[0].a
+                try:
+                    _hit = lead_crosses_contours(
+                        _L, _cl_full, geom.id, _jp,
+                        tool_offset=effective_tool_offset,
+                        safety_factor=1.0, contours_bboxes=_cb_full)
+                except Exception:
+                    _hit = False
+                if _hit:
+                    if _is_in:
+                        lead_in_collision = True
+                    else:
+                        lead_out_collision = True
+        for _src, _set in ((_plan.lead_in, 'in'), (_plan.lead_out, 'out')):
+            if not _src or not _src.segments:
+                continue
+            try:
+                _drawn = _cut_lead(_src, effective_tool_offset * _lead_sgn)
+            except Exception:
+                _drawn = _src
+            if _set == 'in':
+                lead_in_poly = _drawn
+            else:
+                lead_out_poly = _drawn
+
+        # ── ТОЧКА ЗАХОДА ДЛЯ ПОСТА ──
+        # Пост возьмёт её как старт контура, чтобы `.anc` давал те же
+        # заходы, что видны в превью: меньше холостых перемещений. Точка
+        # лежит на ОСЕВОЙ — пост работает в тех же координатах.
         try:
-            if polypath_offset and polypath_offset.segments:
-                _e = polypath_offset.segments[0].a
+            if polypath is not None and polypath.segments:
+                _e = polypath.segments[0].a
                 op.attributes.setdefault('_lead_entry', {})[tp.side.name] = [
                     float(_e[0]), float(_e[1])]
         except Exception:
             pass
-    # ── ПРИМЕНЕНИЕ OVERLAP ПОСЛЕ автоподбора ──
-    # Теперь когда позиция старта окончательно подобрана, удлиняем 
-    # программную осевую и offset на src.overlap мм.
-    if pending_overlap > 1e-9:
-        from ..geometry.path_offset import apply_overlap
-        try:
-            if polypath is not None and polypath.closed:
-                polypath = apply_overlap(polypath, pending_overlap)
-            if polypath_offset is not None and polypath_offset.closed:
-                polypath_offset = apply_overlap(polypath_offset, pending_overlap)
-        except Exception:
-            pass
-    
-    # ── ПЛАНИРОВАНИЕ LEAD-OUT ИЗ ФИНАЛЬНОГО КОНЦА ──
-    # Через ту же plan_lead_out функцию (без авто-сдвига — позиция жёстко 
-    # определена концом polypath'а после применения overlap'а).
-    if lead_out_to_build and polypath_offset and polypath_offset.segments:
-        from ..geometry.lead_collision import LeadGeometryRequest, plan_lead_out
-        
-        # forced_side для exit'а вычисляется так же как для entry: bbox 
-        # центр для углов, иначе авто.
-        forced_exit_side = None
-        if is_3d_corner or is_2d_corner:
-            # Сторона выхода угла = та же, что вход (единый знак лида угла,
-            # в сторону смещения эквидистанты угла). forced_lead_side уже
-            # вычислен выше векторно.
-            forced_exit_side = forced_lead_side
-        # ОСНОВНОЙ путь: forced_exit_side=None — auto-подбор, не трогаем.
-        
-        req_out = LeadGeometryRequest(
-            is_entry=False,
-            pass_side=tp.side.name,
-            angle_deg=lead_out_angle,
-            line_length=(_line_len_alpha_view(lead_out_length_mult,
-                                              lead_out_angle)
-                             * _lead_shrink_view),
-            arc_radius=(lead_out_radius_mult * _c_rmult
-                            * _lead_scale_view * _lead_shrink_view),
-            style=('line' if tp.exit.style == LeadStyle.LINE else 'line_arc'),
-            forced_side=forced_exit_side,
-        )
-        lead_out_poly, lead_out_collision, _ = plan_lead_out(
-            polypath_offset, req_out,
-            contours_lines_cache, contours_bboxes_cache,
-            geom.id, effective_tool_offset,
-            path_is_cutter=True)
-    
+
+        # Диагностика стороны/зазора лида доработки — для правого клика
+        # «Диагностика угла»: видно, что именно посчитал общий код.
+        if is_corner_view:
+            try:
+                _d = op.attributes.setdefault('_diag', {})
+                _d['forced_lead_side'] = _plan.lead_side
+                _d['lead_clr_in'] = round(_plan.clr_in, 4)
+                _d['lead_clr_out'] = round(_plan.clr_out, 4)
+                if _lead_journal:
+                    _d['lead_journal'] = list(_lead_journal)
+            except Exception:
+                pass
+
     return {
         'contour': polypath_offset,
         'lead_in': lead_in_poly,

@@ -493,121 +493,22 @@ class MtxAndersonGVM(PostProcessor):
         #     * 2D: corner_first_idx..corner_last_idx (диапазон дуг скругления)
         #     * 3D: corner3d_point + segment_index (точка острого излома)
         #   - ToolType в шапке программы (0 для 2D, 1 для 3D)
+        # ── УЧАСТОК ДОРАБОТКИ — ОБЩЕЙ ФУНКЦИЕЙ С ВЬЮВЕРОМ (v1.7.58) ──
+        # Карман, 2D- или 3D-угол: какой именно, решают атрибуты
+        # операции. Раньше это место было написано здесь и во вьювере по
+        # отдельности, и припуск 2D-угла разошёлся (1.5 против 3.0+) —
+        # картинка угла показывала не ту кривую, к которой в программе
+        # крепится лид.
         is_corner_rework = False
-        if (op.kind == OperationKind.CORNER_REWORK
-                and 'pocket_s0' in op.attributes):
-            # ── ПРОТОЧКА КАРМАНА (v1.7.38) ──
-            # Основной проход выбросил этот участок (см. bridge_narrow_pits),
-            # металл оттуда снимает тонкая фреза — и на ВЕСЬ карман, а не
-            # вокруг угла: прежде здесь оказывалась только угловая
-            # операция с запасом 1.5 мм, и карман длиной 20 мм она
-            # покрывала на десятую часть.
-            from ..geometry.path_offset import _subpath_forward as _sfw
-            from ..geometry.direction import normalize_for_side as _nfs
-            from ..geometry.primitives import Polypath as _PP
-            _pside = op.attributes.get('pocket_side', 'OUTSIDE')
-            _ppar = _nfs(geom.polypath, _pside)
-            _ptot = sum(x.length() for x in _ppar.segments)
-            # Концы фрагмента отодвигаются до ПОЛОГИХ участков (v1.7.47):
-            # лид начинается на краю, и если край попал на бугор — заход
-            # сходит с него прямо в лезвие.
-            from ..geometry.path_offset import (
-                pocket_fragment_with_gentle_ends as _pfge)
-            _segs = _pfge(_ppar, float(op.attributes['pocket_s0']),
-                          float(op.attributes['pocket_s1']), pad_mm=0.5)
-            if not _segs:
+        if op.kind == OperationKind.CORNER_REWORK:
+            from ..geometry.path_offset import rework_fragment
+            polypath = rework_fragment(
+                geom, op, tp.side.name,
+                options.extras.get('tool_equidistant', 1.3) / 2.0,
+                log=lambda msg: _mach_log(options, geom, tp, msg))
+            if polypath is None or not polypath.segments:
                 return line_no
-            polypath = _PP(segments=_segs, closed=False)
             is_corner_rework = True
-            # Разворачивать нечего: участок вырезан из контура, уже
-            # нормализованного под свой проход.
-        elif (op.kind == OperationKind.CORNER_REWORK
-            and op.attributes.get('corner_is_3d')
-            and 'corner3d_point' in op.attributes):
-            # 3D угол — фрагмент вокруг точки острого излома
-            from ..geometry.path_offset import (
-                extract_subpath_around_point, corner_pad_for_angle)
-            pt = op.attributes['corner3d_point']
-            seg_hint = op.attributes['corner3d_segment_index']
-            # Припуск считается от остроты угла (v1.7.49): в клине фреза
-            # встаёт не ближе T/sin(A/2) от вершины, и фрагмент обязан
-            # доставать дальше упора ОСНОВНОЙ фрезы — иначе полоса между
-            # упорами не снимается никем.
-            _pad3d = corner_pad_for_angle(
-                op.attributes.get('corner3d_interior_angle'),
-                options.extras.get('tool_equidistant', 1.3) / 2.0)
-            polypath = extract_subpath_around_point(
-                geom.polypath, pt, seg_hint, pad_mm=_pad3d
-            )
-            # Упор основной фрезы в клине. Если припуск до него не
-            # достал (сработал потолок на игольчатом угле), полоса
-            # между упорами остаётся несрезанной — это в журнал.
-            try:
-                import math as _m3d
-                _ang3d = float(op.attributes.get('corner3d_interior_angle'))
-                _sin3d = _m3d.sin(_m3d.radians(_ang3d / 2.0))
-                _stop3d = ((options.extras.get('tool_equidistant', 1.3) / 2.0)
-                           / _sin3d) if _sin3d > 1e-6 else None
-                if _stop3d is not None and _pad3d <= _stop3d:
-                    _mach_log(options, geom, tp,
-                              f"УГОЛ 3D {_ang3d:.1f}°: фрагмент {_pad3d:.2f} мм "
-                              f"не достаёт до упора основной фрезы "
-                              f"{_stop3d:.2f} мм — полоса между упорами "
-                              f"остаётся несрезанной, нужна ручная правка")
-            except (TypeError, ValueError):
-                pass
-            is_corner_rework = True
-            if not polypath.segments:
-                return line_no
-            
-            # ── НАПРАВЛЕНИЕ ФРАГМЕНТА (3D corner) ──
-            # CORNER_REWORK 3D идут с side=OUTSIDE → G42 (комп. вправо), 
-            # т.к. corner rework — часть внутреннего реза blade'а. По 
-            # конвенции (normalize_for_side): OUTSIDE = внутренний рез = CW.
-            # Разворот под CW: центр должен быть СПРАВА от касательной. 
-            # Тогда G42 (комп. вправо) даёт фрезу с той же стороны = со 
-            # стороны центра ножа = ВНУТРЬ контура (крючок).
-            # Направление — по намотке РОДИТЕЛЬСКОГО контура, общей
-            # функцией с вьювером (v1.7.37). Прежний признак «центр bbox
-            # ножа справа от касательной» на ложках и языках врал: центр
-            # bbox там лежит вне контура.
-            from ..geometry.direction import orient_corner_fragment
-            polypath = orient_corner_fragment(
-                polypath, geom.polypath,
-                'INSIDE' if tp.side == ContourSide.INSIDE else 'OUTSIDE')
-        
-        elif (op.kind == OperationKind.CORNER_REWORK
-            and 'corner_first_idx' in op.attributes
-            and 'corner_last_idx' in op.attributes):
-            from ..geometry.path_offset import extract_subpath_around_indices
-            first_idx = op.attributes['corner_first_idx']
-            last_idx = op.attributes['corner_last_idx']
-            polypath = extract_subpath_around_indices(
-                geom.polypath, first_idx, last_idx, pad_mm=1.5
-            )
-            is_corner_rework = True
-            if not polypath.segments:
-                return line_no
-            
-            # ── НАПРАВЛЕНИЕ ФРАГМЕНТА ──
-            # CORNER операции идут с side=OUTSIDE → G42 (комп. вправо), 
-            # т.к. corner rework — часть внутреннего реза blade'а. По 
-            # конвенции (normalize_for_side): OUTSIDE = внутренний рез = CW.
-            # Внутренний рез blade'ов идёт CW, corners должны продолжать 
-            # это направление: центр ножа СПРАВА от касательной, фреза с 
-            # G42 идёт в ту же сторону = ВНУТРЬ ножа = крючок в угол.
-            # Эмиттер всегда даёт G42 (фреза справа по ходу), поэтому
-            # сторону задаёт направление обхода фрагмента. Берём его из
-            # намотки РОДИТЕЛЬСКОГО контура — ровно так же, как её берёт
-            # основной проход в normalize_for_side (v1.7.37).
-            #
-            # Прежний признак «центр bbox ножа справа от касательной» —
-            # грубая замена «внутри контура». На ложке, языке или крючке
-            # центр bbox лежит вне контура, и угол резался зеркально.
-            from ..geometry.direction import orient_corner_fragment
-            polypath = orient_corner_fragment(
-                polypath, geom.polypath,
-                'INSIDE' if tp.side == ContourSide.INSIDE else 'OUTSIDE')
         else:
             polypath = geom.polypath
         
@@ -857,593 +758,138 @@ class MtxAndersonGVM(PostProcessor):
         tool_eq = options.extras.get('tool_equidistant', tool_radius_estimate * 2)
         tool_offset = tool_eq / 2.0
 
-        # ── МАСШТАБ LEAD-IN/OUT (v1.7.11) ──
-        # Множители «x_tool_rad» AlphaCAM считает от ЭКВИДИСТАНТЫ, а не от
-        # половины. Замерено сличением с эталонным выходом альфы на 124536:
-        # при повороте 45° хорда выезда = 2R·sin(22.5°) = 0.7654·R, и у
-        # альфы она стабильно 0.8159 мм → R = 1.0661 = ровно эквидистанта.
-        # У меня было 0.4080 мм → R = 0.5330, то есть ВДВОЕ короче: лиды
-        # масштабировались на tool_offset. Направление выезда при этом
-        # совпадало (−22.5° в обоих), поэтому расхождение не бросалось в
-        # глаза — только длина.
-        # У CORNER_REWORK режет ТОНКАЯ фреза T3, и лид должен быть по её
-        # эквидистанте (v1.7.29). Раньше здесь стояла одна величина на
-        # всё, и лиды углов выходили на четверть длиннее, чем рисовал
-        # вьювер, — на узком месте выезд дотягивался до контура.
+        # ── ПЛАНИРОВАНИЕ ЛИДОВ — ОБЩИМ КОДОМ С ВЬЮВЕРОМ (v1.7.58) ──
+        # Раньше этот блок (≈600 строк) существовал здесь и во вьювере
+        # по отдельности и расходился молча: v1.7.11, v1.7.29, v1.7.39,
+        # v1.7.43, v1.7.45, v1.7.55, v1.7.56 — всё это правки одного и
+        # того же, «в программе одно, на картинке другое». Теперь обе
+        # стороны зовут plan_pass_leads и получают лид НА ОСЕВОЙ (именно
+        # она уходит в .anc; путь фрезы из неё делает стойка по G42).
+        from ..geometry.lead_collision import (
+            PassLeadParams, plan_pass_leads)
+
+        # Масштаб множителей «x_tool_rad» — эквидистанта фрезы ЭТОГО
+        # прохода: у доработки режет ТОНКАЯ T3, и лид обязан быть по её
+        # эквидистанте (v1.7.29).
         lead_scale = tool_eq
         if is_corner_rework:
             _c_eq = options.extras.get('corner_tool_equidistant')
             if _c_eq and float(_c_eq) > 0:
                 lead_scale = float(_c_eq)
-        # Множители лида для углов — свои (v1.7.30).
-        _lead_mult = 1.0
-        if is_corner_rework:
-            _lead_mult = float(options.extras.get(
-                'corner_lead_length_mult', 0.5) or 1.0)
-        _lead_rmult = 1.0
-        if is_corner_rework:
-            _lead_rmult = float(options.extras.get(
-                'corner_lead_radius_mult', 0.5) or 1.0)
-        
-        # Формула lead-in (как в Alpha):
-        #   lateral_clearance = user_factor × tool_offset
-        #   line_length = lateral_clearance / sin(approach_angle)
-        # При user=1, angle=45°, tool_offset=0.575: line=0.575/0.707=0.813
-        # При user=1, angle=90°: line=0.575 (минимум).
-        import math as _m
-        # Запас длины прямой части лида доработки (v1.7.39): короткий
-        # лид в узкой щели упирается в стенку и режет ещё до выхода на
-        # путь. Запас задаётся в диаметрах пятки T3 и уводит точку
-        # врезания дальше от металла.
-        _lead_extra = 0.0
-        if is_corner_rework:
-            try:
-                _lead_extra = float(options.extras.get(
-                    'corner_lead_extra_mm', 0.0) or 0.0)
-            except Exception:
-                _lead_extra = 0.0
 
-        def _line_len_alpha(user_factor: float, angle_deg: float) -> float:
-            ang_rad = _m.radians(max(5.0, min(175.0, angle_deg)))
-            sin_a = _m.sin(ang_rad)
-            if sin_a < 0.05: sin_a = 0.05  # защита от близких к 0/180
-            return (user_factor * _lead_mult * lead_scale + _lead_extra) / sin_a
-        
-        # ── ВЫБОР СТОРОНЫ ЗАХОДА/ВЫХОДА ──
-        # Заходы ДВУХ проходов должны расходиться В РАЗНЫЕ СТОРОНЫ (не
-        # пересекать друг друга и канал между резами):
-        #   INSIDE (CW, режет внешний контур) → заход НАРУЖУ
-        #   OUTSIDE (CCW, режет внутренний)   → заход ВНУТРЬ
-        # Внутри pick_lead_side_for_pass — динамический выбор left/right через
-        # point-in-polygon дальней точки (фиксированная сторона не годится:
-        # «наружу» зависит от локальной касательной).
-        from ..geometry.lead_inout import pick_lead_side_for_pass
-        # ── ЭТАЛОН «ВНУТРИ/СНАРУЖИ» ДЛЯ УГЛОВ (v1.7.19) ──
-        # pick_lead_side_for_pass решает, куда направить лид, тестом
-        # point-in-polygon дальней точки. Для CORNER_REWORK в polypath
-        # лежит ОТКРЫТЫЙ фрагмент контура — на нём такой тест бессмыслен,
-        # и сторона лида получалась случайной: часть углов заходила
-        # правильно, часть — навстречу.
-        # Берём для теста родительский ЗАМКНУТЫЙ контур ножа.
-        _side_ref = polypath
-        if is_corner_rework and geom.polypath and geom.polypath.closed:
-            _side_ref = geom.polypath
-        _ll = _line_len_alpha(tp.entry.line_length_x_tool_rad, tp.entry.approach_angle)
-        _ar = tp.entry.arc_radius_x_tool_rad * _lead_rmult * lead_scale
-        _ang = tp.entry.approach_angle
-        _shrink_in = _shrink_out = 1.0
-        _ang_in = _ang_out = None
+        def _x(key, dflt):
+            try:
+                return float(options.extras.get(key, dflt) or dflt)
+            except Exception:
+                return dflt
+
+        # ── Параметры лида: ручная правка отдельного ножа побеждает ──
+        # Юзер мог задать свои значения для конкретного ножа в режиме
+        # «Выделенные» — они лежат в op.attributes['lead_override'].
+        # Маппинг столбцов диалога:
+        #   доработка — заход из «Внутренний», выход из «Внешний»;
+        #   OUTSIDE (внутренний рез) → «Внутренний» на оба;
+        #   INSIDE  (внешний рез)    → «Внешний»   на оба.
+        _lead_ov = op.attributes.get('lead_override', {})
+        if _lead_ov and is_corner_rework:
+            _ov_in = _lead_ov.get('lead_inside', {})
+            _ov_out = _lead_ov.get('lead_outside', {})
+        elif _lead_ov and tp.side == ContourSide.OUTSIDE:
+            _ov_in = _ov_out = _lead_ov.get('lead_inside', {})
+        elif _lead_ov and tp.side == ContourSide.INSIDE:
+            _ov_in = _ov_out = _lead_ov.get('lead_outside', {})
+        else:
+            _ov_in = _ov_out = {}
+
+        # Автоподбор отключаем, если позицию задал юзер (ручная правка
+        # или режим «Все элементы»): его точка — закон, автосдвиг её
+        # «исправлял» и уводил заход не туда (41000/121555). Коллизия при
+        # этом всё равно детектится и подсветится в превью красным.
+        _proj_lead_mode = 0
+        try:
+            _proj_lead_mode = int(getattr(project, 'attributes', {})
+                                  .get('lead_mode', 0))
+        except Exception:
+            _proj_lead_mode = 0
+
+        _lead_params = PassLeadParams(
+            pass_side=tp.side.name,
+            is_corner_rework=bool(is_corner_rework),
+            tool_offset=tool_offset,
+            lead_scale=lead_scale,
+            length_mult=(_x('corner_lead_length_mult', 0.5)
+                         if is_corner_rework else 1.0),
+            radius_mult=(_x('corner_lead_radius_mult', 0.5)
+                         if is_corner_rework else 1.0),
+            extra_mm=(_x('corner_lead_extra_mm', 0.0)
+                      if is_corner_rework else 0.0),
+            entry_enabled=(tp.entry.enabled and tp.entry.style in (
+                LeadStyle.LINE_ARC_TANGENTIAL, LeadStyle.LINE)),
+            entry_style=('line' if tp.entry.style == LeadStyle.LINE
+                         else 'line_arc'),
+            entry_angle=_ov_in.get('angle', tp.entry.approach_angle),
+            entry_length=_ov_in.get('length',
+                                    tp.entry.line_length_x_tool_rad),
+            entry_radius=_ov_in.get('length',
+                                    tp.entry.arc_radius_x_tool_rad),
+            exit_enabled=(tp.exit.enabled and tp.exit.style in (
+                LeadStyle.LINE_ARC_TANGENTIAL, LeadStyle.LINE)),
+            exit_style=('line' if tp.exit.style == LeadStyle.LINE
+                        else 'line_arc'),
+            exit_angle=_ov_out.get('angle', tp.exit.approach_angle),
+            exit_length=_ov_out.get('length',
+                                    tp.exit.line_length_x_tool_rad),
+            exit_radius=_ov_out.get('length',
+                                    tp.exit.arc_radius_x_tool_rad),
+            overlap=pending_overlap,
+            no_avoid=bool(_lead_ov) or (_proj_lead_mode == 1),
+            # Точка захода из превью. Пост ставит старт контура туда,
+            # но подбор не выключает: он начинает с этой позиции, и
+            # безопасная точка остаётся на месте, а небезопасная
+            # исправляется (v1.7.57).
+            entry_hint=(op.attributes.get('_lead_entry', {})
+                        .get(tp.side.name)),
+        )
+
+        # Соседние ножи для замера лида доработки — ИЗ СЛОЯ, а не из
+        # операций: программа доработки генерируется отдельным набором
+        # операций, BLADE_FORMING там нет, и список выходил пустым
+        # (v1.7.40). Щель чаще всего образована вершиной СОСЕДНЕГО
+        # лезвия, а не своим контуром.
+        _nb = []
         if is_corner_rework:
-            # ── ЛИД ДОРАБОТКИ — ПО ЗАМЕРУ ЗАЗОРА (v1.7.39) ──
-            # Эмиттер пишет G42, фреза снимает металл справа по ходу, и
-            # заходить она обязана оттуда же — по уже снятому металлу.
-            # Но в узкой щели справа может не быть места: лид ложится на
-            # встречную стенку (Knife_1 заказа 124173 — щель 1.3 мм при
-            # ширине реза T3 1.1 мм). Поэтому сторону не назначаем
-            # правилом, а меряем зазор обеими сторонами и берём ту, где
-            # его больше; при равенстве — справа по ходу.
-            from ..geometry.lead_inout import fit_rework_lead
-            _cut_half = (lead_scale / 2.0 if lead_scale > 0 else 0.5)
-            # Соседние ножи — обязательная часть замера: щель чаще всего
-            # образована вершиной СОСЕДНЕГО лезвия, а не своим контуром.
-            # Берём соседей ИЗ СЛОЯ, а не из операций: программа
-            # доработки генерируется отдельным набором операций, и
-            # BLADE_FORMING там нет — список соседей получался пустым
-            # (v1.7.40).
-            _nb = []
             try:
                 _klay = project.get_layer_by_name("Knife")
-                for _go in (getattr(_klay, 'geometries', ()) if _klay else ()):
+                for _go in (getattr(_klay, 'geometries', ()) if _klay
+                            else ()):
                     if (_go is not None and _go.is_closed
                             and _go.polypath is not None
                             and _go is not geom):
                         _nb.append(_go.polypath)
             except Exception:
                 _nb = []
-            lead_side, _shrink_in, _ang_in, _clr_in = fit_rework_lead(
-                contour_start_point, contour_start_tangent,
-                geom.polypath, _cut_half, _ll, _ar, _ang,
-                is_exit=False, neighbours=_nb,
-                style=('line' if tp.entry.style == LeadStyle.LINE
-                       else 'line_arc'))
-            _ll *= _shrink_in
-            _ar *= _shrink_in
-            _ang = _ang_in
-            if _clr_in < 0:
-                _mach_log(options, geom, tp,
-                          f"ЛИД ДОРАБОТКИ: заход подходит к металлу ближе "
-                          f"полуширины реза на {abs(_clr_in) * 1000:.0f} мкм "
-                          f"({contour_start_point[0]:.1f} "
-                          f"{contour_start_point[1]:.1f}) — места нет ни "
-                          f"длиной, ни углом, нужна ручная правка")
-        elif tp.side in (ContourSide.INSIDE, ContourSide.OUTSIDE):
-            lead_side = pick_lead_side_for_pass(
-                contour_start_point, contour_start_tangent, _side_ref,
-                tp.side.name, _ll, _ar, _ang, is_exit=False)
-        elif tp.side == ContourSide.LEFT:
-            lead_side = "left"
-        elif tp.side == ContourSide.RIGHT:
-            lead_side = "right"
-        else:
-            lead_side = "right"
-        # Сторона выхода считается отдельно по КОНЦЕВОЙ касательной.
-        if is_corner_rework:
-            from ..geometry.lead_inout import fit_rework_lead as _frl
-            lead_out_side, _shrink_out, _ang_out, _clr_out = _frl(
-                contour_end_point, contour_end_tangent,
-                geom.polypath, (lead_scale / 2.0 if lead_scale > 0 else 0.5),
-                _line_len_alpha(tp.exit.line_length_x_tool_rad,
-                                tp.exit.approach_angle),
-                tp.exit.arc_radius_x_tool_rad * _lead_rmult * lead_scale,
-                tp.exit.approach_angle, is_exit=True, neighbours=_nb,
-                style=('line' if tp.exit.style == LeadStyle.LINE
-                       else 'line_arc'))
-            if _clr_out < 0:
-                _mach_log(options, geom, tp,
-                          f"ЛИД ДОРАБОТКИ: выход подходит к металлу ближе "
-                          f"полуширины реза на {abs(_clr_out) * 1000:.0f} мкм "
-                          f"({contour_end_point[0]:.1f} "
-                          f"{contour_end_point[1]:.1f}) — места нет ни "
-                          f"длиной, ни углом, нужна ручная правка")
-        elif tp.side in (ContourSide.INSIDE, ContourSide.OUTSIDE):
-            lead_out_side = pick_lead_side_for_pass(
-                contour_end_point, contour_end_tangent, _side_ref, tp.side.name,
-                _line_len_alpha(tp.exit.line_length_x_tool_rad, tp.exit.approach_angle),
-                tp.exit.arc_radius_x_tool_rad * _lead_rmult * lead_scale,
-                tp.exit.approach_angle, is_exit=True)
-        else:
-            lead_out_side = lead_side
-        
-        # Геометрия захода/отхода
-        lead_in_geom = None
-        lead_out_geom = None
-        
-        # Минимальный зазор (мм) от точек захода:
-        #   - INSIDE: внутри своего bbox с учётом ПУТИ фрезы 
-        #     (path внутри bbox смещён на tool_offset)
-        #   - OUTSIDE: снаружи своего bbox с учётом пути + ≥1мм от 
-        #     соседних bbox С УЧЁТОМ их INSIDE-пути (тоже смещён внутрь
-        #     на tool_offset, но это значит реальный край соседа = его bbox)
-        SAFE_CLEARANCE = 1.0
-        
-        # Bbox обрабатываемого контура (свой нож)
-        from ..geometry.path_offset import (polypath_bbox, 
-                                             shift_start_along_contour)
-        bb_x0, bb_y0, bb_x1, bb_y1 = polypath_bbox(polypath)
-        
-        # Bbox'ы СОСЕДНИХ ножей на листе (для проверки OUTSIDE заходов)
-        # Кэшируется на уровне проекта чтобы не пересчитывать для каждого PART
-        # Соседи считаются БЕЗ текущей операции, поэтому кэш по проекту
-        # всё равно не переиспользовался — ветки if и else были одинаковы,
-        # а словарь по `id(project)` ещё и держал чужие данные (см.
-        # `_project_contours_cache`). Убрали (v1.7.48).
-        neighbors = []
-        for other_op in project.operations:
-            if other_op is op or other_op.kind != OperationKind.BLADE_FORMING:
-                continue
-            for gid in other_op.geometry_ids:
-                g_other = project.get_geometry(gid)
-                if g_other and g_other.polypath:
-                    neighbors.append(polypath_bbox(g_other.polypath))
-        
-        def _point_safely_inside(p):
-            """True если точка валидна для INSIDE захода.
-            
-            INSIDE-путь фрезы при G41 идёт ВНУТРИ контура на tool_offset.
-            Фактический край пути = bbox − tool_offset со всех сторон.
-            Заход должен быть ещё на SAFE_CLEARANCE глубже = 
-              bbox − tool_offset − 1мм
-            """
-            inset = tool_offset + SAFE_CLEARANCE
-            return (bb_x0 + inset <= p[0] <= bb_x1 - inset
-                    and bb_y0 + inset <= p[1] <= bb_y1 - inset)
-        
-        def _point_outside_own_bbox(p):
-            """True если точка снаружи своего пути фрезы.
-            
-            OUTSIDE-путь фрезы при G42 идёт СНАРУЖИ контура на tool_offset.
-            Фактический внешний край пути = bbox + tool_offset.
-            Главное условие: точка НЕ ВНУТРИ этого пути.
-            """
-            ex_x0 = bb_x0 - tool_offset
-            ex_y0 = bb_y0 - tool_offset
-            ex_x1 = bb_x1 + tool_offset
-            ex_y1 = bb_y1 + tool_offset
-            dx = max(ex_x0 - p[0], 0, p[0] - ex_x1)
-            dy = max(ex_y0 - p[1], 0, p[1] - ex_y1)
-            # СНАРУЖИ расширенного bbox: хоть с одной стороны за границей
-            return (dx + dy) > 0
-        
-        def _point_only_neighbors_clear(p):
-            """True если точка не залезает в путь фрезы соседнего ножа.
-            
-            Главное условие: точка снаружи (соседний_bbox + tool_offset).
-            Соседний путь фрезы (OUTSIDE) уходит наружу его bbox на 
-            tool_offset — точка не должна туда попадать.
-            """
-            for (nx0, ny0, nx1, ny1) in neighbors:
-                ex_x0 = nx0 - tool_offset
-                ex_y0 = ny0 - tool_offset
-                ex_x1 = nx1 + tool_offset
-                ex_y1 = ny1 + tool_offset
-                dx = max(ex_x0 - p[0], 0, p[0] - ex_x1)
-                dy = max(ex_y0 - p[1], 0, p[1] - ex_y1)
-                # ВНУТРИ расширенного соседнего bbox = пересекает путь соседа
-                if dx == 0 and dy == 0:
-                    return False
-            return True
-        
-        def _point_safe_outside(p):
-            """True если точка валидна для OUTSIDE захода:
-              1. Снаружи своего пути фрезы (bbox + tool_offset)
-              2. Не залезает в путь фрезы соседнего ножа
-            Без избыточных +1мм отступов — главное чтобы не пересекать
-            пути фрезы.
-            """
-            return _point_outside_own_bbox(p) and _point_only_neighbors_clear(p)
-        
-        def _check_lead(lead, side_type):
-            """Проверка валидности захода/выхода.
-            side_type: 'in' (заход) или 'out' (выход).
-            
-            Точка СТЫКОВКИ (lead.arc.b для in / lead.arc.a для out) лежит
-            физически на контуре = на границе своего bbox. Поэтому она
-            проверяется ТОЛЬКО на соседей, а не на «снаружи своего».
-            Остальные точки траектории (в воздухе) — на полную проверку.
-            """
-            # Соберём точки выборки на прямой и дуге.
-            # Точку стыковки выделим отдельно — она крайняя на дуге.
-            line_points = []
-            arc_points = []
-            if hasattr(lead, 'line') and lead.line:
-                for i in range(6):
-                    line_points.append(lead.line.point_at(i / 5))
-            if hasattr(lead, 'arc') and lead.arc:
-                for i in range(9):
-                    arc_points.append(lead.arc.point_at(i / 8))
-            
-            # Определим точку стыковки и остальные «воздушные» точки
-            if side_type == 'in':
-                # стыковка = конец дуги, остальное = всё кроме последней
-                join_pt = arc_points[-1] if arc_points else None
-                air_points = line_points + arc_points[:-1]
-            else:
-                # стыковка = начало дуги
-                join_pt = arc_points[0] if arc_points else None
-                air_points = arc_points[1:] + line_points
-            
-            if tp.side == ContourSide.INSIDE:
-                # INSIDE: все точки в воздухе должны быть внутри своего 
-                # bbox с зазором. Стыковка не проверяется (она на контуре).
-                return all(_point_safely_inside(p) for p in air_points)
-            else:
-                # OUTSIDE: главное чтобы lead НЕ ПЕРЕСЕКАЛ путь соседних 
-                # ножей (bbox соседа + tool_offset).
-                # Проверка "снаружи своего bbox+tool_offset" не нужна — это 
-                # наш собственный путь, lead просто стыкуется к нему.
-                if join_pt is not None and not _point_only_neighbors_clear(join_pt):
-                    return False
-                return all(_point_only_neighbors_clear(p) for p in air_points)
-        
-        def _lead_violation(lead, side_type):
-            """Метрика плохости захода — максимальная глубина вторжения
-            какой-либо точки в запретный bbox (свой или соседний с tool_offset).
-            
-            0.0 = заход полностью валиден.
-            >0  = есть точки внутри запретной зоны, число — глубина вторжения.
-            
-            Используется для выбора «лучшего плохого» варианта когда
-            идеального не найти.
-            """
-            # Точки выборки
-            points = []
-            for i in range(6):
-                points.append(lead.line.point_at(i / 5))
-            for i in range(9):
-                points.append(lead.arc.point_at(i / 8))
-            
-            if side_type == 'in':
-                join_pt = points[-1]
-                air_points = points[:-1]
-            else:
-                join_pt = points[6]  # первая точка дуги
-                air_points = points[:6] + points[7:]
-            
-            max_violation = 0.0
-            
-            if tp.side == ContourSide.INSIDE:
-                # Все воздушные точки должны быть внутри bbox - tool_offset - 1
-                inset = tool_offset + SAFE_CLEARANCE
-                ix0 = bb_x0 + inset
-                iy0 = bb_y0 + inset
-                ix1 = bb_x1 - inset
-                iy1 = bb_y1 - inset
-                for p in air_points:
-                    dx = max(ix0 - p[0], 0, p[0] - ix1)
-                    dy = max(iy0 - p[1], 0, p[1] - iy1)
-                    viol = (dx*dx + dy*dy) ** 0.5  # «насколько вне допустимой зоны»
-                    if viol > max_violation:
-                        max_violation = viol
-            else:
-                # OUTSIDE: проверяем ТОЛЬКО пересечение с соседями.
-                # «Внутри своего bbox+tool_offset» — это наш собственный путь,
-                # lead естественно проходит через эту зону и это НЕ нарушение.
-                # Точку стыковки также не включаем (она на bbox).
-                for p_check in air_points:
-                    # внутри соседнего bbox+tool_offset?
-                    for (nx0, ny0, nx1, ny1) in neighbors:
-                        if (nx0 - tool_offset <= p_check[0] <= nx1 + tool_offset
-                            and ny0 - tool_offset <= p_check[1] <= ny1 + tool_offset):
-                            d_to_edge = min(
-                                p_check[0] - (nx0 - tool_offset),
-                                (nx1 + tool_offset) - p_check[0],
-                                p_check[1] - (ny0 - tool_offset),
-                                (ny1 + tool_offset) - p_check[1],
-                            )
-                            if d_to_edge > max_violation:
-                                max_violation = d_to_edge
-            
-            return max_violation
-        
-        # ── ПЛАНИРОВАНИЕ LEAD-IN ЕДИНОЙ ФУНКЦИЕЙ (общая с viewer'ом) ──
-        # plan_lead_in делает всё:
-        #   1) построение line+arc на старте polypath'а
-        #   2) проверка коллизий через line-only апроксимацию контуров +
-        #      bbox-prefilter (быстро) + distance-check от соседей с safety×1.2
-        #   3) автоподбор позиции (сдвиги ±1..±8мм) если коллизия
-        #   4) если не помогло — варианты угла + укорачивание
-        # Тот же код использует viewer_2d.py → одинаковые результаты в превью и .anc.
-        if tp.entry.enabled and tp.entry.style in (LeadStyle.LINE_ARC_TANGENTIAL, LeadStyle.LINE):
-            from ..geometry.lead_collision import (
-                LeadGeometryRequest, plan_lead_in, build_contours_cache)
-            
-            # Кеш контуров для коллизий — все замкнутые ножи проекта. 
-            # Кешируется на уровне self для переиспользования между toolpath'ами.
-            contours_lines_cache, contours_bboxes_cache = \
-                self._project_contours_cache(project)
-            
-            # Сторона захода:
-            # - INSIDE/OUTSIDE: НЕ задаём forced_side, чтобы plan_lead_in 
-            #   пересчитывал сторону на КАЖДОЙ кандидатной позиции через 
-            #   pick_lead_side_for_pass (после автоподбора стартовая позиция 
-            #   могла сдвинуться и сторона измениться).
-            # - LEFT/RIGHT/CORNER: жёстко lead_side (определён выше).
-            from ..core.project import ContourSide
-            # Доработка (угол, карман) — сторону ЗАДАЁМ жёстко (v1.7.38).
-            # Иначе plan_lead_in пересчитает её сам через
-            # pick_lead_side_for_pass, а тот ищет «внутри/снаружи»
-            # ЗАМКНУТОГО контура. Фрагмент разомкнут, лежит в узком
-            # месте — ответ там случайный, и лид уходил в нетронутое
-            # лезвие. Сторона доработки известна точно: G42, значит
-            # справа по ходу.
-            forced_side = (lead_side
-                           if (is_corner_rework
-                               or tp.side not in (ContourSide.INSIDE,
-                                                  ContourSide.OUTSIDE))
-                           else None)
-            
-            # ── Применение per-op lead_override (режим «Выделенные» из viewer'а) ──
-            # Юзер мог отредактировать параметры отдельных ножей — сохранены 
-            # в op.attributes['lead_override']. Читаем их и подменяем 
-            # соответствующие поля tp.entry/tp.exit до построения request'ов.
-            # 
-            # Маппинг:
-            #   CORNER — entry из lead_inside, exit из lead_outside (разные)
-            #   OUTSIDE (внутренний рез) → lead_inside (внутренний столбец)
-            #   INSIDE (внешний рез) → lead_outside (внешний столбец)
-            _lead_ov = op.attributes.get('lead_override', {})
-            if _lead_ov:
-                # Проверяем is_corner_rework СНАЧАЛА — corner ops теперь тоже 
-                # имеют side=OUTSIDE (внутренний рез), но у них entry/exit из 
-                # РАЗНЫХ столбцов полей (Внутренний/Внешний), не из одного.
-                if is_corner_rework:
-                    _ov_in = _lead_ov.get('lead_inside', {})
-                    _ov_out = _lead_ov.get('lead_outside', {})
-                elif tp.side == ContourSide.OUTSIDE:
-                    _ov_in = _lead_ov.get('lead_inside', {})
-                    _ov_out = _lead_ov.get('lead_inside', {})
-                elif tp.side == ContourSide.INSIDE:
-                    _ov_in = _lead_ov.get('lead_outside', {})
-                    _ov_out = _lead_ov.get('lead_outside', {})
-                else:
-                    _ov_in = _ov_out = {}
-            else:
-                _ov_in = _ov_out = {}
-            
-            _entry_angle = _ov_in.get('angle', tp.entry.approach_angle)
-            _entry_length = _ov_in.get('length', tp.entry.line_length_x_tool_rad)
-            _entry_radius = _ov_in.get('length', tp.entry.arc_radius_x_tool_rad)
-            _exit_angle = _ov_out.get('angle', tp.exit.approach_angle)
-            _exit_length = _ov_out.get('length', tp.exit.line_length_x_tool_rad)
-            _exit_radius = _ov_out.get('length', tp.exit.arc_radius_x_tool_rad)
-            # Подобранный угол лида доработки (v1.7.40): в тесном месте
-            # лид делается более пологим, иначе он перелезает через
-            # вершину лезвия.
-            if _ang_in is not None:
-                _entry_angle = _ang_in
-            if _ang_out is not None:
-                _exit_angle = _ang_out
-            
-            req_in = LeadGeometryRequest(
-                is_entry=True,
-                pass_side=tp.side.name,
-                angle_deg=_entry_angle,
-                # _shrink_in < 1 — лид доработки укорочен, чтобы
-                # поместиться на своей стороне (v1.7.39)
-                line_length=_line_len_alpha(_entry_length,
-                                            _entry_angle) * _shrink_in,
-                arc_radius=(_entry_radius * _lead_rmult * lead_scale
-                            * _shrink_in),
-                style=('line' if tp.entry.style == LeadStyle.LINE else 'line_arc'),
-                forced_side=forced_side,
-            )
-            
-            # exit_request — чтобы plan_lead_in учитывал коллизию lead-out'а
-            # при поиске сдвига. Иначе может выйти: lead-in OK, lead-out COL.
-            exit_req = None
-            if tp.exit.enabled and tp.exit.style in (LeadStyle.LINE_ARC_TANGENTIAL, LeadStyle.LINE):
-                forced_out_side = None if tp.side in (ContourSide.INSIDE, ContourSide.OUTSIDE) else lead_out_side
-                exit_req = LeadGeometryRequest(
-                    is_entry=False,
-                    pass_side=tp.side.name,
-                    angle_deg=_exit_angle,
-                    line_length=_line_len_alpha(_exit_length, _exit_angle),
-                    arc_radius=_exit_radius * _lead_rmult * lead_scale,
-                    style=('line' if tp.exit.style == LeadStyle.LINE else 'line_arc'),
-                    forced_side=forced_out_side,
-                )
-            
-            # Если у ножа есть ручной lead_override (режим «Выделенные»,
-            # юзер сам задал позицию) — авто-подбор ОТКЛЮЧАЕМ: позиция
-            # юзера закон. Иначе автоподбор «исправлял» ручные значения:
-            # пример 41000 — юзер ставит offset +20, точка попадает на
-            # правую сторону рядом с соседним ножом, avoid перевозил её
-            # обратно на верхнюю линию — «смещается чуть и не в ту
-            # сторону». Коллизия при этом всё равно детектится (флаг
-            # _coll) и подсветится в viewer'е красным.
-            # auto_avoid отключаем если:
-            #  - у ножа есть ручной lead_override («Выделенные»), ИЛИ
-            #  - проект в режиме «Все элементы» (lead_mode==1).
-            # ДОКАЗАНО (41000/121555): при offset=0 и avoid=OFF оба прохода
-            # сходятся в единую target-точку (65.3, 451.7). При avoid=ON
-            # алгоритм РАЗВОДИТ проходы в разные стороны от соседей —
-            # именно поэтому в «Все элементы» заход не вставал на угол
-            # при offset=0. В «Все» юзер расставляет заходы сам, автосдвиг
-            # только мешает — отключаем.
-            _has_user_override = bool(op.attributes.get('lead_override'))
-            _proj_lead_mode = 0
-            try:
-                _proj_lead_mode = int(getattr(project, 'attributes', {})
-                                      .get('lead_mode', 0))
-            except Exception:
-                _proj_lead_mode = 0
-            _no_avoid = _has_user_override or (_proj_lead_mode == 1)
-            # ── ЗАХОД ИЗ ПРЕВЬЮ (единый источник) ──
-            # Вьювер сохраняет вычисленную точку захода на op. Ставим старт
-            # контура туда и свой авто-подбор выключаем → .anc = превью
-            # (логичнее и меньше холостых перемещений станка).
-            # ЗАЩИТА (после v1.6.29): re-root проверяем на валидность —
-            # контур должен остаться замкнутым, с тем же числом сегментов
-            # (±2) и той же длиной (±1%). Иначе откатываемся к обычному
-            # авто-подбору (в v1.6.29 битый re-root давал вырожденный лид →
-            # паразитные окружности). Касательную в новой точке строит сам
-            # plan_lead_in по полипасу — отдельно её задавать не нужно.
-            _entry_pt = (op.attributes.get('_lead_entry', {})
-                         .get(tp.side.name))
-            if _entry_pt and polypath.closed:
-                try:
-                    from ..geometry.path_offset import shift_start_to_point
-                    _before_n = len(polypath.segments)
-                    _before_len = sum(s.length() for s in polypath.segments)
-                    _cand = shift_start_to_point(
-                        polypath, (float(_entry_pt[0]), float(_entry_pt[1])))
-                    _ok = (_cand and _cand.segments and _cand.closed
-                           and abs(len(_cand.segments) - _before_n) <= 2)
-                    if _ok:
-                        _after_len = sum(s.length() for s in _cand.segments)
-                        _ok = abs(_after_len - _before_len) <= max(
-                            0.01, _before_len * 0.01)
-                    if _ok:
-                        polypath = _cand
-                        # Автоподбор НЕ выключаем (v1.7.57).
-                        #
-                        # Раньше здесь стояло `_no_avoid = True`: точка
-                        # из превью принималась как данность, чтобы
-                        # `.anc` совпадал с картинкой. Но вьювер строит
-                        # лид на ЭКВИДИСТАНТЕ, а пост — на осевой, и
-                        # это разные кривые; вьювер отдаёт точку даже
-                        # когда сам пометил её коллизией. На заказе
-                        # 126387 с пяткой 1.2 так в программу попадало
-                        # 63 захода и 63 выхода, режущих лезвие (худший
-                        # зазор 0.551 при нужных 0.850), — а без
-                        # превью пост находил безопасные все 198.
-                        #
-                        # Подбор начинает с ИСХОДНОЙ позиции, поэтому
-                        # когда точка из превью безопасна, она и
-                        # остаётся: `.anc` по-прежнему совпадает с
-                        # картинкой везде, где картинка не врёт.
-                        pass
-                except Exception:
-                    pass
-            polypath, _lead_in_poly, _coll, lead_in_geom = plan_lead_in(
-                polypath, req_in,
-                contours_lines_cache, contours_bboxes_cache,
-                geom.id, tool_offset,
-                auto_avoid=(not _no_avoid), safety_factor=1.2,
-                exit_request=exit_req,
-                overlap=pending_overlap)
-            
-            # Применяем overlap ПОСЛЕ автоподбора (см. pending_overlap выше)
-            if pending_overlap > 1e-9 and polypath.closed:
-                from ..geometry.path_offset import apply_overlap
-                polypath = apply_overlap(polypath, pending_overlap)
-            
-            # Обновляем точки контура для последующего кода
+
+        _plan = plan_pass_leads(
+            polypath, geom, _lead_params,
+            *self._project_contours_cache(project),
+            neighbours=_nb,
+            log=lambda msg: _mach_log(options, geom, tp, msg))
+
+        lead_in_geom = _plan.lead_in_geom
+        lead_out_geom = _plan.lead_out_geom
+        # Осевую перечитываем ТОЛЬКО если планировался заход: подбор мог
+        # сдвинуть старт, а перебег — разомкнуть контур. Без захода
+        # остаётся срез по start_t/end_t, сделанный выше.
+        if _lead_params.entry_enabled:
+            polypath = _plan.axis
             segments = polypath.segments
+            if not segments:
+                return line_no
             contour_start_point = segments[0].a
             contour_start_tangent = segments[0].tangent_at_start()
             contour_end_point = segments[-1].b
             contour_end_tangent = segments[-1].tangent_at_end()
-        
-        # ── ПЛАНИРОВАНИЕ LEAD-OUT ЕДИНОЙ ФУНКЦИЕЙ (как и lead-in) ──
-        # Lead-out строится из ФИНАЛЬНОГО конца контура (после автоподбора 
-        # и overlap'а). Без авто-сдвига позиции — она жёстко определена 
-        # концом polypath'а. Сторона пересчитывается на финальном конце 
-        # внутри plan_lead_out → build_lead_for_polypath (если 
-        # forced_side=None для INSIDE/OUTSIDE).
-        if tp.exit.enabled and tp.exit.style in (LeadStyle.LINE_ARC_TANGENTIAL, LeadStyle.LINE):
-            from ..geometry.lead_collision import plan_lead_out
-            from ..core.project import ContourSide
-            
-            # Для INSIDE/OUTSIDE: forced_side=None → внутри пересчитают
-            # Для LEFT/RIGHT/CORNER: используем lead_out_side (определён выше)
-            forced_out = (lead_out_side
-                          if (is_corner_rework
-                              or tp.side not in (ContourSide.INSIDE,
-                                                 ContourSide.OUTSIDE))
-                          else None)
-            
-            req_out = LeadGeometryRequest(
-                is_entry=False,
-                pass_side=tp.side.name,
-                angle_deg=_exit_angle,
-                line_length=_line_len_alpha(_exit_length,
-                                            _exit_angle) * _shrink_out,
-                arc_radius=(_exit_radius * _lead_rmult * lead_scale
-                            * _shrink_out),
-                style=('line' if tp.exit.style == LeadStyle.LINE else 'line_arc'),
-                forced_side=forced_out,
-            )
-            
-            # Тот же кеш контуров — может быть уже построен в lead-in блоке
-            contours_lines_cache, contours_bboxes_cache = \
-                self._project_contours_cache(project)
-            
-            _lead_out_poly, _coll_out, lead_out_geom = plan_lead_out(
-                polypath, req_out,
-                contours_lines_cache, contours_bboxes_cache,
-                geom.id, tool_offset, safety_factor=1.2)
-        
+
         # ── Команда компенсации в зависимости от стороны ──
         # Стандарт ISO: G41 = слева по ходу, G42 = справа.
         # Для флексо-резки с лезвием СЛЕВА по ходу фреза смещается СПРАВА от

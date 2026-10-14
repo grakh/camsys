@@ -1291,6 +1291,69 @@ def offset_polypath_toward_center(polypath: Polypath, offset: float,
     return Polypath(segments=new_segments, closed=polypath.closed)
 
 
+def cutter_path_of_lead(lead: Polypath, offset: float,
+                        step: float = 0.05) -> Polypath:
+    """Путь фрезы для ЛИДА: поточечное смещение вправо по ходу.
+
+    Зачем отдельная функция, а не `offset_right_of_travel`. Лид — это
+    два сегмента, прямая и дуга, и его дуга по радиусу СРАВНИМА со
+    смещением (типично R 0.55…1.3 при смещении 0.55…0.85). Посегментный
+    оффсет на таком соотношении разваливается: при R < смещения дуга
+    выворачивается, стык прямой с дугой расходится, и лид рисуется
+    «отдельными прямыми в разные стороны» (так провалилась попытка
+    v1.7.44). Замерено: отход от истинной кривой до 0.326 мм.
+
+    Поточечное смещение таких допущений не делает вовсе: берём точку
+    пути и нормаль в ней. Там, где дуга тоньше смещения, кривая честно
+    выворачивается — именно это и делает фреза, разворачиваясь на месте.
+    Результат — ломаная; для рисования этого достаточно, а в `.anc`
+    уходит осевая, не она.
+
+    Args:
+        lead: лид в координатах ОСЕВОЙ (как его строит планировщик).
+        offset: полуэквидистанта фрезы; >0 — вправо по ходу (G42),
+            <0 — влево (G41).
+        step: шаг выборки по длине, мм.
+    """
+    if not lead or not lead.segments or abs(offset) < 1e-12:
+        return lead
+
+    def _tan(seg, t):
+        if isinstance(seg, Arc):
+            p = seg.point_at(t)
+            rx, ry = p[0] - seg.center[0], p[1] - seg.center[1]
+            r = math.hypot(rx, ry)
+            if r < EPS:
+                return seg.tangent_at_start()
+            # против часовой — касательная поворотом радиуса на +90°
+            return ((-ry / r, rx / r) if seg.ccw else (ry / r, -rx / r))
+        if hasattr(seg, 'tangent_at'):
+            return seg.tangent_at(t)
+        return seg.tangent_at_start()
+
+    pts: List[Point] = []
+    for seg in lead.segments:
+        L = seg.length()
+        n = max(2, int(math.ceil(L / max(step, 1e-4))) + 1)
+        for i in range(n):
+            t = i / (n - 1)
+            px, py = seg.point_at(t)
+            tx, ty = _tan(seg, t)
+            tl = math.hypot(tx, ty)
+            if tl < EPS:
+                continue
+            tx, ty = tx / tl, ty / tl
+            q = (px + ty * offset, py - tx * offset)
+            if pts and math.hypot(q[0] - pts[-1][0], q[1] - pts[-1][1]) < 1e-9:
+                continue
+            pts.append(q)
+
+    if len(pts) < 2:
+        return lead
+    return Polypath(segments=[Line(a=pts[i], b=pts[i + 1])
+                              for i in range(len(pts) - 1)], closed=False)
+
+
 def offset_right_of_travel(polypath: Polypath, offset: float) -> Polypath:
     """Эквидистанта СПРАВА ПО ХОДУ — то, что делает G42 (v1.7.37).
 
@@ -4999,3 +5062,106 @@ def pocket_fragment_with_gentle_ends(parent: Polypath, s0: float, s1: float,
         pad = min(pad + 0.5, pad_max_mm)
         segs = _subpath_forward(parent, (s0 - pad) % total, (s1 + pad) % total)
     return segs
+
+
+# ════════════════════════════════════════════════════════════════════════
+# ФРАГМЕНТ ПРОХОДА ДОРАБОТКИ — ОДИН НА ВЬЮВЕР И ПОСТ (v1.7.58)
+# ════════════════════════════════════════════════════════════════════════
+
+def rework_fragment(geom, op, pass_side_name: str,
+                    main_tool_offset: float,
+                    log=None) -> Optional[Polypath]:
+    """Участок контура, который снимает ТОНКАЯ фреза: карман, 2D- или
+    3D-угол. Возвращает фрагмент, уже развёрнутый под свою сторону.
+
+    Зачем общая функция. До v1.7.58 это место было написано дважды, и
+    припуски разошлись: пост брал для 2D-угла 1.5 мм, а вьювер 3.0 мм с
+    адаптивным удлинением до 5.0. Это РАЗНЫЕ кривые — и лид к ним
+    крепится в разных местах, поэтому картинка угла не имела отношения к
+    программе (на 124173 из 56 лидов доработки совпадали 12).
+
+    Припуск 1.5 мм оставлен ПОСТОВСКИЙ, потому что он лучше по замеру
+    зазора лида до металла (`fit_rework_lead`, 21 угол заказа 124173,
+    42 лида):
+
+        припуск 1.5 (пост)   : худший зазор −118 мкм, отрицательных 1
+        припуск 3.0+ (вьювер): худший зазор −314 мкм, отрицательных 4
+
+    То есть удлинение фрагмента, добавленное во вьювере «чтобы поворот
+    лида не жался к острию», делает хуже — и в программу оно никогда не
+    попадало.
+
+    Args:
+        geom: Geometry ножа (нужен `.polypath` — родительский контур).
+        op: операция доработки; тип участка определяют её атрибуты.
+        pass_side_name: 'INSIDE' или иное — сторона прохода.
+        main_tool_offset: полуэквидистанта ОСНОВНОЙ фрезы; от неё
+            считается припуск 3D-угла (упор клина).
+        log: куда писать предупреждение по 3D-углу.
+
+    Returns:
+        Polypath или None, если участок не построился.
+    """
+    from .direction import normalize_for_side, orient_corner_fragment
+    at = getattr(op, 'attributes', {}) or {}
+    parent = getattr(geom, 'polypath', None)
+    if parent is None:
+        return None
+    side = 'INSIDE' if pass_side_name == 'INSIDE' else 'OUTSIDE'
+
+    # ── ПРОТОЧКА КАРМАНА (v1.7.38) ──
+    # Основной проход выбросил этот участок (bridge_narrow_pits), металл
+    # оттуда снимает тонкая фреза — и на ВЕСЬ карман, а не вокруг угла.
+    # Концы отодвигаются до ПОЛОГИХ участков (v1.7.47): лид начинается на
+    # краю, и если край попал на бугор — заход сходит с него в лезвие.
+    if 'pocket_s0' in at:
+        par = normalize_for_side(parent, at.get('pocket_side', 'OUTSIDE'))
+        segs = pocket_fragment_with_gentle_ends(
+            par, float(at['pocket_s0']), float(at['pocket_s1']), pad_mm=0.5)
+        if not segs:
+            return None
+        # Разворачивать нечего: вырезано из контура, уже нормализованного
+        # под свой проход.
+        return Polypath(segments=segs, closed=False)
+
+    # ── 3D-УГОЛ: фрагмент вокруг точки острого излома ──
+    if at.get('corner_is_3d') and 'corner3d_point' in at:
+        pad = corner_pad_for_angle(at.get('corner3d_interior_angle'),
+                                   main_tool_offset)
+        frag = extract_subpath_around_point(
+            parent, at['corner3d_point'], at['corner3d_segment_index'],
+            pad_mm=pad)
+        if not frag or not frag.segments:
+            return None
+        # Упор ОСНОВНОЙ фрезы в клине: она встаёт не ближе T/sin(A/2) от
+        # вершины. Если припуск до него не достал (потолок на игольчатом
+        # угле), полоса между упорами не снимается никем.
+        if log is not None:
+            try:
+                ang = float(at.get('corner3d_interior_angle'))
+                sn = math.sin(math.radians(ang / 2.0))
+                stop = (main_tool_offset / sn) if sn > 1e-6 else None
+                if stop is not None and pad <= stop:
+                    log(f"УГОЛ 3D {ang:.1f}°: фрагмент {pad:.2f} мм не "
+                        f"достаёт до упора основной фрезы {stop:.2f} мм — "
+                        f"полоса между упорами остаётся несрезанной, "
+                        f"нужна ручная правка")
+            except (TypeError, ValueError):
+                pass
+        return orient_corner_fragment(frag, parent, side)
+
+    # ── 2D-УГОЛ: фрагмент по индексам сегментов скругления ──
+    if 'corner_first_idx' in at and 'corner_last_idx' in at:
+        frag = extract_subpath_around_indices(
+            parent, at['corner_first_idx'], at['corner_last_idx'],
+            pad_mm=1.5)
+        if not frag or not frag.segments:
+            return None
+        # Направление — по намотке РОДИТЕЛЬСКОГО контура (v1.7.37).
+        # Эмиттер всегда пишет G42, значит сторону задаёт направление
+        # обхода фрагмента. Прежний признак «центр bbox ножа справа от
+        # касательной» на ложке, языке и крючке врал: центр bbox там
+        # лежит вне контура, и угол резался зеркально.
+        return orient_corner_fragment(frag, parent, side)
+
+    return None

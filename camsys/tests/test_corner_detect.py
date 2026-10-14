@@ -500,14 +500,17 @@ def test_corner_lead_side_uses_parent_contour():
     # Если бы эталон был неважен, фикс был бы пустышкой
     assert differ > 0, "эталон не влияет — тест не проверяет ничего"
 
-    # И пост обязан брать родительский контур
+    # И планировщик обязан брать родительский контур. С v1.7.58 это
+    # общий код вьювера и поста — проверяем его, а не копию в посте.
     src = open(os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        'post', 'mtx_anderson.py'), encoding='utf-8').read()
-    assert '_side_ref = geom.polypath' in src, \
-        "пост не использует родительский контур как эталон стороны"
-    assert 'contour_start_tangent, _side_ref' in src
-    assert 'contour_end_tangent, _side_ref' in src
+        'geometry', 'lead_collision.py'), encoding='utf-8').read()
+    assert 'side_ref = own_pp' in src, \
+        "планировщик не берёт родительский контур эталоном стороны"
+    assert src.count('side_ref, p.pass_side') == 2, \
+        "эталон применён не к обоим концам (заход и выход)"
+    assert 'start_pt, start_tan, side_ref' in src
+    assert 'end_pt, end_tan, side_ref' in src
 
 
 def test_no_false_corners_where_face_is_thin():

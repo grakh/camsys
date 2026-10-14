@@ -606,3 +606,124 @@ def test_corner_pad_covers_what_the_main_tool_left():
         f'у острого угла путь вырос лишь с {was_sharp:.3f} до '
         f'{now_sharp:.3f} мм')
 
+
+
+def test_lead_cutter_path_is_pointwise_not_per_segment():
+    """Путь фрезы для лида считается ПОТОЧЕЧНО, а не посегментно.
+
+    Предыстория (v1.7.44). Правильно считать лид на ОСЕВОЙ — именно она
+    уходит в `.anc`, а смещение делает стойка, — и рисовать смещение
+    результата. Я так и сделал, но смещал ПОСЕГМЕНТНО, и получил жалобу
+    «что это с ними стало, в разные стороны, и просто прямые линии».
+
+    Причина геометрическая: дуга лида по радиусу СРАВНИМА со смещением
+    (типично R 0.55…1.3 при смещении 0.55…0.85). Посегментный оффсет на
+    таком соотношении выворачивает дугу и расходит её стык с прямой.
+    Поточечное смещение таких допущений не делает вовсе.
+
+    Здесь это замеряется: эталон — плотная выборка истинного места
+    смещённой кривой (2000 точек на сегмент), и от неё не должен
+    отходить поточечный результат. Посегментный — отходит, иначе тест
+    ничего не проверяет.
+    """
+    import math
+    from camsys.geometry.primitives import Polypath, Line
+    from camsys.geometry.lead_inout import build_lead_in
+    from camsys.geometry.path_offset import (cutter_path_of_lead,
+                                             offset_right_of_travel)
+
+    axis = Polypath(segments=[Line(a=(0.0, 0.0), b=(20.0, 0.0))],
+                    closed=False)
+
+    def true_locus(lead, off, n=2000):
+        """Истинное место смещённой кривой: плотная выборка p(t)+n(t)·off."""
+        pts = []
+        for seg in lead.segments:
+            for i in range(n + 1):
+                t = i / n
+                p = seg.point_at(t)
+                if hasattr(seg, 'center'):
+                    rx, ry = p[0] - seg.center[0], p[1] - seg.center[1]
+                    r = math.hypot(rx, ry)
+                    tg = ((-ry / r, rx / r) if seg.ccw else (ry / r, -rx / r))
+                else:
+                    tg = seg.tangent_at_start()
+                pts.append((p[0] + tg[1] * off, p[1] - tg[0] * off))
+        return pts
+
+    def worst_off(curve, locus):
+        w = 0.0
+        for s in curve.segments:
+            for t in (0.0, 0.25, 0.5, 0.75, 1.0):
+                q = s.point_at(t)
+                d = min(math.hypot(q[0] - c[0], q[1] - c[1]) for c in locus)
+                w = max(w, d)
+        return w
+
+    worst_point = 0.0
+    worst_seg = 0.0
+    for side in ('right', 'left'):
+        for R, off in ((0.65, 0.65), (1.30, 0.65), (0.325, 0.65),
+                       (0.55, 0.85)):
+            lead = build_lead_in(axis.segments[0].a, (1.0, 0.0), side,
+                                 line_length=1.0, arc_radius=R,
+                                 approach_angle_deg=45.0)
+            lp = Polypath(segments=[s for s in (lead.line, lead.arc)
+                                    if s is not None], closed=False)
+            locus = true_locus(lp, off)
+            wp = worst_off(cutter_path_of_lead(lp, off), locus)
+            ws = worst_off(offset_right_of_travel(lp, off), locus)
+            print(f'  {side:5s} R={R:4} смещение={off}: поточечно '
+                  f'{wp * 1000:6.1f} мкм, посегментно {ws * 1000:7.1f} мкм')
+            worst_point = max(worst_point, wp)
+            worst_seg = max(worst_seg, ws)
+
+    # Поточечно — в пределах шага выборки (0.05 мм) на прогиб хорды,
+    # то есть единицы микрон.
+    assert worst_point < 0.005, (
+        f'поточечное смещение ушло от истинной кривой на '
+        f'{worst_point * 1000:.1f} мкм')
+    # И посегментное обязано быть ХУЖЕ на порядки — иначе проверять
+    # нечего и выбор функции не имеет значения.
+    assert worst_seg > 0.05, (
+        f'посегментное смещение отходит всего на {worst_seg * 1000:.1f} мкм '
+        f'— тест перестал ловить причину провала v1.7.44')
+
+
+def test_rework_fragment_is_one_function_with_the_post_pad():
+    """Участок доработки вырезает ОДНА функция, с припуском поста.
+
+    До v1.7.58 это место было написано дважды: пост брал для 2D-угла
+    припуск 1.5 мм, вьювер — 3.0 с адаптивным удлинением до 5.0. Кривые
+    получались разные, лид крепился к ним в разных местах, и картинка
+    угла не имела отношения к программе: на 124173 из 56 лидов
+    доработки совпадали с программой 12.
+
+    Припуск оставлен постовский, потому что он ЛУЧШЕ по замеру зазора
+    лида до металла (21 угол заказа 124173, 42 лида): 1.5 мм даёт
+    худший зазор −118 мкм и один отрицательный, 3.0+ — −314 мкм и
+    четыре. То есть удлинение «чтобы поворот лида не жался к острию»
+    делало хуже, и в программу оно никогда не попадало.
+    """
+    import os
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    geo = open(os.path.join(here, 'geometry', 'path_offset.py'),
+               encoding='utf-8').read()
+    post = open(os.path.join(here, 'post', 'mtx_anderson.py'),
+                encoding='utf-8').read()
+    view = open(os.path.join(here, 'ui', 'viewer_2d.py'),
+                encoding='utf-8').read()
+
+    assert 'def rework_fragment(' in geo, 'общая функция участка пропала'
+    assert 'pad_mm=1.5' in geo, 'припуск 2D-угла не постовский'
+
+    for name, src in (('mtx_anderson.py', post), ('viewer_2d.py', view)):
+        assert 'rework_fragment(' in src, \
+            f'{name}: участок доработки вырезается не общей функцией'
+        # Своих вырезаний больше быть не должно — именно они и разошлись
+        for forbidden in ('extract_subpath_around_indices(',
+                          'extract_subpath_around_point(',
+                          'pocket_fragment_with_gentle_ends(',
+                          'orient_corner_fragment('):
+            assert forbidden not in src, \
+                f'{name}: остался свой вырез участка ({forbidden})'

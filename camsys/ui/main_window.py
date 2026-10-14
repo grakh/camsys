@@ -2188,8 +2188,11 @@ class MainWindow(QtWidgets.QMainWindow):
             d = op.attributes.get('_diag', {})
             lines = [f"{op_name}", ""]
             for k in ('apex', 'corner_radius', 'rounding_R', 'rounding_center',
-                      'convex', 'inward', 'forced_lead_side'):
+                      'convex', 'forced_lead_side',
+                      'lead_clr_in', 'lead_clr_out'):
                 lines.append(f"{k} = {d.get(k)}")
+            for _msg in d.get('lead_journal', ()):
+                lines += ["", str(_msg)]
             QtWidgets.QMessageBox.information(
                 self, "Диагностика угла", "\n".join(str(x) for x in lines))
         elif act_diag_off is not None and chosen is act_diag_off:

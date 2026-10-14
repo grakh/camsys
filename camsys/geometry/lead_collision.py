@@ -1038,3 +1038,300 @@ def build_contours_cache(geometries: List,
         except Exception:
             continue
     return contours_lines, contours_bboxes
+
+
+# ════════════════════════════════════════════════════════════════════════
+# ЕДИНОЕ ПЛАНИРОВАНИЕ ЛИДОВ ОДНОГО ПРОХОДА (v1.7.58)
+# ════════════════════════════════════════════════════════════════════════
+#
+# До v1.7.58 этот блок существовал ДВАЖДЫ: в посте и во вьювере. Они
+# расходились молча и повторно — v1.7.11 (масштаб лида), v1.7.29
+# (эквидистанта тонкой фрезы), v1.7.39 (множители и запас угла), v1.7.43
+# и v1.7.45 (какая кривая идёт в замер), v1.7.55 и v1.7.56 (что считает
+# проверка коллизий). Каждый раз это обнаруживалось так: в программе
+# одно, на картинке другое.
+#
+# ГЛАВНОЕ РАСХОЖДЕНИЕ, из-за которого блок и сведён: лид строится на
+# ОСЕВОЙ, потому что в `.anc` уходит осевая, а путь фрезы из неё делает
+# стойка (G41/G42). Вьювер же строил лид на ЭКВИДИСТАНТЕ — это ДРУГАЯ
+# кривая, и её смещение вправо не совпадает с тем, что едет станок. На
+# заказе 126387 с пяткой 1.2 так рисовалось 126 лидов из 396, худший
+# подходил к лезвию на 0.302 мм при нужных 0.850.
+#
+# Теперь обе стороны зовут `plan_pass_leads` и обе дают лид НА ОСЕВОЙ.
+# Вьювер рисует его смещение вправо по ходу — то есть ровно ту кривую,
+# которую построит стойка.
+
+@dataclass
+class PassLeadParams:
+    """Всё, что нужно для планирования захода и выхода одного прохода.
+
+    Значения уже разрешены вызывающей стороной: пост читает их из
+    `tp.entry`/`tp.exit` (их заполняет `_apply_lead_params` из
+    `CuttingMacroParams`), вьювер — из полей текущей панели UI. Дальше
+    геометрия считается ОДНИМ кодом.
+    """
+    pass_side: str              # tp.side.name — INSIDE/OUTSIDE/LEFT/RIGHT
+    is_corner_rework: bool      # проход доработки угла/кармана
+    tool_offset: float          # полуэквидистанта фрезы ЭТОГО прохода
+    lead_scale: float           # эквидистанта фрезы (масштаб множителей)
+    length_mult: float = 1.0    # множитель длины (у доработки 0.5)
+    radius_mult: float = 1.0    # множитель радиуса
+    extra_mm: float = 0.0       # запас прямой части (доработка)
+
+    entry_enabled: bool = False
+    entry_style: str = 'line_arc'
+    entry_angle: float = 45.0
+    entry_length: float = 1.0   # множитель «x_tool_rad»
+    entry_radius: float = 1.0
+
+    exit_enabled: bool = False
+    exit_style: str = 'line_arc'
+    exit_angle: float = 45.0
+    exit_length: float = 1.0
+    exit_radius: float = 1.0
+
+    overlap: float = 0.0        # перебег, мм (применяется ПОСЛЕ подбора)
+    no_avoid: bool = False      # ручная позиция — автоподбор не двигает
+    entry_hint: Optional[Point] = None   # готовая точка захода
+
+
+@dataclass
+class PassLeadResult:
+    """Результат планирования: ОСЕВАЯ и лиды НА ОСЕВОЙ."""
+    axis: Polypath                      # контур после re-root и перебега
+    # Контур после re-root, но ДО перебега — ещё замкнутый. Нужен
+    # вьюверу: эквидистанту считают по ЗАМКНУТОМУ контуру (там намотка
+    # определена однозначно), а перебег разомкнул бы его и нормаль могла
+    # уйти в другую сторону.
+    axis_rerooted: Optional[Polypath] = None
+    lead_in: Optional[Polypath] = None
+    lead_out: Optional[Polypath] = None
+    lead_in_geom: object = None         # .line/.arc для эмиссии NC
+    lead_out_geom: object = None
+    lead_in_collision: bool = False
+    lead_out_collision: bool = False
+    lead_side: str = 'right'
+    lead_out_side: str = 'right'
+    clr_in: float = 0.0                 # зазор лида доработки, мм (<0 — тесно)
+    clr_out: float = 0.0
+
+
+def _lead_line_length(user_factor: float, angle_deg: float,
+                      p: PassLeadParams) -> float:
+    """Длина прямой части лида по формуле альфы.
+
+    lateral_clearance = user_factor × эквидистанта, затем делится на
+    sin(угла захода): чем положе заход, тем длиннее прямая при том же
+    боковом зазоре. Множители «x_tool_rad» альфа считает ОТ
+    ЭКВИДИСТАНТЫ, а не от её половины (замерено сличением с эталоном на
+    124536, v1.7.11).
+    """
+    ang_rad = math.radians(max(5.0, min(175.0, angle_deg)))
+    sin_a = math.sin(ang_rad)
+    if sin_a < 0.05:
+        sin_a = 0.05            # защита от углов около 0 и 180
+    return (user_factor * p.length_mult * p.lead_scale + p.extra_mm) / sin_a
+
+
+def plan_pass_leads(axis: Polypath,
+                    own_geom,
+                    p: PassLeadParams,
+                    contours_lines: List[Tuple[str, List]],
+                    contours_bboxes: List[Tuple[str, Tuple]],
+                    neighbours=(),
+                    log: Optional[Callable[[str], None]] = None,
+                    ) -> PassLeadResult:
+    """Планирует заход и выход прохода НА ОСЕВОЙ. Общая точка для поста
+    и вьювера.
+
+    Args:
+        axis: программная осевая прохода — уже нормализованная по
+            направлению, со сдвинутым стартом, с поднятыми радиусами и
+            слитыми коллинеарными линиями. Именно она уходит в `.anc`.
+        own_geom: Geometry обрабатываемого ножа (нужен `.id` и
+            `.polypath` как эталон «внутри/снаружи»).
+        p: разрешённые параметры лидов.
+        contours_lines, contours_bboxes: кеш `build_contours_cache`.
+        neighbours: полипасы СОСЕДНИХ ножей — для замера лида доработки.
+        log: куда писать «места нет, нужна ручная правка».
+
+    Returns:
+        PassLeadResult. Лиды — в координатах ОСЕВОЙ. Путь фрезы = их
+        смещение на `tool_offset` вправо по ходу (так делает стойка по
+        G42); вьювер для рисования зовёт `offset_right_of_travel`.
+    """
+    from .lead_inout import fit_rework_lead, pick_lead_side_for_pass
+
+    res = PassLeadResult(axis=axis)
+    if not axis or not axis.segments:
+        return res
+
+    want_in = bool(p.entry_enabled)
+    want_out = bool(p.exit_enabled)
+
+    start_pt = axis.segments[0].a
+    start_tan = axis.segments[0].tangent_at_start()
+    end_pt = axis.segments[-1].b
+    end_tan = axis.segments[-1].tangent_at_end()
+
+    # Эталон «внутри/снаружи»: у доработки в axis лежит ОТКРЫТЫЙ
+    # фрагмент, point-in-polygon на нём бессмыслен — берём родительский
+    # замкнутый контур ножа (v1.7.19).
+    side_ref = axis
+    own_pp = getattr(own_geom, 'polypath', None)
+    if p.is_corner_rework and own_pp is not None and own_pp.closed:
+        side_ref = own_pp
+
+    ll_in = _lead_line_length(p.entry_length, p.entry_angle, p)
+    ar_in = p.entry_radius * p.radius_mult * p.lead_scale
+    ang_in = p.entry_angle
+    shrink_in = 1.0
+
+    ll_out = _lead_line_length(p.exit_length, p.exit_angle, p)
+    ar_out = p.exit_radius * p.radius_mult * p.lead_scale
+    ang_out = p.exit_angle
+    shrink_out = 1.0
+
+    # ── СТОРОНА ЗАХОДА ──
+    if p.is_corner_rework:
+        # Лид доработки — ПО ЗАМЕРУ ЗАЗОРА (v1.7.39). Эмиттер пишет G42,
+        # фреза снимает металл справа по ходу, заходить обязана оттуда
+        # же. Но в узкой щели справа может не быть места: лид ложится на
+        # встречную стенку. Поэтому сторону не назначаем правилом, а
+        # меряем обеими и берём ту, где зазор больше.
+        cut_half = (p.lead_scale / 2.0 if p.lead_scale > 0 else 0.5)
+        res.lead_side, shrink_in, _a, res.clr_in = fit_rework_lead(
+            start_pt, start_tan, own_pp, cut_half, ll_in, ar_in, ang_in,
+            is_exit=False, neighbours=list(neighbours),
+            style=p.entry_style)
+        if _a is not None:
+            # Подобранный угол меняет и длину прямой: при том же боковом
+            # зазоре длина делится на sin(угла). Пересчитываем, иначе
+            # лид строится под один угол, а мерился под другой.
+            ang_in = _a
+            ll_in = _lead_line_length(p.entry_length, ang_in, p)
+        # Укорочение применяется к ИТОГОВОЙ длине и радиусу (v1.7.45):
+        # запас прямой части уже внутри ll_in, и он тоже обязан
+        # укорачиваться — иначе лид выходит длиннее программного.
+        ll_in *= shrink_in
+        ar_in *= shrink_in
+        if res.clr_in < 0 and log is not None:
+            log(f"ЛИД ДОРАБОТКИ: заход подходит к металлу ближе "
+                f"полуширины реза на {abs(res.clr_in) * 1000:.0f} мкм "
+                f"({start_pt[0]:.1f} {start_pt[1]:.1f}) — места нет ни "
+                f"длиной, ни углом, нужна ручная правка")
+    elif p.pass_side in ("INSIDE", "OUTSIDE"):
+        res.lead_side = pick_lead_side_for_pass(
+            start_pt, start_tan, side_ref, p.pass_side,
+            ll_in, ar_in, ang_in, is_exit=False)
+    elif p.pass_side == "LEFT":
+        res.lead_side = "left"
+    else:
+        res.lead_side = "right"
+
+    # ── СТОРОНА ВЫХОДА — отдельно, по КОНЦЕВОЙ касательной ──
+    if p.is_corner_rework:
+        cut_half = (p.lead_scale / 2.0 if p.lead_scale > 0 else 0.5)
+        res.lead_out_side, shrink_out, _a, res.clr_out = fit_rework_lead(
+            end_pt, end_tan, own_pp, cut_half, ll_out, ar_out, ang_out,
+            is_exit=True, neighbours=list(neighbours), style=p.exit_style)
+        if _a is not None:
+            ang_out = _a
+            ll_out = _lead_line_length(p.exit_length, ang_out, p)
+        if res.clr_out < 0 and log is not None:
+            log(f"ЛИД ДОРАБОТКИ: выход подходит к металлу ближе "
+                f"полуширины реза на {abs(res.clr_out) * 1000:.0f} мкм "
+                f"({end_pt[0]:.1f} {end_pt[1]:.1f}) — места нет ни "
+                f"длиной, ни углом, нужна ручная правка")
+    elif p.pass_side in ("INSIDE", "OUTSIDE"):
+        res.lead_out_side = pick_lead_side_for_pass(
+            end_pt, end_tan, side_ref, p.pass_side,
+            ll_out, ar_out, ang_out, is_exit=True)
+    else:
+        res.lead_out_side = res.lead_side
+
+    # ── ЗАПРОСЫ НА ПОСТРОЕНИЕ ──
+    # INSIDE/OUTSIDE: сторону НЕ фиксируем — автоподбор пересчитает её на
+    # каждой кандидатной позиции (после сдвига старта сторона меняется).
+    # Доработка и LEFT/RIGHT: сторона замерена/задана, фиксируем.
+    _fix = (p.is_corner_rework or p.pass_side not in ("INSIDE", "OUTSIDE"))
+    req_in = LeadGeometryRequest(
+        is_entry=True, pass_side=p.pass_side, angle_deg=ang_in,
+        line_length=ll_in, arc_radius=ar_in, style=p.entry_style,
+        forced_side=(res.lead_side if _fix else None))
+    req_out = LeadGeometryRequest(
+        is_entry=False, pass_side=p.pass_side, angle_deg=ang_out,
+        line_length=ll_out * shrink_out,
+        arc_radius=ar_out * shrink_out, style=p.exit_style,
+        forced_side=(res.lead_out_side if _fix else None))
+
+    # ── ЗАХОД ──
+    if want_in:
+        # Готовая точка захода (вьювер посчитал её первым). Ставим старт
+        # туда, но автоподбор НЕ выключаем: он начинает с этой позиции,
+        # поэтому безопасная точка остаётся на месте, а небезопасная
+        # исправляется (v1.7.57).
+        if p.entry_hint and axis.closed:
+            try:
+                from .path_offset import shift_start_to_point
+                before_n = len(axis.segments)
+                before_len = sum(s.length() for s in axis.segments)
+                cand = shift_start_to_point(
+                    axis, (float(p.entry_hint[0]), float(p.entry_hint[1])))
+                ok = (cand and cand.segments and cand.closed
+                      and abs(len(cand.segments) - before_n) <= 2)
+                if ok:
+                    after_len = sum(s.length() for s in cand.segments)
+                    ok = abs(after_len - before_len) <= max(
+                        0.01, before_len * 0.01)
+                if ok:
+                    axis = cand
+            except Exception:
+                pass
+        # ── ВЫХОД В ПОДБОРЕ ЗАХОДА: НЕ ТОТ ЖЕ, ЧТО БУДЕТ ПОСТРОЕН ──
+        # Здесь сознательно оставлено расхождение, которое было в посте
+        # до v1.7.58: подбор позиции захода проверяет выход БЕЗ
+        # укорочения и БЕЗ жёсткой стороны, а строится потом выход С
+        # ними. Логически это неверно — проверяется не тот объект,
+        # который поедет, — но это НЕ дефект картинки, и трогать его
+        # внутри сведения вьювера с постом нельзя: замерено на 124173,
+        # что согласованный вариант УХУДШАЕТ два захода угла (зазор до
+        # металла 0.547 → 0.502 и 0.547 → 0.429 мм), потому что
+        # «лишняя» проверка выхода работала как дополнительный фильтр и
+        # уводила заход на лучший угол. Разбирать это надо отдельно и с
+        # замерами на станке, а не попутно. Поэтому: подбору отдаём
+        # ТАКОЙ ЖЕ запрос, как отдавал прежний пост.
+        _exit_in_search = None
+        if want_out:
+            _exit_in_search = LeadGeometryRequest(
+                is_entry=False, pass_side=p.pass_side, angle_deg=ang_out,
+                line_length=ll_out, arc_radius=ar_out, style=p.exit_style,
+                forced_side=(None if p.pass_side in ("INSIDE", "OUTSIDE")
+                             else res.lead_out_side))
+        axis, res.lead_in, res.lead_in_collision, res.lead_in_geom = \
+            plan_lead_in(
+                axis, req_in, contours_lines, contours_bboxes,
+                own_geom.id, p.tool_offset,
+                auto_avoid=(not p.no_avoid), safety_factor=1.2,
+                exit_request=_exit_in_search,
+                overlap=p.overlap)
+
+    # ── ПЕРЕБЕГ — ПОСЛЕ подбора ──
+    # Применённый раньше, он разомкнул бы контур, и сдвиг старта тащил
+    # бы перебег вместе с собой.
+    res.axis_rerooted = axis
+    if p.overlap > 1e-9 and axis.closed:
+        from .path_offset import apply_overlap
+        axis = apply_overlap(axis, p.overlap)
+
+    # ── ВЫХОД — из ФИНАЛЬНОГО конца контура ──
+    # Без автоподбора: позиция жёстко задана концом осевой.
+    if want_out and axis.segments:
+        res.lead_out, res.lead_out_collision, res.lead_out_geom = \
+            plan_lead_out(
+                axis, req_out, contours_lines, contours_bboxes,
+                own_geom.id, p.tool_offset, safety_factor=1.2)
+
+    res.axis = axis
+    return res

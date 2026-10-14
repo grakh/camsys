@@ -1536,3 +1536,398 @@ def test_preview_point_never_forces_a_cutting_lead():
         f'{bad} лидов из превью попали в программу режущими, '
         f'худший зазор {worst:.3f} при нужных {half:.3f}')
 
+
+def test_preview_lead_matches_the_program_lead():
+    """Нарисованный лид совпадает с эквидистантой лида из `.anc`.
+
+    Это и есть смысл сведения вьювера с постом (v1.7.58). До него вьювер
+    строил лид на ЭКВИДИСТАНТЕ, а пост — на ОСЕВОЙ, и смещение первой не
+    равно второй: на заказе 126387 с пяткой 1.2 из 396 лидов 126
+    рисовались не там, где пройдёт фреза, худший подходил к лезвию на
+    0.302 мм при нужных 0.850. Программа была защищена, а превью врало —
+    именно на это и была жалоба.
+
+    Проверка идёт по всей цепочке приложения: вьювер считает и рисует,
+    пост пишет программу, программа разбирается парсером, из её осевой
+    поточечно строится путь фрезы — и он обязан совпасть с нарисованным.
+    Допуск 20 мкм: это разрешение самого замера (шаг выборки эталона
+    0.01 мм даёт пол-шага на поиск ближайшей точки плюс прогиб хорды),
+    реально расхождение около 5 мкм.
+
+    Берутся первые 12 ножей из 99 — этого хватает: прежний код врал
+    примерно на трети лидов, а полный заказ считается минутами.
+    """
+    ai = '/mnt/user-data/uploads/126387.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет 126387.ai')
+        return
+    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+    try:
+        from camsys.ui.viewer_2d import _build_toolpath_geometry
+    except Exception as e:
+        print(f'  SKIP — вьювер не загрузился ({type(e).__name__})')
+        return
+    import re
+    import camsys.post.mtx_anderson  # noqa: F401
+    from camsys.core.session import CamSession
+    from camsys.core.project import OperationKind
+    import camsys.core.macros as macros_mod
+    from camsys.post.package_export import PackageExporter
+
+    tip = 1.2
+    s = CamSession()
+    s.load_ai(ai)
+    knives = [g for g in s.project.get_layer_by_name('Knife').geometries
+              if g.polypath][:12]
+    assert len(knives) >= 6, f'ножей всего {len(knives)}'
+    for g in knives:
+        s.project.add_blade_operation(g.id)
+    macros_mod.sort_operations_by_grid(s.project)
+    p = s.cutting_params
+    p.knife_angle, p.tip_diameter, p.bottom = 90.0, tip, 0.25
+    eq = tip + 2 * 0.25 * math.tan(math.radians(45))
+    half = eq / 2
+    extras = {'tool_radius': tip / 2, 'tool_equidistant': eq,
+              'corner_tool_radius': 0.3, 'corner_tool_equidistant': 1.1,
+              'auto_avoid_all': True, 'lead_mode': 0, 'selected_op_id': None}
+
+    # ── 1. ВЬЮВЕР: что нарисовано ──
+    drawn = []
+    for op in s.project.operations:
+        if op.kind != OperationKind.BLADE_FORMING:
+            continue
+        for tp in op.toolpaths:
+            r = _build_toolpath_geometry(s.project, op, tp, extras, p)
+            if not r:
+                continue
+            for key, is_in in (('lead_in', True), ('lead_out', False)):
+                L = r.get(key)
+                if not L or not getattr(L, 'segments', None):
+                    continue
+                drawn.append((is_in, [L.segments[0].a]
+                              + [sg.b for sg in L.segments]))
+    assert len(drawn) > 20, f'вьювер нарисовал лидов всего {len(drawn)}'
+
+    # ── 2. ПОСТ: что уходит в станок ──
+    anc = list(PackageExporter(s.project, p).generate(
+        only_stages=('rough_all',)).values())[0]
+
+    num = r'-?\d+\.?\d*'
+
+    def arc_pts(x0, y0, x1, y1, r, ccw, n=64):
+        d = math.hypot(x1 - x0, y1 - y0)
+        if d < 1e-12 or r <= 0:
+            return [(x1, y1)]
+        h = math.sqrt(max(0.0, r * r - (d / 2) ** 2))
+        mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+        ux, uy = -(y1 - y0) / d, (x1 - x0) / d
+        for sgn in (1, -1):
+            cx, cy = mx + sgn * h * ux, my + sgn * h * uy
+            a0 = math.atan2(y0 - cy, x0 - cx)
+            a1 = math.atan2(y1 - cy, x1 - cx)
+            sw = (a1 - a0) % (2 * math.pi)
+            if not ccw:
+                sw -= 2 * math.pi
+            if abs(sw) <= math.pi:
+                return [(cx + r * math.cos(a0 + sw * t / n),
+                         cy + r * math.sin(a0 + sw * t / n))
+                        for t in range(n + 1)]
+        return [(x1, y1)]
+
+    leads = []
+    x = y = 0.0
+    cur = None
+    for line in anc.splitlines():
+        gx = re.search(r'\bX\s*(' + num + ')', line)
+        gy = re.search(r'\bY\s*(' + num + ')', line)
+        nx = float(gx.group(1)) if gx else x
+        ny = float(gy.group(1)) if gy else y
+        gr = re.search(r'\bR\s*(' + num + ')', line)
+        if 'G42' in line or 'G41' in line:
+            cur = [(x, y), (nx, ny)]
+        elif cur is not None and (';50,10' in line or ';60,10' in line):
+            cur += arc_pts(x, y, nx, ny, float(gr.group(1)), ';60,' in line)
+            leads.append((True, cur))
+            cur = None
+        elif ';50,15' in line or ';60,15' in line:
+            cur = [(x, y)] + arc_pts(x, y, nx, ny, float(gr.group(1)),
+                                     ';60,' in line)
+        elif cur is not None and 'G40' in line:
+            cur.append((nx, ny))
+            leads.append((False, cur))
+            cur = None
+        if gx or gy:
+            x, y = nx, ny
+    assert len(leads) == len(drawn), (
+        f'лидов в программе {len(leads)}, а нарисовано {len(drawn)}')
+
+    def densify(P, step=0.01):
+        out = []
+        for i in range(len(P) - 1):
+            x0, y0 = P[i]
+            x1, y1 = P[i + 1]
+            dx, dy = x1 - x0, y1 - y0
+            L = math.hypot(dx, dy)
+            n = max(1, int(L / step))
+            for t in range(n):
+                out.append((x0 + dx * t / n, y0 + dy * t / n))
+        out.append(P[-1])
+        return out
+
+    def cutter(P, off, step=0.01):
+        """Путь фрезы из осевой программы: поточечно вправо по ходу —
+        ровно это и делает стойка по G42."""
+        D = densify(P, step)
+        out = []
+        lx = ly = None
+        for i in range(len(D) - 1):
+            x0, y0 = D[i]
+            x1, y1 = D[i + 1]
+            dx, dy = x1 - x0, y1 - y0
+            L = math.hypot(dx, dy)
+            if L < 1e-12:
+                continue
+            out.append((x0 + dy / L * off, y0 - dx / L * off))
+            lx, ly = dx / L, dy / L
+        if lx is not None:
+            out.append((D[-1][0] + ly * off, D[-1][1] - lx * off))
+        return out
+
+    # ── 3. СОПОСТАВЛЕНИЕ по точке стыка на ПУТИ ФРЕЗЫ ──
+    anc_cut = []
+    for is_in, P in leads:
+        cut = cutter(P, half)
+        if cut:
+            anc_cut.append((is_in, (cut[-1] if is_in else cut[0]), cut))
+
+    worst = 0.0
+    worst_at = None
+    unmatched = 0
+    checked = 0
+    for is_in, P in drawn:
+        j = P[-1] if is_in else P[0]
+        best, bd = None, 9e9
+        for k, (ii, aj, _c) in enumerate(anc_cut):
+            if ii != is_in:
+                continue
+            d = math.hypot(aj[0] - j[0], aj[1] - j[1])
+            if d < bd:
+                bd, best = d, k
+        if best is None or bd > 0.5:
+            unmatched += 1
+            continue
+        cut = anc_cut[best][2]
+        m = 0.0
+        for q in densify(P, 0.02):
+            n = min(math.hypot(q[0] - c[0], q[1] - c[1]) for c in cut)
+            if n > m:
+                m = n
+        checked += 1
+        if m > worst:
+            worst = m
+            worst_at = ('вход' if is_in else 'выход', round(j[0], 2),
+                        round(j[1], 2))
+
+    print(f'  лидов {len(drawn)}, сверено {checked}, без пары {unmatched}; '
+          f'худшее расхождение рисунка с программой {worst * 1000:.1f} мкм'
+          f'{" у " + str(worst_at) if worst_at else ""}')
+    assert unmatched == 0, (
+        f'{unmatched} нарисованных лидов не нашли себя в программе — '
+        f'картинка показывает не то, что уходит в станок')
+    assert worst < 0.020, (
+        f'рисунок расходится с программой на {worst * 1000:.1f} мкм '
+        f'{worst_at} — превью врёт')
+
+def test_preview_rework_lead_matches_the_program_lead():
+    """То же для ЛИДОВ ДОРАБОТКИ: рисунок обязан совпасть с программой.
+
+    У доработки своя фреза (T3), свои множители и РАЗОМКНУТЫЙ фрагмент,
+    поэтому совпадение основных проходов её не покрывает. До v1.7.58 из
+    56 лидов доработки заказа 124173 картинка совпадала с программой у
+    12: расходились и припуск фрагмента (1.5 в посте против 3.0+ во
+    вьювере), и зазор для проверки (пост берёт ОСНОВНУЮ фрезу), и список
+    контуров (в корнер-программе он у поста пустой — операции основного
+    прохода из проекта выброшены).
+    """
+    ai = '/mnt/user-data/uploads/124173_test.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет 124173_test.ai')
+        return
+    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+    try:
+        from camsys.ui.viewer_2d import _build_toolpath_geometry
+    except Exception as e:
+        print(f'  SKIP — вьювер не загрузился ({type(e).__name__})')
+        return
+    import re
+    import camsys.post.mtx_anderson  # noqa: F401
+    from camsys.core.session import CamSession
+    from camsys.core.project import OperationKind
+    import camsys.core.macros as macros_mod
+    from camsys.post.package_export import PackageExporter
+
+    s = CamSession()
+    s.load_ai(ai)
+    for g in s.project.get_layer_by_name('Knife').geometries:
+        if g.polypath:
+            s.project.add_blade_operation(g.id)
+    macros_mod.sort_operations_by_grid(s.project)
+    p = s.cutting_params
+    p.knife_angle, p.tip_diameter, p.bottom = 90.0, 0.8, 0.25
+    p.generate_corner = True
+    ops2d, ops3d = PackageExporter(s.project, p)._build_corner_operations()
+    for o in (ops2d + ops3d):
+        s.project.operations.append(o)
+    if not (ops2d or ops3d):
+        print('  SKIP — углов не нашлось')
+        return
+
+    c_eq = p.corner_tip_diameter + 2 * p.bottom * math.tan(
+        math.radians(p.knife_angle / 2))
+    eq = p.tip_diameter + 2 * p.bottom * math.tan(
+        math.radians(p.knife_angle / 2))
+    half = c_eq / 2
+    extras = {'tool_radius': p.tip_diameter / 2, 'tool_equidistant': eq,
+              'corner_tool_radius': p.corner_tip_diameter / 2,
+              'corner_tool_equidistant': c_eq, 'auto_avoid_all': True,
+              'lead_mode': 0, 'selected_op_id': None}
+
+    drawn = []
+    for op in s.project.operations:
+        if op.kind != OperationKind.CORNER_REWORK:
+            continue
+        for tp in op.toolpaths:
+            r = _build_toolpath_geometry(s.project, op, tp, extras, p)
+            if not r:
+                continue
+            for key, is_in in (('lead_in', True), ('lead_out', False)):
+                L = r.get(key)
+                if not L or not getattr(L, 'segments', None):
+                    continue
+                drawn.append((is_in, [L.segments[0].a]
+                              + [sg.b for sg in L.segments]))
+    assert len(drawn) > 10, f'лидов доработки нарисовано {len(drawn)}'
+
+    anc = list(PackageExporter(s.project, p).generate(
+        only_stages=('corner',)).values())[0]
+
+    num = r'-?\d+\.?\d*'
+
+    def arc_pts(x0, y0, x1, y1, r, ccw, n=64):
+        d = math.hypot(x1 - x0, y1 - y0)
+        if d < 1e-12 or r <= 0:
+            return [(x1, y1)]
+        h = math.sqrt(max(0.0, r * r - (d / 2) ** 2))
+        mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+        ux, uy = -(y1 - y0) / d, (x1 - x0) / d
+        for sgn in (1, -1):
+            cx, cy = mx + sgn * h * ux, my + sgn * h * uy
+            a0 = math.atan2(y0 - cy, x0 - cx)
+            a1 = math.atan2(y1 - cy, x1 - cx)
+            sw = (a1 - a0) % (2 * math.pi)
+            if not ccw:
+                sw -= 2 * math.pi
+            if abs(sw) <= math.pi:
+                return [(cx + r * math.cos(a0 + sw * t / n),
+                         cy + r * math.sin(a0 + sw * t / n))
+                        for t in range(n + 1)]
+        return [(x1, y1)]
+
+    leads = []
+    x = y = 0.0
+    cur = None
+    for line in anc.splitlines():
+        gx = re.search(r'\bX\s*(' + num + ')', line)
+        gy = re.search(r'\bY\s*(' + num + ')', line)
+        nx = float(gx.group(1)) if gx else x
+        ny = float(gy.group(1)) if gy else y
+        gr = re.search(r'\bR\s*(' + num + ')', line)
+        if 'G42' in line or 'G41' in line:
+            cur = [(x, y), (nx, ny)]
+        elif cur is not None and (';50,10' in line or ';60,10' in line):
+            cur += arc_pts(x, y, nx, ny, float(gr.group(1)), ';60,' in line)
+            leads.append((True, cur))
+            cur = None
+        elif ';50,15' in line or ';60,15' in line:
+            cur = [(x, y)] + arc_pts(x, y, nx, ny, float(gr.group(1)),
+                                     ';60,' in line)
+        elif cur is not None and 'G40' in line:
+            cur.append((nx, ny))
+            leads.append((False, cur))
+            cur = None
+        if gx or gy:
+            x, y = nx, ny
+    assert len(leads) == len(drawn), (
+        f'лидов доработки в программе {len(leads)}, нарисовано {len(drawn)}')
+
+    def densify(P, step=0.01):
+        out = []
+        for i in range(len(P) - 1):
+            x0, y0 = P[i]
+            x1, y1 = P[i + 1]
+            dx, dy = x1 - x0, y1 - y0
+            L = math.hypot(dx, dy)
+            n = max(1, int(L / step))
+            for t in range(n):
+                out.append((x0 + dx * t / n, y0 + dy * t / n))
+        out.append(P[-1])
+        return out
+
+    def cutter(P, off, step=0.01):
+        D = densify(P, step)
+        out = []
+        lx = ly = None
+        for i in range(len(D) - 1):
+            x0, y0 = D[i]
+            x1, y1 = D[i + 1]
+            dx, dy = x1 - x0, y1 - y0
+            L = math.hypot(dx, dy)
+            if L < 1e-12:
+                continue
+            out.append((x0 + dy / L * off, y0 - dx / L * off))
+            lx, ly = dx / L, dy / L
+        if lx is not None:
+            out.append((D[-1][0] + ly * off, D[-1][1] - lx * off))
+        return out
+
+    anc_cut = []
+    for is_in, P in leads:
+        c = cutter(P, half)
+        if c:
+            anc_cut.append((is_in, (c[-1] if is_in else c[0]), c))
+
+    worst = 0.0
+    worst_at = None
+    unmatched = 0
+    for is_in, P in drawn:
+        j = P[-1] if is_in else P[0]
+        best, bd = None, 9e9
+        for k, (ii, aj, _c) in enumerate(anc_cut):
+            if ii != is_in:
+                continue
+            d = math.hypot(aj[0] - j[0], aj[1] - j[1])
+            if d < bd:
+                bd, best = d, k
+        if best is None or bd > 0.5:
+            unmatched += 1
+            continue
+        cut = anc_cut[best][2]
+        m = 0.0
+        for q in densify(P, 0.02):
+            n = min(math.hypot(q[0] - c[0], q[1] - c[1]) for c in cut)
+            if n > m:
+                m = n
+        if m > worst:
+            worst = m
+            worst_at = ('вход' if is_in else 'выход', round(j[0], 2),
+                        round(j[1], 2))
+
+    print(f'  лидов доработки {len(drawn)}, без пары {unmatched}; худшее '
+          f'расхождение {worst * 1000:.1f} мкм'
+          f'{" у " + str(worst_at) if worst_at else ""}')
+    assert unmatched == 0, (
+        f'{unmatched} нарисованных лидов доработки не нашли себя в '
+        f'программе — картинка показывает не ту кривую')
+    assert worst < 0.020, (
+        f'рисунок лида доработки расходится с программой на '
+        f'{worst * 1000:.1f} мкм {worst_at}')

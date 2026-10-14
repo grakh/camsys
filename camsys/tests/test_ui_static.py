@@ -251,30 +251,49 @@ def test_startup_applies_defaults_without_knife_params():
 
 
 def test_viewer_and_post_use_same_lead_scale():
-    """Вьювер и пост масштабируют лиды одинаково — от эквидистанты.
+    """Масштаб лида считается в ОДНОМ месте — в общем планировщике.
 
-    Регрессия v1.7.11/1.7.12: пост исправили на tool_eq, а во вьювере
-    осталось tool_offset (половина). Картинка расходилась с программой
-    вдвое, и выход выглядел почти прямой линией — дуга была слишком
-    мелкой, чтобы её заметить.
+    Регрессия v1.7.11/1.7.12: множители «x_tool_rad» альфа считает от
+    ЭКВИДИСТАНТЫ. В посте это исправили, а во вьювере осталось
+    tool_offset (половина) — картинка расходилась с программой вдвое, и
+    выход выглядел почти прямой линией: дуга была слишком мелкой, чтобы
+    её заметить.
+
+    С v1.7.58 формулу держит `_lead_line_length` в lead_collision.py, и
+    обе стороны передают в неё `lead_scale`. Поэтому проверяем не
+    совпадение двух копий текста (копий больше нет), а что копий
+    действительно нет: ни вьювер, ни пост не считают длину или радиус
+    лида сами.
     """
     post = open(os.path.join(os.path.dirname(UI_DIR), 'post',
                              'mtx_anderson.py'), encoding='utf-8').read()
     view = open(os.path.join(UI_DIR, 'viewer_2d.py'), encoding='utf-8').read()
+    plan = open(os.path.join(os.path.dirname(UI_DIR), 'geometry',
+                             'lead_collision.py'), encoding='utf-8').read()
 
-    # В посте масштаб — эквидистанта
-    assert 'lead_scale = tool_eq' in post, "пост не масштабирует от эквидистанты"
+    # Формула — одна, и она в общем модуле
+    assert 'def _lead_line_length(' in plan, 'общая формула длины лида пропала'
+    assert 'user_factor * p.length_mult * p.lead_scale' in plan, \
+        'длина лида считается не от эквидистанты'
 
-    # Ни одна arc_radius не считается от половины
+    # Ни один из вызывающих не строит LeadGeometryRequest сам: иначе
+    # масштаб опять заведётся в двух местах и опять разойдётся.
     for name, src in (('mtx_anderson.py', post), ('viewer_2d.py', view)):
+        assert 'LeadGeometryRequest(' not in src, \
+            f'{name}: лид собирается мимо общего планировщика'
+        # Запрещены именно ПОЛЯ запроса: их заполняет планировщик.
+        # Передать множитель «x_tool_rad» (entry_radius=…) можно — это
+        # значение из диалога, а не посчитанная геометрия.
         bad = [ln.strip() for ln in src.splitlines()
-               if 'arc_radius' in ln and 'tool_offset' in ln
-               and 'lead_scale' not in ln]
+               if 'arc_radius=' in ln or 'line_length=' in ln]
         for b in bad:
             print(f'  {name}: {b}')
-        assert not bad, f"{name}: радиус лида масштабируется половиной"
+        assert not bad, f'{name}: параметры лида считаются на месте'
 
-    assert '_lead_scale_view' in view, "во вьювере нет общего масштаба лидов"
+    # И обе стороны зовут общий планировщик
+    for name, src in (('mtx_anderson.py', post), ('viewer_2d.py', view)):
+        assert 'plan_pass_leads(' in src, \
+            f'{name}: не использует общий планировщик лидов'
 
 
 def test_offset_sign_flip_is_gui_only():
@@ -383,12 +402,18 @@ def test_corner_lead_side_is_pinned_to_cut_side():
         "вернулся старый подбор стороны лида угла пробами"
     assert '_probe_len' not in source and '_probe_rad' not in source, \
         "остались пробы лида для выбора стороны"
-    i = source.index('СТОРОНА ЛИДА ДОРАБОТКИ')
-    blk = source[i:i + 3000]
-    assert 'fit_rework_lead' in blk, \
-        "вьювер подбирает лид не тем же кодом, что пост"
+    # С v1.7.58 сторону меряет общий планировщик — там и проверяем.
+    plan = open(os.path.join(os.path.dirname(UI_DIR), 'geometry',
+                             'lead_collision.py'), encoding='utf-8').read()
+    i = plan.index('СТОРОНА ЗАХОДА')
+    blk = plan[i:i + 2500]
+    assert 'fit_rework_lead(' in blk, \
+        "сторона лида доработки считается не замером зазора"
     assert 'neighbours=' in blk, \
         "в замер не переданы соседние ножи"
+    # А вьювер обязан отдать соседей в этот замер
+    assert 'neighbours=_nb_view' in source, \
+        "вьювер не передаёт соседние ножи в планировщик"
 
 
 def test_viewer_applies_corner_lead_multipliers():
@@ -401,13 +426,24 @@ def test_viewer_applies_corner_lead_multipliers():
     не было.
     """
     source = open(os.path.join(UI_DIR, 'viewer_2d.py'), encoding='utf-8').read()
-    assert '_c_lmult' in source and '_c_rmult' in source, \
-        "множители лида доработки во вьювере не применяются"
-    assert 'user_factor * _c_lmult * _lead_scale_view' in source, \
-        "длина лида доработки считается без множителя"
-    assert '_lead_scale_view = ' in source
-    assert source.index('_lead_scale_view = ') < source.index('_c_lmult = 1.0'), \
-        "_c_lmult объявлен раньше _lead_scale_view"
+    post = open(os.path.join(os.path.dirname(UI_DIR), 'post',
+                             'mtx_anderson.py'), encoding='utf-8').read()
+    # С v1.7.58 множители — поля общего запроса; обе стороны обязаны их
+    # заполнять, иначе лид доработки опять поедет только у одного.
+    for name, src in (('viewer_2d.py', source), ('mtx_anderson.py', post)):
+        for field in ('length_mult=', 'radius_mult=', 'extra_mm='):
+            assert field in src, f'{name}: не задан {field} лида доработки'
+        assert 'corner_lead_length_mult' in src, \
+            f'{name}: множитель длины лида доработки не читается'
+        assert 'corner_lead_radius_mult' in src, \
+            f'{name}: множитель радиуса лида доработки не читается'
+    # И применяет их один и тот же код
+    plan = open(os.path.join(os.path.dirname(UI_DIR), 'geometry',
+                             'lead_collision.py'), encoding='utf-8').read()
+    assert 'p.entry_radius * p.radius_mult * p.lead_scale' in plan, \
+        'радиус лида считается без множителя'
+    assert 'p.exit_radius * p.radius_mult * p.lead_scale' in plan, \
+        'радиус выхода считается без множителя'
 
 
 def test_export_dialog_shows_machinability_report():
@@ -510,25 +546,30 @@ def test_reverse_is_controlled_only_by_generation_flag():
     assert 'self.gen_reverse' in src, 'настоящая галка реверса пропала'
 
 
-def test_viewer_decides_lead_for_the_curve_it_draws():
-    """Решение о лиде принимается для той кривой, которую вьювер рисует.
+def test_viewer_draws_the_lead_the_machine_will_cut():
+    """Вьювер решает на ОСЕВОЙ и рисует смещение результата.
 
-    Вьювер строит лид от ЭКВИДИСТАНТЫ — это уже путь фрезы. Поэтому в
-    подбор уходит её стартовая точка и флаг `path_is_cutter=True`: иначе
-    функция сместит путь ещё раз и решение будет считаться для другой
-    кривой.
+    В `.anc` уходит осевая, а путь фрезы из неё делает стойка по G42.
+    Значит решение о лиде обязано приниматься на осевой — тем же кодом,
+    что в посте, — а рисовать надо СМЕЩЕНИЕ полученного лида. Пока
+    вьювер строил лид на ЭКВИДИСТАНТЕ, это была другая кривая: на 126387
+    с пяткой 1.2 из 396 лидов 126 рисовались не там, где пройдёт фреза
+    (худший подходил к лезвию на 0.302 мм при нужных 0.850).
 
-    В 1.7.44 я пробовал наоборот — строить лид на осевой и рисовать её
-    смещение. Так нельзя: дуга лида радиусом ~0.55 мм при смещении на те
-    же 0.55 вырождается, а линия и дуга расходятся — лид распадался на
-    отдельные прямые, уезжающие в разные стороны.
+    В v1.7.44 эту же замену я уже пробовал и провалил: смещал лид
+    ПОСЕГМЕНТНО, а дуга лида по радиусу сравнима со смещением — она
+    выворачивалась, стык с прямой расходился, и лид распадался на
+    отдельные прямые в разные стороны. Поэтому смещение обязано быть
+    ПОТОЧЕЧНЫМ (`cutter_path_of_lead`); посегментное здесь запрещено.
     """
     source = open(os.path.join(UI_DIR, 'viewer_2d.py'), encoding='utf-8').read()
-    i = source.index('fit_rework_lead')
-    blk = source[i:i + 2500]
-    assert 'path_is_cutter=True' in blk, (
-        'вьювер не сообщает, что передаёт уже путь фрезы')
-    assert 'polypath_offset.segments[0].a' in blk, (
-        'в подбор уходит не та точка, от которой строится лид')
+    assert 'plan_pass_leads(' in source, 'вьювер не зовёт общий планировщик'
+    assert 'path_is_cutter' not in source, (
+        'вьювер опять объявляет свою кривую путём фрезы — значит строит '
+        'лид не на осевой')
+    i = source.index('ЛИДЫ: РИСУЕМ ПУТЬ ФРЕЗЫ')
+    blk = source[i:i + 1500]
+    assert 'cutter_path_of_lead' in blk, (
+        'лид рисуется не поточечным смещением')
     assert 'offset_right_of_travel' not in blk, (
-        'вернулось смещение готового лида — оно вырождает его дугу')
+        'вернулось посегментное смещение лида — оно вырождает его дугу')
