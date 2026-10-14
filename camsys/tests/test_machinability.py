@@ -1377,3 +1377,162 @@ def test_lead_cutter_never_reaches_another_blade():
         f'{bad} лидов режут соседнее лезвие, худший зазор {worst:.3f} мм '
         f'при нужных {half:.3f}')
 
+def test_preview_point_never_forces_a_cutting_lead():
+    """Точка захода из превью не отключает подбор в посте (v1.7.57).
+
+    Вьювер строит лид на ЭКВИДИСТАНТЕ, пост — на осевой; это разные
+    кривые. Вьювер отдаёт посту точку захода ДАЖЕ когда сам пометил её
+    коллизией, а пост принимал её как данность и свой автоподбор
+    выключал (`_no_avoid = True`), чтобы `.anc` совпадал с картинкой.
+
+    Заказ 126387, пятка 1.2: так в программу попадало 63 захода и 63
+    выхода, режущих лезвие (худший зазор 0.551 при нужных 0.850). Без
+    превью пост находил безопасные все 198.
+
+    Теперь подбор остаётся включённым и начинает с ИСХОДНОЙ позиции:
+    безопасная точка из превью сохраняется, небезопасная — исправляется.
+    """
+    ai = '/mnt/user-data/uploads/126387.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет 126387.ai')
+        return
+    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+    try:
+        from camsys.ui.viewer_2d import _build_toolpath_geometry
+    except Exception as e:
+        print(f'  SKIP — вьювер не загрузился ({type(e).__name__})')
+        return
+    import re
+    import camsys.post.mtx_anderson  # noqa: F401
+    from camsys.core.session import CamSession
+    from camsys.core.project import OperationKind
+    import camsys.core.macros as macros_mod
+    from camsys.post.package_export import PackageExporter
+    from camsys.geometry.path_offset import _exact_axis_points
+
+    tip = 1.2
+    s = CamSession()
+    s.load_ai(ai)
+    knives = [g for g in s.project.get_layer_by_name('Knife').geometries
+              if g.polypath]
+    for g in knives:
+        s.project.add_blade_operation(g.id)
+    macros_mod.sort_operations_by_grid(s.project)
+    p = s.cutting_params
+    p.knife_angle, p.tip_diameter, p.bottom = 90.0, tip, 0.25
+    eq = tip + 2 * 0.25 * math.tan(math.radians(45))
+    half = eq / 2
+    extras = {'tool_radius': tip / 2, 'tool_equidistant': eq,
+              'corner_tool_radius': 0.3, 'corner_tool_equidistant': 1.1,
+              'auto_avoid_all': True, 'lead_mode': 0, 'selected_op_id': None}
+
+    # 1. Прогоняем вьювер — он запишет точки захода на операции.
+    n_bad_preview = 0
+    for op in s.project.operations:
+        if op.kind != OperationKind.BLADE_FORMING:
+            continue
+        for tp in op.toolpaths:
+            r = _build_toolpath_geometry(s.project, op, tp, extras, p)
+            if r and (r.get('lead_in_collision') or r.get('lead_out_collision')):
+                n_bad_preview += 1
+    n_entry = sum(1 for op in s.project.operations
+                  if op.attributes.get('_lead_entry'))
+    assert n_entry > 0, 'вьювер не записал ни одной точки захода'
+
+    # 2. Генерируем программу — как это делает приложение.
+    anc = list(PackageExporter(s.project, p).generate(
+        only_stages=('rough_all',)).values())[0]
+
+    cell = max(1.0, half * 4)
+    grid = {}
+    for g in knives:
+        for _t, q in _exact_axis_points(g.polypath, 0.02)[0]:
+            grid.setdefault((int(q[0] / cell), int(q[1] / cell)), []).append(q)
+
+    def nearest(pt):
+        gx, gy = int(pt[0] / cell), int(pt[1] / cell)
+        best = 9e9
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for q in grid.get((gx + dx, gy + dy), ()):
+                    d = math.hypot(q[0] - pt[0], q[1] - pt[1])
+                    if d < best:
+                        best = d
+        return best
+
+    num = r'-?\d+\.?\d*'
+
+    def arc_pts(x0, y0, x1, y1, r, ccw):
+        d = math.hypot(x1 - x0, y1 - y0)
+        if d < 1e-9 or r <= 0:
+            return [(x1, y1)]
+        h = math.sqrt(max(0.0, r * r - (d / 2) ** 2))
+        mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+        ux, uy = -(y1 - y0) / d, (x1 - x0) / d
+        for sgn in (1, -1):
+            cx, cy = mx + sgn * h * ux, my + sgn * h * uy
+            a0 = math.atan2(y0 - cy, x0 - cx)
+            a1 = math.atan2(y1 - cy, x1 - cx)
+            sw = (a1 - a0) % (2 * math.pi)
+            if not ccw:
+                sw -= 2 * math.pi
+            if abs(sw) <= math.pi:
+                return [(cx + r * math.cos(a0 + sw * t / 12),
+                         cy + r * math.sin(a0 + sw * t / 12))
+                        for t in range(13)]
+        return [(x1, y1)]
+
+    leads = []
+    x = y = 0.0
+    cur = None
+    for line in anc.splitlines():
+        gx = re.search(r'\bX\s*(' + num + ')', line)
+        gy = re.search(r'\bY\s*(' + num + ')', line)
+        nx = float(gx.group(1)) if gx else x
+        ny = float(gy.group(1)) if gy else y
+        gr = re.search(r'\bR\s*(' + num + ')', line)
+        if 'G42' in line or 'G41' in line:
+            cur = [(x, y), (nx, ny)]
+        elif cur is not None and (';50,10' in line or ';60,10' in line):
+            cur += arc_pts(x, y, nx, ny, float(gr.group(1)), ';60,' in line)
+            leads.append(cur)
+            cur = None
+        elif ';50,15' in line or ';60,15' in line:
+            cur = [(x, y)] + arc_pts(x, y, nx, ny, float(gr.group(1)),
+                                     ';60,' in line)
+        elif cur is not None and 'G40' in line:
+            cur.append((nx, ny))
+            leads.append(cur)
+            cur = None
+        if gx or gy:
+            x, y = nx, ny
+
+    assert len(leads) > 100, f'лидов в программе всего {len(leads)}'
+    bad = 0
+    worst = 9e9
+    for pts in leads:
+        cut = []
+        for i in range(len(pts) - 1):
+            x0, y0 = pts[i]
+            x1, y1 = pts[i + 1]
+            dx, dy = x1 - x0, y1 - y0
+            L = math.hypot(dx, dy)
+            if L < 1e-9:
+                continue
+            n = max(2, int(L / 0.05))
+            for t in range(n + 1):
+                cut.append((x0 + dx * t / n + dy / L * half,
+                            y0 + dy * t / n - dx / L * half))
+        if not cut:
+            continue
+        d = min(nearest(q) for q in cut)
+        worst = min(worst, d)
+        if d < half - 0.002:
+            bad += 1
+    print(f'  превью пометило коллизией {n_bad_preview} путей; '
+          f'в программе лидов {len(leads)}, режут лезвие {bad}, '
+          f'худший зазор {worst:.3f} (надо {half:.3f})')
+    assert bad == 0, (
+        f'{bad} лидов из превью попали в программу режущими, '
+        f'худший зазор {worst:.3f} при нужных {half:.3f}')
+
