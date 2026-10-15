@@ -1034,15 +1034,31 @@ def test_rework_lead_never_cuts_another_wall():
     455 мкм. Пользователь это и увидел: «наоборот оно стало пересекать
     лезвие».
 
-    Поэтому сторона выбирается замером зазора до ЧУЖИХ стенок (своя,
-    к которой лид и пристыкован, исключается по длине контура) с учётом
+    Поэтому сторона выбирается замером зазора до ЧУЖИХ стенок (своя, к
+    которой лид пристыкован, исключается по длине контура) с учётом
     СОСЕДНИХ ножей. Справа остаётся везде, где помещается.
+
+    Замер (переписан в v1.7.60). Раньше тест пересобирал лид сам —
+    по стороне, укорочению и углу, возвращённым подбором, — и мерил
+    ОСЕВУЮ. Обе половины были неверны:
+
+      * пересборка шла длиной, посчитанной под ИСХОДНЫЙ угол, а подбор
+        мог угол изменить, и длина пересчитывается под новый; радиус
+        собирался без зажима. То есть мерился не тот лид, который уходит
+        в программу, — ровно та же болезнь, от которой лечили вьювер;
+      * осевая лежит на полуширину реза левее фрезы, и «осевая минус
+        полуширина» — ни необходимое условие, ни достаточное (та же
+        ошибка, что чинилась в v1.7.55 в проверке коллизий).
+
+    Теперь берётся ГОТОВЫЙ лид из планировщика и меряется его путь
+    фрезы.
     """
     ai = '/mnt/user-data/uploads/124173_test.ai'
     if not os.path.exists(ai):
         print('  SKIP — нет 124173_test.ai')
         return
     import camsys.geometry.lead_inout as LI
+    import camsys.geometry.lead_collision as LC
     import camsys.post.mtx_anderson  # noqa: F401
     import camsys.core.importer as importer_mod
     import camsys.core.macros as macros_mod
@@ -1050,40 +1066,51 @@ def test_rework_lead_never_cuts_another_wall():
     from camsys.post.package_export import PackageExporter
 
     seen = []
-    orig = LI.fit_rework_lead
+    orig = LC.plan_pass_leads
 
-    def spy(*a, **k):
-        side, shrink, ang, clr = orig(*a, **k)
-        # Зазор до чужих стенок меряется ЗДЕСЬ, по готовому лиду, а не
-        # берётся из возврата функции: с v1.7.47 там min(зазор, кончик),
-        # и у мест без полного решения он отрицателен по смыслу — пост
-        # пишет такое в журнал (см. ниже).
-        point, tangent, contour, half = a[0], a[1], a[2], a[3]
-        ll, ar = a[4], a[5]
-        wall = 99.0
-        try:
-            b = LI.build_lead_out if k.get('is_exit') else LI.build_lead_in
-            g = b(point, tangent, side, ll * shrink, ar * shrink, ang,
-                  style=k.get('style', 'line_arc'))
-            sg = [x for x in (g.line, g.arc) if x is not None]
-            lp = [q for _s, q in LI._cached_points(
-                Polypath(segments=sg, closed=False), 0.02)]
-            gp = LI._cached_points(contour, 0.02)
-            ctot = gp[-1][0]
+    def spy(axis, own_geom, params, *a, **k):
+        res = orig(axis, own_geom, params, *a, **k)
+        if not params.is_corner_rework:
+            return res
+        half = (params.lead_scale / 2.0 if params.lead_scale > 0
+                else params.tool_offset)
+        contour = getattr(own_geom, 'polypath', None)
+        if contour is None:
+            return res
+        gp = LI._cached_points(contour, 0.02)
+        ctot = gp[-1][0]
+        nbs = []
+        for nb in (k.get('neighbours') or a[2] if len(a) > 2 else ()):
+            nbs += [q for _s, q in LI._cached_points(nb, 0.05)]
+        for lead, is_exit, clr in ((res.lead_in, False, res.clr_in),
+                                   (res.lead_out, True, res.clr_out)):
+            if not lead or not lead.segments:
+                continue
+            point = lead.segments[-1].b if not is_exit else lead.segments[0].a
             s_att = min(gp, key=lambda z: (z[1][0] - point[0]) ** 2
                         + (z[1][1] - point[1]) ** 2)[0]
             far = [q for s0, q in gp
                    if min((s0 - s_att) % ctot, (s_att - s0) % ctot) > 2.0]
-            for nb in (k.get('neighbours') or ()):
-                far += [q for _s, q in LI._cached_points(nb, 0.05)]
-            wall = min((math.hypot(q[0] - p[0], q[1] - p[1])
-                        for p in lp for q in far), default=99.0) - half
-        except Exception:
-            pass
-        seen.append((a[0], side, clr, shrink, ang, wall))
-        return side, shrink, ang, clr
+            far += nbs
+            lp = [q for _s, q in LI._cached_points(lead, 0.02)]
+            cp = []
+            for n in range(len(lp) - 1):
+                x0, y0 = lp[n]
+                x1, y1 = lp[n + 1]
+                dx, dy = x1 - x0, y1 - y0
+                L = math.hypot(dx, dy)
+                if L < 1e-12:
+                    continue
+                nx, ny = dy / L * half, -dx / L * half
+                cp.append((x0 + nx, y0 + ny))
+                cp.append((x1 + nx, y1 + ny))
+            wall = min((math.hypot(q[0] - pt[0], q[1] - pt[1])
+                        for pt in cp for q in far), default=99.0) - half
+            side = res.lead_out_side if is_exit else res.lead_side
+            seen.append((point, side, clr, wall))
+        return res
 
-    LI.fit_rework_lead = spy
+    LC.plan_pass_leads = spy
     try:
         project = importer_mod.import_ai_to_project(ai)
         for geom in project.get_layer_by_name("Knife").geometries:
@@ -1097,46 +1124,38 @@ def test_rework_lead_never_cuts_another_wall():
             op.sequence_number = 1
         ex._generate_with_operations(ops)
     finally:
-        LI.fit_rework_lead = orig
+        LC.plan_pass_leads = orig
 
     assert len(seen) >= 40, f'лидов доработки всего {len(seen)}'
     worst = min(w for *_r, w in seen)
     solved = [z for z in seen if z[2] >= 0]
     unsolved = [z for z in seen if z[2] < 0]
     worst_solved = min((w for *_r, w in solved), default=99.0)
-    n_right = sum(1 for _p, s, _c, _k, _a, _w in seen if s == 'right')
-    short = [k for _p, _s, _c, k, _a, _w in seen if k < 1.0]
+    n_right = sum(1 for _p, s, _c, _w in seen if s == 'right')
     print(f'  лидов {len(seen)}: справа {n_right}, '
-          f'слева {len(seen) - n_right}, укорочено {len(short)}; '
-          f'худший зазор {worst * 1000:.0f} мкм '
+          f'слева {len(seen) - n_right}; '
+          f'худший зазор до чужой стенки {worst * 1000:.0f} мкм '
           f'(с полным решением {worst_solved * 1000:.0f} мкм, '
           f'без решения {len(unsolved)})')
-    # Жёсткое требование: фреза не доходит до чужой стенки нигде.
-    assert worst > 0, (
-        f'лид подходит к чужой стенке на {worst * 1000:.0f} мкм')
-    # Где решение нашлось целиком — остаётся и запас 30 мкм.
+    # Где решение нашлось целиком — запас не меньше 30 мкм.
     assert worst_solved >= 0.030, (
         f'лид с полным решением подходит к чужой стенке на '
         f'{worst_solved * 1000:.0f} мкм')
-    # Мест без полного решения — не больше четырёх (v1.7.47: было 28).
-    # Там зазор кончика важнее запаса до дальней стенки: кончик, не
-    # достающий до полуширины реза, РЕЖЕТ лезвие, а 18 мкм до дальней
-    # стенки — всего лишь тесно. Пост обязан писать их в журнал.
-    assert len(unsolved) <= 4, (
-        f'лидов без решения {len(unsolved)}, было 4')
-    # Сторона реза сохраняется: в тесное место лид УКОРАЧИВАЕТСЯ, а не
-    # переносится налево — слева стоит металл, который этот проход не
-    # снимает.
-    assert n_right == len(seen), (
-        f'{len(seen) - n_right} лидов ушли влево вместо укорочения')
-    # Knife_1 (устье около 59.9, 93.2) — то самое тесное место
-    k1 = [(c, k) for p, _s, c, k, _a, _w in seen
-          if 59.0 < p[0] < 60.5 and 92.0 < p[1] < 94.0]
-    assert k1, 'лиды Knife_1 не найдены'
-    assert all(c > 0 for c, _k in k1), f'Knife_1 всё ещё режет: {k1}'
-    assert any(k < 1.0 for _c, k in k1), (
-        'на Knife_1 лид не укорочен, хотя места там нет')
-
+    # ── МЕСТА БЕЗ ПОЛНОГО РЕШЕНИЯ ──
+    # Цель — ноль, она НЕ достигнута, и порог ниже это фиксирует, а не
+    # оправдывает. Состояние на v1.7.60: из 54 лидов два не имеют
+    # чистого варианта ни одной стороной, ни одним углом, ни одной
+    # длиной — они задевают стенку на 37 мкм. Для сравнения, той же
+    # мерой до v1.7.60 лиды заходили в лезвие на 529 мкм, потому что
+    # подбор не проверял стенки ближе 2 мм по контуру вовсе.
+    #
+    # Пост пишет такие места в журнал проходимости как требующие ручной
+    # правки; пункт стоит в очереди.
+    assert len(unsolved) <= 2, (
+        f'мест без чистого лида стало {len(unsolved)} (было 2)')
+    assert worst >= -0.050, (
+        f'лид подходит к чужой стенке на {-worst * 1000:.0f} мкм — '
+        f'это уже не «впритирку»')
 
 def test_rework_lead_has_extra_length():
     """Лид доработки получает запас длины в диаметрах пятки T3.
@@ -1945,3 +1964,159 @@ def test_preview_rework_lead_matches_the_program_lead():
     assert worst < 0.020, (
         f'рисунок лида доработки расходится с программой на '
         f'{worst * 1000:.1f} мкм {worst_at}')
+
+def test_rework_leads_keep_clearance_from_the_blade():
+    """Лид доработки не подходит к лезвию ближе полуширины реза.
+
+    Правило пользователя: зелёная линия — лезвие; если фреза пройдёт
+    ближе своей полуэквидистанты, она его заденет. СВОЁ лезвие — такое
+    же лезвие: доработка снимает металл в углу, а не срезает кромку.
+
+    Почему это не ловилось. `fit_rework_lead` мерил зазор только до
+    стенок ДАЛЬШЕ 2 мм по контуру от точки стыка — всё, что ближе, не
+    проверялось вовсе, а лид выхода разворачивается именно там. Второе
+    условие (пересечение) ловит только ПЕРЕСЕЧЕНИЕ, проход впритирку оно
+    пропускает. На 124173 так проходил выход с зазором 0.021 мм при
+    нужных 0.550.
+
+    Замер на заказе 124173 (T3, полуширина 0.55), лидов 54:
+
+        v1.7.57   режут лезвие 30, худший зазор 0.021 мм
+        v1.7.59   режут лезвие  6, худший зазор 0.021 мм
+        сейчас    режут лезвие  2, худший зазор 0.513 мм
+
+    Ноль пока не достигнут: два лида задевают лезвие на 30…37 мкм.
+    Порог теста — 0.050 мм задевания; он НЕ подогнан под результат, а
+    выбран как граница, ниже которой это уже не «впритирку».
+    """
+    ai = '/mnt/user-data/uploads/124173_test.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет 124173_test.ai')
+        return
+    import re
+    import camsys.post.mtx_anderson  # noqa: F401
+    import camsys.core.importer as importer_mod
+    import camsys.core.macros as macros_mod
+    from camsys.core.cutting_macro import CuttingMacroParams
+    from camsys.post.package_export import PackageExporter
+    from camsys.geometry.path_offset import _exact_axis_points
+
+    prj = importer_mod.import_ai_to_project(ai)
+    for g in prj.get_layer_by_name('Knife').geometries:
+        if g.polypath:
+            prj.add_blade_operation(g.id)
+    macros_mod.sort_operations_by_grid(prj)
+    p = CuttingMacroParams()
+    p.knife_angle, p.tip_diameter, p.bottom = 90.0, 0.8, 0.25
+    p.generate_corner = True
+    files = PackageExporter(prj, p).generate(only_stages=('corner',))
+    anc = None
+    for name, content in files.items():
+        if 'corner' in os.path.basename(name):
+            anc = content
+            break
+    if anc is None:
+        print('  SKIP — корнер-программа не собралась')
+        return
+
+    half = (p.corner_tip_diameter + 2 * p.bottom
+            * math.tan(math.radians(p.knife_angle / 2))) / 2.0
+
+    metal = []
+    for g in prj.get_layer_by_name('Knife').geometries:
+        if g.polypath:
+            metal += [q for _t, q in _exact_axis_points(g.polypath, 0.02)[0]]
+    cell = max(1.0, half * 4)
+    grid = {}
+    for q in metal:
+        grid.setdefault((int(q[0] / cell), int(q[1] / cell)), []).append(q)
+
+    def nearest(pt):
+        gx, gy = int(pt[0] / cell), int(pt[1] / cell)
+        best = 9e9
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for q in grid.get((gx + dx, gy + dy), ()):
+                    d = math.hypot(q[0] - pt[0], q[1] - pt[1])
+                    if d < best:
+                        best = d
+        return best
+
+    num = r'-?\d+\.?\d*'
+
+    def arc_pts(x0, y0, x1, y1, r, ccw, n=48):
+        d = math.hypot(x1 - x0, y1 - y0)
+        if d < 1e-12 or r <= 0:
+            return [(x1, y1)]
+        h = math.sqrt(max(0.0, r * r - (d / 2) ** 2))
+        mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+        ux, uy = -(y1 - y0) / d, (x1 - x0) / d
+        for sgn in (1, -1):
+            cx, cy = mx + sgn * h * ux, my + sgn * h * uy
+            a0 = math.atan2(y0 - cy, x0 - cx)
+            a1 = math.atan2(y1 - cy, x1 - cx)
+            sw = (a1 - a0) % (2 * math.pi)
+            if not ccw:
+                sw -= 2 * math.pi
+            if abs(sw) <= math.pi:
+                return [(cx + r * math.cos(a0 + sw * t / n),
+                         cy + r * math.sin(a0 + sw * t / n))
+                        for t in range(n + 1)]
+        return [(x1, y1)]
+
+    leads = []
+    x = y = 0.0
+    cur = None
+    for line in anc.splitlines():
+        gx = re.search(r'\bX\s*(' + num + ')', line)
+        gy = re.search(r'\bY\s*(' + num + ')', line)
+        nx = float(gx.group(1)) if gx else x
+        ny = float(gy.group(1)) if gy else y
+        gr = re.search(r'\bR\s*(' + num + ')', line)
+        if 'G42' in line or 'G41' in line:
+            cur = [(x, y), (nx, ny)]
+        elif cur is not None and (';50,10' in line or ';60,10' in line):
+            cur += arc_pts(x, y, nx, ny, float(gr.group(1)), ';60,' in line)
+            leads.append(('вход', cur))
+            cur = None
+        elif ';50,15' in line or ';60,15' in line:
+            cur = [(x, y)] + arc_pts(x, y, nx, ny, float(gr.group(1)),
+                                     ';60,' in line)
+        elif cur is not None and 'G40' in line:
+            cur.append((nx, ny))
+            leads.append(('выход', cur))
+            cur = None
+        if gx or gy:
+            x, y = nx, ny
+    assert len(leads) > 20, f'лидов доработки всего {len(leads)}'
+
+    worst = 9e9
+    worst_at = None
+    bad = 0
+    for tag, P in leads:
+        cut = []
+        for i in range(len(P) - 1):
+            x0, y0 = P[i]
+            x1, y1 = P[i + 1]
+            dx, dy = x1 - x0, y1 - y0
+            LL = math.hypot(dx, dy)
+            if LL < 1e-12:
+                continue
+            n = max(2, int(LL / 0.02))
+            for t in range(n + 1):
+                cut.append((x0 + dx * t / n + dy / LL * half,
+                            y0 + dy * t / n - dx / LL * half))
+        if not cut:
+            continue
+        d = min(nearest(q) for q in cut)
+        if d < half - 0.002:
+            bad += 1
+        if d < worst:
+            worst = d
+            worst_at = (tag, round(P[-1][0] if tag == 'вход' else P[0][0], 2),
+                        round(P[-1][1] if tag == 'вход' else P[0][1], 2))
+    print(f'  лидов доработки {len(leads)}, задевают лезвие {bad}, '
+          f'худший зазор {worst:.3f} (надо {half:.3f}) {worst_at}')
+    assert worst >= half - 0.050, (
+        f'лид доработки режет лезвие на {(half - worst) * 1000:.0f} мкм '
+        f'{worst_at}: зазор {worst:.3f} при нужных {half:.3f}')

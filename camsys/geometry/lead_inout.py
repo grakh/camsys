@@ -541,7 +541,8 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
                     neighbours=None,
                     margin_mm: float = 0.05,
                     attach_eps: float = 0.02,
-                    path_is_cutter: bool = False):
+                    path_is_cutter: bool = False,
+                    min_arc_radius: float = 0.0):
     """Подбирает лид доработки так, чтобы фреза НЕ доставала до геометрии.
 
     Три условия (1–2 с v1.7.40, 3-е с v1.7.47):
@@ -599,9 +600,6 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
             if (abs(_q0[0] - point[0]) < reach
                     and abs(_q0[1] - point[1]) < reach):
                 all_metal.append(_q0)
-    far = [q for s, q in cpts
-           if min((s - s_att) % ctot, (s_att - s) % ctot) > 2.0
-           and abs(q[0] - point[0]) < reach and abs(q[1] - point[1]) < reach]
     # Соседние ножи идут ТОЛЬКО в замер зазора. В проверку на пересечение
     # их добавлять нельзя: точки разных контуров, склеенные в одну
     # ломаную, дают фиктивные отрезки через весь лист, и «пересечение»
@@ -611,19 +609,24 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
         near_nb = False
         for _s, q in pts_nb:
             if abs(q[0] - point[0]) < reach and abs(q[1] - point[1]) < reach:
-                far.append(q)
                 near_nb = True
         if near_nb:
             walls.append([q for _s, q in pts_nb])
 
     def probe(side, shrink, ang):
+        # Радиус зажимается ЗДЕСЬ, тем же правилом, что применит
+        # вызывающий: дуга лида обязана пережить компенсацию стойки
+        # (v1.7.59). Иначе подбор оценивает одну дугу, а в программу
+        # уходит другая — в v1.7.59 зажим стоял ПОСЛЕ подбора, и четыре
+        # лида доработки на 124173 уехали в лезвие на 40…70 мкм глубже.
+        _r = max(arc_radius * shrink, min_arc_radius)
         try:
             g = builder(point, tangent, side, line_length * shrink,
-                        arc_radius * shrink, ang, style=style)
+                        _r, ang, style=style)
         except TypeError:
             try:
                 g = builder(point, tangent, side, line_length * shrink,
-                            arc_radius * shrink, ang)
+                            _r, ang)
             except Exception:
                 return None
         except Exception:
@@ -652,8 +655,45 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
                 continue
             nx, ny = dy / L, -dx / L
             out.append((x0 + nx * cut_half_width, y0 + ny * cut_half_width))
-            out.append((x1 + nx * cut_half_width, y1 + ny * cut_half_width))
+            _last = (x1 + nx * cut_half_width, y1 + ny * cut_half_width)
+        if out:
+            out.append(_last)
         return out
+
+    # ── СЕТКА ПО МЕТАЛЛУ ──
+    # Замер зазора идёт для каждого из ~150 кандидатов по всем точкам
+    # лида против всего металла рядом. В лоб это десятки миллионов
+    # расстояний на один лид: сборка пакета 124173 выросла с 3 до 6.5
+    # минут. Сетка с ячейкой в полуширину реза оставляет на точку лида
+    # горсть ячеек вместо всего списка.
+    # Выше этого расстояния решение не меняется: всё, что дальше
+    # полуширины реза плюс миллиметр, одинаково безопасно. Без
+    # потолка кольцевой поиск у точки вдали от металла просматривал
+    # все ячейки до `reach`.
+    _probe_cap = cut_half_width + 1.0
+    _cell = max(0.2, cut_half_width)
+    _grid = {}
+    for _q in all_metal:
+        _grid.setdefault((int(_q[0] / _cell), int(_q[1] / _cell)),
+                         []).append(_q)
+
+    def _nearest_metal(px, py, limit):
+        gx, gy = int(px / _cell), int(py / _cell)
+        best = limit
+        rings = int(math.ceil(limit / _cell)) + 1
+        for r in range(rings + 1):
+            # всё ближе (r-1) ячеек уже просмотрено
+            if best <= (r - 1) * _cell:
+                break
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    if max(abs(dx), abs(dy)) != r:
+                        continue
+                    for q in _grid.get((gx + dx, gy + dy), ()):
+                        d = math.hypot(q[0] - px, q[1] - py)
+                        if d < best:
+                            best = d
+        return best
 
     def evaluate(lpts):
         """Замер варианта лида.
@@ -703,21 +743,34 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
         #    тянет кончик К стыку, то есть К металлу, поэтому выполняется
         #    это условие удлинением и увеличением угла — см. перебор ниже.
         _tipp = lpts[-1] if is_exit else lpts[0]
-        _dt = min((math.hypot(q[0] - _tipp[0], q[1] - _tipp[1])
-                   for q in all_metal), default=reach)
+        _dt = _nearest_metal(_tipp[0], _tipp[1], _probe_cap)
 
-        # 3. зазор до чужих стенок
-        worst = reach
-        for p in lpts:
-            for q in far:
-                d = math.hypot(q[0] - p[0], q[1] - p[1])
-                if d < worst:
-                    worst = d
-        # Полуширина реза вычитается ВСЕГДА (v1.7.46). Фреза снимает
-        # металл на эту ширину вокруг себя, где бы ни проходила её линия.
-        # В 1.7.45 флаг path_is_cutter убирал вычитание — требование «не
-        # ближе эквидистанты» превращалось в «не ближе 0.05 мм», и во
-        # вьювере укорочение вообще не срабатывало.
+        # 3. ЗАЗОР ВСЕГО ЛИДА ДО ЛЮБОГО МЕТАЛЛА (v1.7.60)
+        #
+        # Раньше здесь мерилось расстояние только до стенок ДАЛЬШЕ 2 мм
+        # по контуру от точки стыка (список `far`). Всё, что ближе, не
+        # проверялось вовсе — а лид выхода как раз разворачивается возле
+        # стыка и уходит в лезвие именно там. На 124173 так проходили
+        # лиды с зазором 0.021 мм при нужных 0.55: ни условие 1 (оно
+        # ловит только ПЕРЕСЕЧЕНИЕ, а не проход впритирку), ни условие 2
+        # (оно про кончик) их не видели.
+        #
+        # Теперь меряется весь путь фрезы до ВСЕГО металла рядом.
+        # Исключение одно и оно геометрическое, а не «по длине контура»:
+        # точки лида в окрестности СТЫКА пропускаются — там фреза и
+        # должна лежать ровно в полуширине от контура, это её рабочее
+        # положение, а не врезание.
+        cpath3 = cutter(lpts)
+        worst = _probe_cap
+        for p in cpath3:
+            if math.hypot(p[0] - point[0], p[1] - point[1]) < eps:
+                continue
+            d = _nearest_metal(p[0], p[1], min(worst, _probe_cap))
+            if d < worst:
+                worst = d
+        # Полуширина вычитается ВСЕГДА (v1.7.46): `worst` — расстояние
+        # от ЦЕНТРА фрезы до металла, а снимает она на полуширину вокруг
+        # себя. Ноль означает «край фрезы касается лезвия».
         return crosses, _dt, worst - cut_half_width
 
     other = 'left' if prefer == 'right' else 'right'

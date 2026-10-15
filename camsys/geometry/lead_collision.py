@@ -1212,6 +1212,20 @@ def plan_pass_leads(axis: Polypath,
     ang_out = p.exit_angle
     shrink_out = 1.0
 
+    # ── ПОРОГ РАДИУСА ДУГИ ЛИДА ──
+    # Дуга обязана пережить компенсацию стойки: та пересчитывает её в
+    # концентрическую радиусом R − d, и при R <= d такой дуги нет.
+    # Радиус считается от эквидистанты фрезы ЭТОГО прохода: угол режет
+    # тонкая T3, и компенсацию стойка делает по ней (p.tool_offset там
+    # намеренно завышен, см. комментарий во вьювере).
+    #
+    # Порог идёт В ПОДБОР (min_arc_radius), а не применяется после него.
+    # В v1.7.59 он стоял после — подбор оценивал одну дугу, а строилась
+    # другая, и четыре лида доработки на 124173 ушли в лезвие на 40…70
+    # мкм глубже.
+    _d_cut = (p.lead_scale / 2.0) if p.lead_scale > 0 else p.tool_offset
+    _r_min = _d_cut + LEAD_MIN_COMP_RADIUS
+
     # ── СТОРОНА ЗАХОДА ──
     if p.is_corner_rework:
         # Лид доработки — ПО ЗАМЕРУ ЗАЗОРА (v1.7.39). Эмиттер пишет G42,
@@ -1223,7 +1237,7 @@ def plan_pass_leads(axis: Polypath,
         res.lead_side, shrink_in, _a, res.clr_in = fit_rework_lead(
             start_pt, start_tan, own_pp, cut_half, ll_in, ar_in, ang_in,
             is_exit=False, neighbours=list(neighbours),
-            style=p.entry_style)
+            style=p.entry_style, min_arc_radius=_r_min)
         if _a is not None:
             # Подобранный угол меняет и длину прямой: при том же боковом
             # зазоре длина делится на sin(угла). Пересчитываем, иначе
@@ -1254,7 +1268,8 @@ def plan_pass_leads(axis: Polypath,
         cut_half = (p.lead_scale / 2.0 if p.lead_scale > 0 else 0.5)
         res.lead_out_side, shrink_out, _a, res.clr_out = fit_rework_lead(
             end_pt, end_tan, own_pp, cut_half, ll_out, ar_out, ang_out,
-            is_exit=True, neighbours=list(neighbours), style=p.exit_style)
+            is_exit=True, neighbours=list(neighbours), style=p.exit_style,
+            min_arc_radius=_r_min)
         if _a is not None:
             ang_out = _a
             ll_out = _lead_line_length(p.exit_length, ang_out, p)
@@ -1270,13 +1285,10 @@ def plan_pass_leads(axis: Polypath,
     else:
         res.lead_out_side = res.lead_side
 
-    # ── ДУГА ЛИДА ОБЯЗАНА ПЕРЕЖИТЬ КОМПЕНСАЦИЮ ──
-    # Радиус считается от эквидистанты фрезы ЭТОГО прохода: у доработки
-    # режет тонкая T3, и компенсацию стойка делает по ней, а не по
-    # основной (p.tool_offset там намеренно завышен, см. комментарий во
-    # вьювере).
-    _d_cut = (p.lead_scale / 2.0) if p.lead_scale > 0 else p.tool_offset
-    _r_min = _d_cut + LEAD_MIN_COMP_RADIUS
+    # ── ЗАЖИМ РАДИУСА — ТЕМ ЖЕ ПРАВИЛОМ, ЧТО В ПОДБОРЕ ──
+    # `probe` внутри fit_rework_lead строит кандидатов с
+    # max(radius * shrink, _r_min); здесь то же самое применяется к
+    # выбранному варианту, поэтому оценённая дуга и построенная — одна.
     if ar_in > 0 and ar_in < _r_min:
         if log is not None:
             log(f"ЛИД: радиус дуги захода {ar_in:.3f} мм при радиусе "
@@ -1284,14 +1296,13 @@ def plan_pass_leads(axis: Polypath,
                 f"{ar_in - _d_cut:+.3f} мм, стойка такую дугу не "
                 f"выполнит; поднят до {_r_min:.3f} мм")
         ar_in = _r_min
-    if ar_out > 0 and ar_out * shrink_out < _r_min:
-        if log is not None:
-            log(f"ЛИД: радиус дуги выхода {ar_out * shrink_out:.3f} мм "
-                f"при радиусе инструмента {_d_cut:.3f} — после "
-                f"компенсации {ar_out * shrink_out - _d_cut:+.3f} мм, "
-                f"стойка такую дугу не выполнит; поднят до "
-                f"{_r_min:.3f} мм")
-        ar_out = _r_min / (shrink_out if shrink_out > 1e-9 else 1.0)
+    _ar_out_final = max(ar_out * shrink_out, _r_min if ar_out > 0 else 0.0)
+    if ar_out > 0 and ar_out * shrink_out < _r_min and log is not None:
+        log(f"ЛИД: радиус дуги выхода {ar_out * shrink_out:.3f} мм "
+            f"при радиусе инструмента {_d_cut:.3f} — после "
+            f"компенсации {ar_out * shrink_out - _d_cut:+.3f} мм, "
+            f"стойка такую дугу не выполнит; поднят до "
+            f"{_r_min:.3f} мм")
 
     # ── ЗАПРОСЫ НА ПОСТРОЕНИЕ ──
     # INSIDE/OUTSIDE: сторону НЕ фиксируем — автоподбор пересчитает её на
@@ -1305,7 +1316,7 @@ def plan_pass_leads(axis: Polypath,
     req_out = LeadGeometryRequest(
         is_entry=False, pass_side=p.pass_side, angle_deg=ang_out,
         line_length=ll_out * shrink_out,
-        arc_radius=ar_out * shrink_out, style=p.exit_style,
+        arc_radius=_ar_out_final, style=p.exit_style,
         forced_side=(res.lead_out_side if _fix else None))
 
     # ── ЗАХОД ──
@@ -1348,7 +1359,9 @@ def plan_pass_leads(axis: Polypath,
         if want_out:
             _exit_in_search = LeadGeometryRequest(
                 is_entry=False, pass_side=p.pass_side, angle_deg=ang_out,
-                line_length=ll_out, arc_radius=ar_out, style=p.exit_style,
+                line_length=ll_out,
+                arc_radius=max(ar_out, _r_min if ar_out > 0 else 0.0),
+                style=p.exit_style,
                 forced_side=(None if p.pass_side in ("INSIDE", "OUTSIDE")
                              else res.lead_out_side))
         axis, res.lead_in, res.lead_in_collision, res.lead_in_geom = \
