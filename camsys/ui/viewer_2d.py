@@ -1185,26 +1185,9 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         _nb_view = [g.polypath for g in _geoms
                     if (g is not None and g.is_closed
                         and g.polypath is not None and g is not geom)]
-        # ── КАКИЕ КОНТУРЫ ВИДИТ ПРОВЕРКА КОЛЛИЗИЙ ──
-        # У доработки — НИКАКИХ, и это не упрощение, а повторение поста:
-        # программу доработки он собирает на проекте, из которого
-        # операции основного прохода выброшены, а кеш контуров строит
-        # ровно по ним (`_project_contours_cache`). Значит в корнер-
-        # программе список пустой, и лид угла подбирается без оглядки на
-        # ножи — безопасность там держит только замер `fit_rework_lead`
-        # (ему соседи передаются). Пока это так, вьювер обязан считать
-        # так же, иначе картинка расходится: на 124173 с полным списком
-        # у 8 лидов из 56 заход уходил на 421 мкм в сторону от того, что
-        # уйдёт в станок.
-        #
-        # Замерено, опасности на этом заказе нет: ни один лид доработки
-        # не подходит к ЧУЖОМУ ножу ближе полуширины реза T3 (ближайший
-        # 5.3 мм при нужных 0.55). Но запас этот случайный — пробел в
-        # посте остаётся, и он записан в очередь.
-        if is_corner_view:
-            _cl_cache, _cb_cache = [], []
-        else:
-            _cl_cache, _cb_cache = _cl_full, _cb_full
+        # Проверка коллизий видит ВСЕ ножи, и у доработки тоже
+        # (v1.7.61): угол — тот же проход, что основной.
+        _cl_cache, _cb_cache = _cl_full, _cb_full
         _vp = PassLeadParams(
             pass_side=tp.side.name,
             is_corner_rework=is_corner_view,
@@ -1223,20 +1206,12 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
             # Масштаб множителей «x_tool_rad» — ЭКВИДИСТАНТА фрезы этого
             # прохода (у доработки режет тонкая T3).
             lead_scale=effective_tool_offset * 2.0,
-            length_mult=(float(getattr(cutting_params,
-                                       'corner_lead_length_mult', 0.5)
-                               or 1.0) if (is_corner_view and cutting_params)
-                         else (0.5 if is_corner_view else 1.0)),
-            radius_mult=(float(getattr(cutting_params,
-                                       'corner_lead_radius_mult', 0.5)
-                               or 1.0) if (is_corner_view and cutting_params)
-                         else (0.5 if is_corner_view else 1.0)),
-            extra_mm=((float(getattr(cutting_params,
-                                     'corner_lead_extra_diam', 1.0) or 0.0)
-                       * float(getattr(cutting_params,
-                                       'corner_tip_diameter', 0.6) or 0.6))
-                      if (is_corner_view and cutting_params)
-                      else (0.6 if is_corner_view else 0.0)),
+            # Своих множителей у доработки больше нет (v1.7.61): угол
+            # и карман — тот же проход, что основной, только фрезой с
+            # меньшей эквидистантой.
+            length_mult=1.0,
+            radius_mult=1.0,
+            extra_mm=0.0,
             entry_enabled=(tp.entry.enabled and tp.entry.style in (
                 LeadStyle.LINE_ARC_TANGENTIAL, LeadStyle.LINE)),
             entry_style=('line' if tp.entry.style == LeadStyle.LINE
@@ -1407,30 +1382,6 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
     if _plan is not None:
         lead_in_collision = bool(_plan.lead_in_collision)
         lead_out_collision = bool(_plan.lead_out_collision)
-        # ── ПРЕДУПРЕЖДЕНИЕ ДЛЯ ЛИДА ДОРАБОТКИ ──
-        # Подбор его не видел (список контуров пуст, см. выше), но
-        # ПОКАЗАТЬ опасность надо: рисуем ту кривую, что уйдёт в станок,
-        # и если она подходит к ножу — красим красным. Так картинка и
-        # правдива, и предупреждает.
-        if is_corner_view:
-            from ..geometry.lead_collision import lead_crosses_contours
-            for _L, _is_in in ((_plan.lead_in, True),
-                               (_plan.lead_out, False)):
-                if not _L or not _L.segments:
-                    continue
-                _jp = _L.segments[-1].b if _is_in else _L.segments[0].a
-                try:
-                    _hit = lead_crosses_contours(
-                        _L, _cl_full, geom.id, _jp,
-                        tool_offset=effective_tool_offset,
-                        safety_factor=1.0, contours_bboxes=_cb_full)
-                except Exception:
-                    _hit = False
-                if _hit:
-                    if _is_in:
-                        lead_in_collision = True
-                    else:
-                        lead_out_collision = True
         for _src, _set in ((_plan.lead_in, 'in'), (_plan.lead_out, 'out')):
             if not _src or not _src.segments:
                 continue

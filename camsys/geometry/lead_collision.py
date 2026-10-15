@@ -60,6 +60,19 @@ class LeadGeometryRequest:
     # Используется для 3D/2D corner-прохода где сторона выбирается по bbox.
     forced_side: Optional[str] = None
 
+    # Замкнутый контур-эталон для выбора стороны. У основного прохода
+    # это сам путь, у доработки — РОДИТЕЛЬСКИЙ контур ножа: фрагмент
+    # разомкнут, и тест «внутри/снаружи» на нём бессмыслен (v1.7.19).
+    # Без эталона сторону приходилось фиксировать заранее, и автоподбор
+    # лишался последнего средства — попробовать другую сторону.
+    side_ref: object = None
+
+    # Нижняя граница радиуса дуги, мм. Автоподбор умеет укорачивать лид
+    # множителем, и без этой границы он уводил радиус НИЖЕ радиуса
+    # инструмента — такую дугу стойка не выполнит (см.
+    # LEAD_MIN_COMP_RADIUS). Ноль — границы нет.
+    min_arc_radius: float = 0.0
+
 
 # ════════════════════════════════════════════════════════════════════════
 # Утилиты геометрии (line-only апроксимация, пересечение, расстояние)
@@ -166,7 +179,8 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
                            safety_factor: float = 1.2,
                            skip_radius: Optional[float] = None,
                            contours_bboxes: Optional[List[Tuple[str, Tuple]]] = None,
-                           path_is_cutter: bool = False
+                           path_is_cutter: bool = False,
+                           own_strict: bool = False
                            ) -> bool:
     """Проверка коллизии lead'а с упрощёнными line-only контурами.
     
@@ -280,9 +294,26 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
     lead_bb = (min(xs) - _bb_pad, min(ys) - _bb_pad,
                max(xs) + _bb_pad, max(ys) + _bb_pad)
     
-    # Адаптивный skip_radius для собственного контура: 0.8 × размер lead'а
-    lead_span = max(lead_bb[2]-lead_bb[0], lead_bb[3]-lead_bb[1])
+    # ── ЧТО СЧИТАТЬ «СВОИМ» КОНТУРОМ ──
+    # Основной проход формирует ВЕСЬ свой контур: его лид законно идёт
+    # по уже снятому металлу вдоль него, и мерить там нечего — зона
+    # освобождения берётся по размеру лида, а расстояние считается по
+    # осевой (как было).
+    #
+    # Проход ДОРАБОТКИ формирует только свой фрагмент. Остальная часть
+    # родительского контура для него — такое же лезвие, как чужое, и
+    # освобождать её нельзя: лид выхода успевал развернуться и лечь на
+    # собственное лезвие внутри старой двухмиллиметровой зоны, а
+    # проверка молчала. Для него (own_strict) зона — только
+    # тангенциальное касание у стыка, и меряется ПУТЬ ФРЕЗЫ.
+    lead_span = max(lead_bb[2] - lead_bb[0], lead_bb[3] - lead_bb[1])
     own_skip_radius = max(skip_radius, lead_span * 0.8)
+    # При own_strict освобождение по ДЛИНЕ КОНТУРА не годится вовсе:
+    # зона около миллиметра оказывалась больше самого лида, и короткий
+    # выход целиком попадал внутрь неё — проверка его не видела.
+    # Освобождаем вместо этого точки лида рядом со СТЫКОМ: там фреза
+    # лежит на эквидистанте своего контура по построению.
+    _join_eps = max(0.05, JOIN_TOUCH_MM)
     
     # Подготавливаем bbox-индекс если не задан
     if contours_bboxes is None:
@@ -318,7 +349,7 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
         # лида тангенциально прижат к нему по построению. Всё, что
         # далеко по контуру, но близко геометрически, проверяем.
         _skip_idx = set()
-        if is_own and c_lines:
+        if is_own and not own_strict and c_lines:
             _cum = [0.0]
             for (ca_, cb_) in c_lines:
                 _cum.append(_cum[-1] + math.hypot(cb_[0] - ca_[0],
@@ -347,7 +378,14 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
             # стыковки, при пороге пропуска 1.79 мм.
             _near_join = is_own and _ci in _skip_idx
             
-            for (la, lb) in (lead_lines if is_own else cut_lines):
+            # Свой контур проверяется ТЕМ ЖЕ путём фрезы, что и чужой
+            # (v1.7.61). Раньше для своего мерилась ОСЕВАЯ — тот же
+            # класс ошибки, что чинился в v1.7.55 для чужих: центр
+            # фрезы оказывается на полуэквидистанту ближе к лезвию,
+            # чем осевая, и на фрагменте доработки именно он его и
+            # срезал.
+            for (la, lb) in (cut_lines if (own_strict or not is_own)
+                             else lead_lines):
                 # 1. Явное пересечение — реальная коллизия, всегда проверяется
                 if _segments_intersect_2d(la, lb, ca, cb):
                     if _near_join:
@@ -368,7 +406,30 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
                 # выпуклого изгиба (тангенс срезает материал).
                 if _near_join:
                     continue
-                _lim = safe_offset if is_own else cut_clear
+                if is_own and own_strict:
+                    _mx = (la[0] + lb[0]) * 0.5
+                    _my = (la[1] + lb[1]) * 0.5
+                    if math.hypot(_mx - entry_point[0],
+                                  _my - entry_point[1]) < _join_eps:
+                        continue
+                # Свой контур: радиус инструмента МИНУС допуск, потому
+                # что лид к нему пристыкован и в рабочем положении лежит
+                # ровно на нём. Допуск 50 мкм — цена ломаной: контур
+                # здесь аппроксимирован хордами до 0.5 мм, и на вогнутом
+                # участке хорда лежит СНАРУЖИ кривой, занижая расстояние
+                # на величину прогиба. Без допуска вся основная
+                # программа пометилась бы коллизией.
+                # Чужой контур: радиус ПЛЮС 50 мкм.
+                if not is_own:
+                    _lim = cut_clear
+                elif own_strict:
+                    # Радиус инструмента минус 50 мкм: контур здесь
+                    # аппроксимирован хордами до 0.5 мм, и на вогнутом
+                    # участке хорда лежит снаружи кривой, занижая
+                    # расстояние на величину прогиба.
+                    _lim = tool_offset - 0.05
+                else:
+                    _lim = safe_offset
                 for p in (la, lb, ((la[0]+lb[0])/2, (la[1]+lb[1])/2)):
                     if _point_to_segment_distance(p, ca, cb) < _lim:
                         return True
@@ -700,6 +761,10 @@ def build_lead_for_polypath(polypath: Polypath,
     ang = angle_override if angle_override is not None else request.angle_deg
     line_len = request.line_length * shrink
     arc_r = request.arc_radius * shrink
+    # Укорочение не имеет права увести радиус ниже границы: дуга должна
+    # пережить компенсацию стойки (v1.7.61).
+    if request.min_arc_radius > 0 and 0 < arc_r < request.min_arc_radius:
+        arc_r = request.min_arc_radius
     
     if request.is_entry:
         sp = polypath.segments[0].a
@@ -708,7 +773,8 @@ def build_lead_for_polypath(polypath: Polypath,
             side = request.forced_side
         else:
             side = pick_lead_side_for_pass(
-                sp, tan, polypath, request.pass_side,
+                sp, tan, (request.side_ref if request.side_ref is not None
+                          else polypath), request.pass_side,
                 line_len, arc_r, ang, is_exit=False)
         try:
             g = build_lead_in(
@@ -726,7 +792,8 @@ def build_lead_for_polypath(polypath: Polypath,
             side = request.forced_side
         else:
             side = pick_lead_side_for_pass(
-                ep, tan, polypath, request.pass_side,
+                ep, tan, (request.side_ref if request.side_ref is not None
+                          else polypath), request.pass_side,
                 line_len, arc_r, ang, is_exit=True)
         try:
             g = build_lead_out(
@@ -750,6 +817,7 @@ def plan_lead_in(polypath: Polypath,
                   exit_request: Optional[LeadGeometryRequest] = None,
                   overlap: float = 0.0,
                   path_is_cutter: bool = False,
+                  own_strict: bool = False,
                   ) -> Tuple[Polypath, Optional[Polypath], bool, object]:
     """ПЛАНИРОВАНИЕ lead-in с ТРЁХФАЗНЫМ подбором безопасности.
     
@@ -774,7 +842,8 @@ def plan_lead_in(polypath: Polypath,
             return lead_crosses_contours(
                 lead, contours_lines, own_geom_id, entry_pt,
                 tool_offset=tool_offset, safety_factor=sf,
-                contours_bboxes=contours_bboxes, path_is_cutter=path_is_cutter)
+                contours_bboxes=contours_bboxes, path_is_cutter=path_is_cutter,
+                own_strict=own_strict)
         return _check
     
     def _make_scorer(sf):
@@ -818,7 +887,8 @@ def plan_lead_in(polypath: Polypath,
             if lead_crosses_contours(
                     lead_out, contours_lines, own_geom_id, join_pt,
                     tool_offset=tool_offset, safety_factor=sf,
-                    contours_bboxes=contours_bboxes, path_is_cutter=path_is_cutter):
+                    contours_bboxes=contours_bboxes,
+                    path_is_cutter=path_is_cutter, own_strict=own_strict):
                 return True
             # Заход и выход не должны пересекаться между собой (v1.7.17)
             return leads_cross_each_other(lead_in, lead_out)
@@ -908,7 +978,8 @@ def plan_lead_in(polypath: Polypath,
             sp = polypath.segments[0].a
             tan = polypath.segments[0].tangent_at_start()
             auto_side = pick_lead_side_for_pass(
-                sp, tan, polypath, request.pass_side,
+                sp, tan, (request.side_ref if request.side_ref is not None
+                          else polypath), request.pass_side,
                 request.line_length, request.arc_radius, 
                 request.angle_deg, is_exit=False)
             opposite_side = "left" if auto_side == "right" else "right"
@@ -919,7 +990,8 @@ def plan_lead_in(polypath: Polypath,
             is_entry=request.is_entry, pass_side=request.pass_side,
             angle_deg=request.angle_deg, line_length=request.line_length,
             arc_radius=request.arc_radius, style=request.style,
-            forced_side=opposite_side)
+            forced_side=opposite_side, side_ref=request.side_ref,
+            min_arc_radius=request.min_arc_radius)
         
         def _build_flipped(pp, angle, shrink):
             return build_lead_for_polypath(pp, request_flipped, angle, shrink)
@@ -949,7 +1021,8 @@ def plan_lead_out(polypath: Polypath,
                    tool_offset: float,
                    safety_factor: float = 1.2,
                    fallback_safety_factor: float = 1.0,
-                   path_is_cutter: bool = False
+                   path_is_cutter: bool = False,
+                   own_strict: bool = False
                    ) -> Tuple[Optional[Polypath], bool, object]:
     """ПЛАНИРОВАНИЕ lead-out: построение + проверка коллизии.
     
@@ -970,7 +1043,8 @@ def plan_lead_out(polypath: Polypath,
     coll = lead_crosses_contours(
         lead, contours_lines, own_geom_id, join_pt,
         tool_offset=tool_offset, safety_factor=safety_factor,
-        contours_bboxes=contours_bboxes, path_is_cutter=path_is_cutter)
+        contours_bboxes=contours_bboxes, path_is_cutter=path_is_cutter,
+        own_strict=own_strict)
     
     # Мягкая — для определения «реально ли есть пересечение» (а не просто
     # тесный зазор в пределах safety запаса)
@@ -978,7 +1052,8 @@ def plan_lead_out(polypath: Polypath,
         coll = lead_crosses_contours(
             lead, contours_lines, own_geom_id, join_pt,
             tool_offset=tool_offset, safety_factor=fallback_safety_factor,
-            contours_bboxes=contours_bboxes, path_is_cutter=path_is_cutter)
+            contours_bboxes=contours_bboxes, path_is_cutter=path_is_cutter,
+            own_strict=own_strict)
     
     geom = _polypath_to_lead_geometry(lead, request.is_entry)
     return lead, coll, geom
@@ -1018,7 +1093,11 @@ def build_contours_cache(geometries: List,
     
     Args:
         geometries: список Geometry-объектов (например knife_layer.geometries)
-        max_chord: шаг апроксимации дуг ломаной (мм)
+        max_chord: шаг апроксимации дуг ломаной (мм). Мельчить пробовал
+            (0.12 вместо 0.5) — вердикты проверки не изменились ни на
+            одном лиде, а сборка пакета выросла вдвое. Значит остаток в
+            117 мкм (см. тесты) не от грубости ломаной, причина другая и
+            пока не найдена.
     
     Returns:
         (contours_lines, contours_bboxes) — для передачи в plan_lead_*
@@ -1132,7 +1211,7 @@ class PassLeadResult:
     lead_out_collision: bool = False
     lead_side: str = 'right'
     lead_out_side: str = 'right'
-    clr_in: float = 0.0                 # зазор лида доработки, мм (<0 — тесно)
+    clr_in: float = 0.0                 # оставлено для диагностики
     clr_out: float = 0.0
 
 
@@ -1172,7 +1251,6 @@ def plan_pass_leads(axis: Polypath,
             `.polypath` как эталон «внутри/снаружи»).
         p: разрешённые параметры лидов.
         contours_lines, contours_bboxes: кеш `build_contours_cache`.
-        neighbours: полипасы СОСЕДНИХ ножей — для замера лида доработки.
         log: куда писать «места нет, нужна ручная правка».
 
     Returns:
@@ -1180,7 +1258,7 @@ def plan_pass_leads(axis: Polypath,
         смещение на `tool_offset` вправо по ходу (так делает стойка по
         G42); вьювер для рисования зовёт `offset_right_of_travel`.
     """
-    from .lead_inout import fit_rework_lead, pick_lead_side_for_pass
+    from .lead_inout import pick_lead_side_for_pass
 
     res = PassLeadResult(axis=axis)
     if not axis or not axis.segments:
@@ -1205,12 +1283,10 @@ def plan_pass_leads(axis: Polypath,
     ll_in = _lead_line_length(p.entry_length, p.entry_angle, p)
     ar_in = p.entry_radius * p.radius_mult * p.lead_scale
     ang_in = p.entry_angle
-    shrink_in = 1.0
 
     ll_out = _lead_line_length(p.exit_length, p.exit_angle, p)
     ar_out = p.exit_radius * p.radius_mult * p.lead_scale
     ang_out = p.exit_angle
-    shrink_out = 1.0
 
     # ── ПОРОГ РАДИУСА ДУГИ ЛИДА ──
     # Дуга обязана пережить компенсацию стойки: та пересчитывает её в
@@ -1225,70 +1301,43 @@ def plan_pass_leads(axis: Polypath,
     # мкм глубже.
     _d_cut = (p.lead_scale / 2.0) if p.lead_scale > 0 else p.tool_offset
     _r_min = _d_cut + LEAD_MIN_COMP_RADIUS
+    # ── РАДИУС ИНСТРУМЕНТА ДЛЯ ПРОВЕРКИ КОЛЛИЗИЙ ──
+    # У доработки режет ТОНКАЯ T3, и путь фрезы стойка строит по ней.
+    # До v1.7.61 сюда шла полуэквидистанта ОСНОВНОЙ фрезы: проверка
+    # строила кривую на 0.1 мм в стороне от настоящей и требовала от неё
+    # порогов, завышенных на те же 0.1 мм. У стыка фреза лежит ровно в
+    # 0.55 от контура, а проверка ждала 0.65 — лид помечался коллизией
+    # всегда, и зону освобождения приходилось делать больше самого лида.
+    _tool_off = _d_cut if p.is_corner_rework else p.tool_offset
 
-    # ── СТОРОНА ЗАХОДА ──
-    if p.is_corner_rework:
-        # Лид доработки — ПО ЗАМЕРУ ЗАЗОРА (v1.7.39). Эмиттер пишет G42,
-        # фреза снимает металл справа по ходу, заходить обязана оттуда
-        # же. Но в узкой щели справа может не быть места: лид ложится на
-        # встречную стенку. Поэтому сторону не назначаем правилом, а
-        # меряем обеими и берём ту, где зазор больше.
-        cut_half = (p.lead_scale / 2.0 if p.lead_scale > 0 else 0.5)
-        res.lead_side, shrink_in, _a, res.clr_in = fit_rework_lead(
-            start_pt, start_tan, own_pp, cut_half, ll_in, ar_in, ang_in,
-            is_exit=False, neighbours=list(neighbours),
-            style=p.entry_style, min_arc_radius=_r_min)
-        if _a is not None:
-            # Подобранный угол меняет и длину прямой: при том же боковом
-            # зазоре длина делится на sin(угла). Пересчитываем, иначе
-            # лид строится под один угол, а мерился под другой.
-            ang_in = _a
-            ll_in = _lead_line_length(p.entry_length, ang_in, p)
-        # Укорочение применяется к ИТОГОВОЙ длине и радиусу (v1.7.45):
-        # запас прямой части уже внутри ll_in, и он тоже обязан
-        # укорачиваться — иначе лид выходит длиннее программного.
-        ll_in *= shrink_in
-        ar_in *= shrink_in
-        if res.clr_in < 0 and log is not None:
-            log(f"ЛИД ДОРАБОТКИ: заход подходит к металлу ближе "
-                f"полуширины реза на {abs(res.clr_in) * 1000:.0f} мкм "
-                f"({start_pt[0]:.1f} {start_pt[1]:.1f}) — места нет ни "
-                f"длиной, ни углом, нужна ручная правка")
-    elif p.pass_side in ("INSIDE", "OUTSIDE"):
-        res.lead_side = pick_lead_side_for_pass(
-            start_pt, start_tan, side_ref, p.pass_side,
-            ll_in, ar_in, ang_in, is_exit=False)
-    elif p.pass_side == "LEFT":
-        res.lead_side = "left"
-    else:
-        res.lead_side = "right"
-
-    # ── СТОРОНА ВЫХОДА — отдельно, по КОНЦЕВОЙ касательной ──
-    if p.is_corner_rework:
-        cut_half = (p.lead_scale / 2.0 if p.lead_scale > 0 else 0.5)
-        res.lead_out_side, shrink_out, _a, res.clr_out = fit_rework_lead(
-            end_pt, end_tan, own_pp, cut_half, ll_out, ar_out, ang_out,
-            is_exit=True, neighbours=list(neighbours), style=p.exit_style,
-            min_arc_radius=_r_min)
-        if _a is not None:
-            ang_out = _a
-            ll_out = _lead_line_length(p.exit_length, ang_out, p)
-        if res.clr_out < 0 and log is not None:
-            log(f"ЛИД ДОРАБОТКИ: выход подходит к металлу ближе "
-                f"полуширины реза на {abs(res.clr_out) * 1000:.0f} мкм "
-                f"({end_pt[0]:.1f} {end_pt[1]:.1f}) — места нет ни "
-                f"длиной, ни углом, нужна ручная правка")
-    elif p.pass_side in ("INSIDE", "OUTSIDE"):
-        res.lead_out_side = pick_lead_side_for_pass(
-            end_pt, end_tan, side_ref, p.pass_side,
-            ll_out, ar_out, ang_out, is_exit=True)
-    else:
-        res.lead_out_side = res.lead_side
+    # ── СТОРОНА ЗАХОДА И ВЫХОДА ──
+    # Одна логика на все проходы (v1.7.61). Угол и карман — это ТОТ ЖЕ
+    # проход, что основной, только фрезой с меньшей эквидистантой; своей
+    # механики у них нет.
+    #
+    # До v1.7.61 у доработки был отдельный подбор `fit_rework_lead`: он
+    # сам перебирал сторону, угол и длину (укорачивая до 0.12 и удлиняя
+    # до 2.5 раза), меряя зазор по своим правилам. Он и давал то, что
+    # видно на картинке: выходы по 7…11 мм и заходы, перелезающие через
+    # собственный путь. Основной проход ничего такого не делает —
+    # сторона выбирается point-in-polygon по РОДИТЕЛЬСКОМУ замкнутому
+    # контуру, размер лида берётся из тех же полей диалога, а дальше
+    # обычный `plan_lead_in` с проверкой коллизий.
+    res.lead_side = pick_lead_side_for_pass(
+        start_pt, start_tan, side_ref, p.pass_side,
+        ll_in, ar_in, ang_in, is_exit=False)
+    res.lead_out_side = pick_lead_side_for_pass(
+        end_pt, end_tan, side_ref, p.pass_side,
+        ll_out, ar_out, ang_out, is_exit=True)
+    if p.pass_side == "LEFT":
+        res.lead_side = res.lead_out_side = "left"
+    elif p.pass_side not in ("INSIDE", "OUTSIDE"):
+        res.lead_side = res.lead_out_side = "right"
 
     # ── ЗАЖИМ РАДИУСА — ТЕМ ЖЕ ПРАВИЛОМ, ЧТО В ПОДБОРЕ ──
-    # `probe` внутри fit_rework_lead строит кандидатов с
-    # max(radius * shrink, _r_min); здесь то же самое применяется к
-    # выбранному варианту, поэтому оценённая дуга и построенная — одна.
+    # Дуга лида обязана пережить компенсацию стойки — см.
+    # LEAD_MIN_COMP_RADIUS. Порог защищает от настройки, при которой
+    # радиус оказывается не больше радиуса инструмента.
     if ar_in > 0 and ar_in < _r_min:
         if log is not None:
             log(f"ЛИД: радиус дуги захода {ar_in:.3f} мм при радиусе "
@@ -1296,28 +1345,36 @@ def plan_pass_leads(axis: Polypath,
                 f"{ar_in - _d_cut:+.3f} мм, стойка такую дугу не "
                 f"выполнит; поднят до {_r_min:.3f} мм")
         ar_in = _r_min
-    _ar_out_final = max(ar_out * shrink_out, _r_min if ar_out > 0 else 0.0)
-    if ar_out > 0 and ar_out * shrink_out < _r_min and log is not None:
-        log(f"ЛИД: радиус дуги выхода {ar_out * shrink_out:.3f} мм "
-            f"при радиусе инструмента {_d_cut:.3f} — после "
-            f"компенсации {ar_out * shrink_out - _d_cut:+.3f} мм, "
-            f"стойка такую дугу не выполнит; поднят до "
-            f"{_r_min:.3f} мм")
+    if ar_out > 0 and ar_out < _r_min:
+        if log is not None:
+            log(f"ЛИД: радиус дуги выхода {ar_out:.3f} мм при радиусе "
+                f"инструмента {_d_cut:.3f} — после компенсации "
+                f"{ar_out - _d_cut:+.3f} мм, стойка такую дугу не "
+                f"выполнит; поднят до {_r_min:.3f} мм")
+        ar_out = _r_min
 
     # ── ЗАПРОСЫ НА ПОСТРОЕНИЕ ──
     # INSIDE/OUTSIDE: сторону НЕ фиксируем — автоподбор пересчитает её на
     # каждой кандидатной позиции (после сдвига старта сторона меняется).
     # Доработка и LEFT/RIGHT: сторона замерена/задана, фиксируем.
-    _fix = (p.is_corner_rework or p.pass_side not in ("INSIDE", "OUTSIDE"))
+    # Сторону фиксируем только там, где её нельзя пересчитать: у
+    # LEFT/RIGHT она задана по смыслу. У доработки больше не фиксируем
+    # (v1.7.61) — есть замкнутый эталон, и автоподбор может попробовать
+    # другую сторону, ровно как на основном проходе.
+    _fix = (p.pass_side not in ("INSIDE", "OUTSIDE"))
+    _sref = side_ref if (side_ref is not None and
+                         getattr(side_ref, 'closed', False)) else None
     req_in = LeadGeometryRequest(
         is_entry=True, pass_side=p.pass_side, angle_deg=ang_in,
         line_length=ll_in, arc_radius=ar_in, style=p.entry_style,
-        forced_side=(res.lead_side if _fix else None))
+        forced_side=(res.lead_side if _fix else None),
+        side_ref=_sref, min_arc_radius=_r_min)
     req_out = LeadGeometryRequest(
         is_entry=False, pass_side=p.pass_side, angle_deg=ang_out,
-        line_length=ll_out * shrink_out,
-        arc_radius=_ar_out_final, style=p.exit_style,
-        forced_side=(res.lead_out_side if _fix else None))
+        line_length=ll_out,
+        arc_radius=ar_out, style=p.exit_style,
+        forced_side=(res.lead_out_side if _fix else None),
+        side_ref=_sref, min_arc_radius=_r_min)
 
     # ── ЗАХОД ──
     if want_in:
@@ -1363,14 +1420,16 @@ def plan_pass_leads(axis: Polypath,
                 arc_radius=max(ar_out, _r_min if ar_out > 0 else 0.0),
                 style=p.exit_style,
                 forced_side=(None if p.pass_side in ("INSIDE", "OUTSIDE")
-                             else res.lead_out_side))
+                             else res.lead_out_side),
+                side_ref=_sref, min_arc_radius=_r_min)
         axis, res.lead_in, res.lead_in_collision, res.lead_in_geom = \
             plan_lead_in(
                 axis, req_in, contours_lines, contours_bboxes,
-                own_geom.id, p.tool_offset,
+                own_geom.id, _tool_off,
                 auto_avoid=(not p.no_avoid), safety_factor=1.2,
                 exit_request=_exit_in_search,
-                overlap=p.overlap)
+                overlap=p.overlap,
+                own_strict=p.is_corner_rework)
 
     # ── ПЕРЕБЕГ — ПОСЛЕ подбора ──
     # Применённый раньше, он разомкнул бы контур, и сдвиг старта тащил
@@ -1386,7 +1445,77 @@ def plan_pass_leads(axis: Polypath,
         res.lead_out, res.lead_out_collision, res.lead_out_geom = \
             plan_lead_out(
                 axis, req_out, contours_lines, contours_bboxes,
-                own_geom.id, p.tool_offset, safety_factor=1.2)
+                own_geom.id, _tool_off, safety_factor=1.2,
+                own_strict=p.is_corner_rework)
+
+    # ── АВАРИЙНЫЙ ЛИД ТАМ, ГДЕ ОБЫЧНЫЙ РЕЖЕТ ЛЕЗВИЕ ──
+    # Доработка идёт теми же лидами, что основной проход (v1.7.61), и в
+    # подавляющем большинстве мест этого достаточно. Но карман — это
+    # щель около 1.3 мм при ширине реза T3 1.1 мм: обычному лиду там
+    # негде быть, любой уходит в стенку. Для таких мест остаётся прежний
+    # перебор `fit_rework_lead` — он ищет сторону, угол и длину, при
+    # которых фреза не достаёт до металла, и платит за это длиной.
+    #
+    # Порядок именно такой: сперва обычный лид, аварийный — только если
+    # обычный режет. Иначе длинные лиды появлялись ВЕЗДЕ, в том числе
+    # там, где места хватало (жалоба «выход немерянной длины»).
+    if p.is_corner_rework and (res.lead_in_collision or res.lead_out_collision):
+        from .lead_inout import fit_rework_lead
+        own_pp2 = getattr(own_geom, 'polypath', None)
+        nb2 = [g for g in (neighbours or ())]
+        cut_half2 = _d_cut
+        for _is_exit in (False, True):
+            if _is_exit and not res.lead_out_collision:
+                continue
+            if (not _is_exit) and not res.lead_in_collision:
+                continue
+            _pt = (axis.segments[-1].b if _is_exit else axis.segments[0].a)
+            _tn = (axis.segments[-1].tangent_at_end() if _is_exit
+                   else axis.segments[0].tangent_at_start())
+            _ll = ll_out if _is_exit else ll_in
+            _ar = ar_out if _is_exit else ar_in
+            _an = ang_out if _is_exit else ang_in
+            _st = p.exit_style if _is_exit else p.entry_style
+            try:
+                _side, _sh, _a2, _clr = fit_rework_lead(
+                    _pt, _tn, own_pp2, cut_half2, _ll, _ar, _an,
+                    is_exit=_is_exit, neighbours=nb2, style=_st,
+                    min_arc_radius=_r_min)
+            except Exception:
+                continue
+            if _a2 is None:
+                _a2 = _an
+            _req = LeadGeometryRequest(
+                is_entry=(not _is_exit), pass_side=p.pass_side,
+                angle_deg=_a2,
+                line_length=_lead_line_length(
+                    p.exit_length if _is_exit else p.entry_length, _a2, p) * _sh,
+                arc_radius=_ar * _sh, style=_st, forced_side=_side,
+                side_ref=_sref, min_arc_radius=_r_min)
+            _lead = build_lead_for_polypath(axis, _req)
+            if not _lead or not _lead.segments:
+                continue
+            _jp = _lead.segments[0].a if _is_exit else _lead.segments[-1].b
+            _coll = lead_crosses_contours(
+                _lead, contours_lines, own_geom.id, _jp,
+                tool_offset=_tool_off, safety_factor=1.0,
+                contours_bboxes=contours_bboxes, own_strict=True)
+            if _is_exit:
+                res.lead_out, res.lead_out_collision = _lead, _coll
+                res.lead_out_geom = _polypath_to_lead_geometry(_lead, False)
+                res.lead_out_side, res.clr_out = _side, _clr
+            else:
+                res.lead_in, res.lead_in_collision = _lead, _coll
+                res.lead_in_geom = _polypath_to_lead_geometry(_lead, True)
+                res.lead_side, res.clr_in = _side, _clr
+            if log is not None:
+                _w = 'выход' if _is_exit else 'заход'
+                _len = sum(s.length() for s in _lead.segments)
+                log(f"ЛИД ДОРАБОТКИ: обычный {_w} у "
+                    f"({_pt[0]:.1f} {_pt[1]:.1f}) режет лезвие — взят "
+                    f"аварийный длиной {_len:.2f} мм"
+                    + ("" if not _coll else ", он тоже задевает: места нет, "
+                       "нужна ручная правка"))
 
     res.axis = axis
     return res

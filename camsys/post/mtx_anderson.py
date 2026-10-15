@@ -436,13 +436,17 @@ class MtxAndersonGVM(PostProcessor):
         entry = getattr(self, '_contours_cache_entry', None)
         if entry is not None and entry[0] is project:
             return entry[1]
+        # Контуры берутся из СЛОЯ ножей, а не из операций (v1.7.61).
+        # Программу доработки пост собирает на проекте, из которого
+        # операции основного прохода выброшены, — по операциям список
+        # выходил ПУСТОЙ, и лид угла подбирался без оглядки на ножи.
+        # Металл на листе от состава операций не зависит.
         all_geoms = []
-        for other_op in project.operations:
-            if other_op.kind == OperationKind.BLADE_FORMING:
-                for gid in other_op.geometry_ids:
-                    g_other = project.get_geometry(gid)
-                    if g_other is not None and g_other.is_closed:
-                        all_geoms.append(g_other)
+        _klayer = project.get_layer_by_name("Knife")
+        for g_other in (getattr(_klayer, 'geometries', ())
+                        if _klayer is not None else ()):
+            if g_other is not None and g_other.is_closed:
+                all_geoms.append(g_other)
         data = build_contours_cache(all_geoms)
         self._contours_cache_entry = (project, data)
         return data
@@ -817,12 +821,12 @@ class MtxAndersonGVM(PostProcessor):
             is_corner_rework=bool(is_corner_rework),
             tool_offset=tool_offset,
             lead_scale=lead_scale,
-            length_mult=(_x('corner_lead_length_mult', 0.5)
-                         if is_corner_rework else 1.0),
-            radius_mult=(_x('corner_lead_radius_mult', 0.5)
-                         if is_corner_rework else 1.0),
-            extra_mm=(_x('corner_lead_extra_mm', 0.0)
-                      if is_corner_rework else 0.0),
+            # Своих множителей у доработки больше нет (v1.7.61): угол
+            # и карман — тот же проход, что основной, только фрезой с
+            # меньшей эквидистантой. Масштаб лида задаёт lead_scale.
+            length_mult=1.0,
+            radius_mult=1.0,
+            extra_mm=0.0,
             entry_enabled=(tp.entry.enabled and tp.entry.style in (
                 LeadStyle.LINE_ARC_TANGENTIAL, LeadStyle.LINE)),
             entry_style=('line' if tp.entry.style == LeadStyle.LINE
@@ -851,11 +855,7 @@ class MtxAndersonGVM(PostProcessor):
                         .get(tp.side.name)),
         )
 
-        # Соседние ножи для замера лида доработки — ИЗ СЛОЯ, а не из
-        # операций: программа доработки генерируется отдельным набором
-        # операций, BLADE_FORMING там нет, и список выходил пустым
-        # (v1.7.40). Щель чаще всего образована вершиной СОСЕДНЕГО
-        # лезвия, а не своим контуром.
+        # Соседние ножи нужны аварийному подбору лида доработки.
         _nb = []
         if is_corner_rework:
             try:
@@ -863,8 +863,7 @@ class MtxAndersonGVM(PostProcessor):
                 for _go in (getattr(_klay, 'geometries', ()) if _klay
                             else ()):
                     if (_go is not None and _go.is_closed
-                            and _go.polypath is not None
-                            and _go is not geom):
+                            and _go.polypath is not None and _go is not geom):
                         _nb.append(_go.polypath)
             except Exception:
                 _nb = []
