@@ -1291,67 +1291,85 @@ def offset_polypath_toward_center(polypath: Polypath, offset: float,
     return Polypath(segments=new_segments, closed=polypath.closed)
 
 
-def cutter_path_of_lead(lead: Polypath, offset: float,
-                        step: float = 0.05) -> Polypath:
-    """Путь фрезы для ЛИДА: поточечное смещение вправо по ходу.
+def lead_compensated_radius(arc: Arc, offset: float) -> float:
+    """Радиус дуги лида ПОСЛЕ компенсации, со знаком.
 
-    Зачем отдельная функция, а не `offset_right_of_travel`. Лид — это
-    два сегмента, прямая и дуга, и его дуга по радиусу СРАВНИМА со
-    смещением (типично R 0.55…1.3 при смещении 0.55…0.85). Посегментный
-    оффсет на таком соотношении разваливается: при R < смещения дуга
-    выворачивается, стык прямой с дугой расходится, и лид рисуется
-    «отдельными прямыми в разные стороны» (так провалилась попытка
-    v1.7.44). Замерено: отход от истинной кривой до 0.326 мм.
+    Стойка по G42 смещает запрограммированную дугу на радиус
+    инструмента вправо по ходу. Дуга против часовой при этом уходит
+    НАРУЖУ (R + d), по часовой — ВНУТРЬ (R − d).
 
-    Поточечное смещение таких допущений не делает вовсе: берём точку
-    пути и нормаль в ней. Там, где дуга тоньше смещения, кривая честно
-    выворачивается — именно это и делает фреза, разворачиваясь на месте.
-    Результат — ломаная; для рисования этого достаточно, а в `.anc`
-    уходит осевая, не она.
+    Отрицательный или нулевой результат означает, что такую дугу стойка
+    выполнить не может: центр инструмента должен был бы вывернуться
+    через центр дуги.
+    """
+    return (arc.radius + offset) if arc.ccw else (arc.radius - offset)
+
+
+def cutter_path_of_lead(lead: Polypath, offset: float) -> Polypath:
+    """Путь фрезы для ЛИДА — так, как его строит СТОЙКА.
+
+    Прямая смещается в параллельную, дуга — в КОНЦЕНТРИЧЕСКУЮ с
+    радиусом R ± d (см. `lead_compensated_radius`). Лид касателен в
+    стыке, поэтому смещённые куски сходятся точно, без подрезки.
+
+    Почему не посегментным `offset_right_of_travel` и не поточечной
+    выборкой — обе уже провалились:
+
+      * `offset_right_of_travel` (v1.7.44) считает нормаль по намотке
+        ЗАМКНУТОГО контура, а лид разомкнут: стык прямой с дугой
+        расходился, лид распадался на отдельные прямые. Отход от
+        истинной кривой до 0.326 мм.
+
+      * поточечная выборка (v1.7.58) даёт правильные ТОЧКИ, но рисует
+        их ломаной из 30+ отрезков. Там, где дуга тоньше смещения,
+        кривая честно выворачивается через центр — и эта ломаная
+        выглядела «набором линий, пересекающих друг друга».
+
+    Концентрическая дуга описывает то же самое ОДНИМ сегментом:
+    вывернутая дуга остаётся дугой, видно и форму, и что она вывернута.
+    Вырожденный случай (|R ± d| ≈ 0) — вся дуга схлопывается в точку,
+    такую программу стойка не выполнит; вызывающий это показывает и
+    помечает.
 
     Args:
         lead: лид в координатах ОСЕВОЙ (как его строит планировщик).
-        offset: полуэквидистанта фрезы; >0 — вправо по ходу (G42),
+        offset: радиус инструмента; >0 — вправо по ходу (G42),
             <0 — влево (G41).
-        step: шаг выборки по длине, мм.
     """
     if not lead or not lead.segments or abs(offset) < 1e-12:
         return lead
 
-    def _tan(seg, t):
-        if isinstance(seg, Arc):
-            p = seg.point_at(t)
-            rx, ry = p[0] - seg.center[0], p[1] - seg.center[1]
-            r = math.hypot(rx, ry)
-            if r < EPS:
-                return seg.tangent_at_start()
-            # против часовой — касательная поворотом радиуса на +90°
-            return ((-ry / r, rx / r) if seg.ccw else (ry / r, -rx / r))
-        if hasattr(seg, 'tangent_at'):
-            return seg.tangent_at(t)
-        return seg.tangent_at_start()
-
-    pts: List[Point] = []
+    out: List[Segment] = []
     for seg in lead.segments:
-        L = seg.length()
-        n = max(2, int(math.ceil(L / max(step, 1e-4))) + 1)
-        for i in range(n):
-            t = i / (n - 1)
-            px, py = seg.point_at(t)
-            tx, ty = _tan(seg, t)
-            tl = math.hypot(tx, ty)
-            if tl < EPS:
+        if isinstance(seg, Arc):
+            c = seg.center
+            r = seg.radius
+            if r < EPS:
                 continue
-            tx, ty = tx / tl, ty / tl
-            q = (px + ty * offset, py - tx * offset)
-            if pts and math.hypot(q[0] - pts[-1][0], q[1] - pts[-1][1]) < 1e-9:
+            signed = lead_compensated_radius(seg, offset)
+            if abs(signed) < 1e-6:
+                continue            # дуга схлопнулась в центр
+            k = signed / r
+            a = (c[0] + (seg.a[0] - c[0]) * k,
+                 c[1] + (seg.a[1] - c[1]) * k)
+            b = (c[0] + (seg.b[0] - c[0]) * k,
+                 c[1] + (seg.b[1] - c[1]) * k)
+            # k < 0 — дуга вывернулась ЧЕРЕЗ ЦЕНТР: концы отразились на
+            # 180°, но угол по ходу меняется в ту же сторону, поэтому
+            # направление обхода остаётся прежним.
+            out.append(Arc(a=a, b=b, center=c, ccw=seg.ccw))
+        else:
+            t0 = seg.tangent_at_start()
+            L = math.hypot(t0[0], t0[1])
+            if L < EPS:
                 continue
-            pts.append(q)
+            nx, ny = t0[1] / L * offset, -t0[0] / L * offset
+            out.append(Line(a=(seg.a[0] + nx, seg.a[1] + ny),
+                            b=(seg.b[0] + nx, seg.b[1] + ny)))
 
-    if len(pts) < 2:
-        return lead
-    return Polypath(segments=[Line(a=pts[i], b=pts[i + 1])
-                              for i in range(len(pts) - 1)], closed=False)
+    if not out:
+        return None
+    return Polypath(segments=out, closed=False)
 
 
 def offset_right_of_travel(polypath: Polypath, offset: float) -> Polypath:

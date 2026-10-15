@@ -1604,8 +1604,15 @@ def test_preview_lead_matches_the_program_lead():
                 L = r.get(key)
                 if not L or not getattr(L, 'segments', None):
                     continue
-                drawn.append((is_in, [L.segments[0].a]
-                              + [sg.b for sg in L.segments]))
+                # Выбираем ВДОЛЬ сегментов, а не по их концам: лид
+                # состоит из прямой и ДУГИ, и хорда дуги отходит от неё
+                # на прогиб (при радиусе 0.85 и угле 45° это 65 мкм) —
+                # по концам мерилась бы хорда, а не нарисованная кривая.
+                pp = []
+                for sg in L.segments:
+                    n = max(2, int(math.ceil(sg.length() / 0.02)) + 1)
+                    pp += [sg.point_at(i / (n - 1)) for i in range(n)]
+                drawn.append((is_in, pp))
     assert len(drawn) > 20, f'вьювер нарисовал лидов всего {len(drawn)}'
 
     # ── 2. ПОСТ: что уходит в станок ──
@@ -1804,8 +1811,15 @@ def test_preview_rework_lead_matches_the_program_lead():
                 L = r.get(key)
                 if not L or not getattr(L, 'segments', None):
                     continue
-                drawn.append((is_in, [L.segments[0].a]
-                              + [sg.b for sg in L.segments]))
+                # Выбираем ВДОЛЬ сегментов, а не по их концам: лид
+                # состоит из прямой и ДУГИ, и хорда дуги отходит от неё
+                # на прогиб (при радиусе 0.85 и угле 45° это 65 мкм) —
+                # по концам мерилась бы хорда, а не нарисованная кривая.
+                pp = []
+                for sg in L.segments:
+                    n = max(2, int(math.ceil(sg.length() / 0.02)) + 1)
+                    pp += [sg.point_at(i / (n - 1)) for i in range(n)]
+                drawn.append((is_in, pp))
     assert len(drawn) > 10, f'лидов доработки нарисовано {len(drawn)}'
 
     anc = list(PackageExporter(s.project, p).generate(

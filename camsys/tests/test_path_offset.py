@@ -608,41 +608,46 @@ def test_corner_pad_covers_what_the_main_tool_left():
 
 
 
-def test_lead_cutter_path_is_pointwise_not_per_segment():
-    """Путь фрезы для лида считается ПОТОЧЕЧНО, а не посегментно.
+def test_lead_cutter_path_is_what_the_control_builds():
+    """Путь фрезы для лида — концентрическая дуга, как у стойки.
 
-    Предыстория (v1.7.44). Правильно считать лид на ОСЕВОЙ — именно она
-    уходит в `.anc`, а смещение делает стойка, — и рисовать смещение
-    результата. Я так и сделал, но смещал ПОСЕГМЕНТНО, и получил жалобу
-    «что это с ними стало, в разные стороны, и просто прямые линии».
+    Предыстория в двух провалах.
 
-    Причина геометрическая: дуга лида по радиусу СРАВНИМА со смещением
-    (типично R 0.55…1.3 при смещении 0.55…0.85). Посегментный оффсет на
-    таком соотношении выворачивает дугу и расходит её стык с прямой.
-    Поточечное смещение таких допущений не делает вовсе.
+    v1.7.44: лид смещался ПОСЕГМЕНТНО через `offset_right_of_travel`.
+    Та считает нормаль по намотке ЗАМКНУТОГО контура, а лид разомкнут —
+    стык прямой с дугой расходился, и лид распадался на отдельные
+    прямые в разные стороны. Жалоба была дословно про это.
 
-    Здесь это замеряется: эталон — плотная выборка истинного места
-    смещённой кривой (2000 точек на сегмент), и от неё не должен
-    отходить поточечный результат. Посегментный — отходит, иначе тест
-    ничего не проверяет.
+    v1.7.58: смещение стало ПОТОЧЕЧНЫМ. Точки верные, но рисовались
+    ломаной из 30+ отрезков, и там, где дуга тоньше смещения, кривая
+    выворачивается через центр — ломаная выглядела «набором линий».
+
+    Правильно так, как делает стойка: прямая → параллельная, дуга →
+    КОНЦЕНТРИЧЕСКАЯ радиусом R ± d. Тогда вывернутая дуга остаётся
+    дугой: видно и форму, и что она вывернута.
+
+    Здесь проверяется, что результат лежит на истинной параллельной
+    кривой (плотная выборка p(t) + n(t)·d), что он состоит из ДУГ, а не
+    из ломаной, и что посегментный вариант на тех же данных врёт — иначе
+    тест не ловит причину провала.
     """
     import math
-    from camsys.geometry.primitives import Polypath, Line
+    from camsys.geometry.primitives import Polypath, Line, Arc
     from camsys.geometry.lead_inout import build_lead_in
     from camsys.geometry.path_offset import (cutter_path_of_lead,
-                                             offset_right_of_travel)
+                                             offset_right_of_travel,
+                                             lead_compensated_radius)
 
     axis = Polypath(segments=[Line(a=(0.0, 0.0), b=(20.0, 0.0))],
                     closed=False)
 
     def true_locus(lead, off, n=2000):
-        """Истинное место смещённой кривой: плотная выборка p(t)+n(t)·off."""
         pts = []
         for seg in lead.segments:
             for i in range(n + 1):
                 t = i / n
                 p = seg.point_at(t)
-                if hasattr(seg, 'center'):
+                if isinstance(seg, Arc):
                     rx, ry = p[0] - seg.center[0], p[1] - seg.center[1]
                     r = math.hypot(rx, ry)
                     tg = ((-ry / r, rx / r) if seg.ccw else (ry / r, -rx / r))
@@ -652,42 +657,107 @@ def test_lead_cutter_path_is_pointwise_not_per_segment():
         return pts
 
     def worst_off(curve, locus):
+        if curve is None or not curve.segments:
+            return float('inf')
         w = 0.0
         for s in curve.segments:
-            for t in (0.0, 0.25, 0.5, 0.75, 1.0):
+            for t in (0.0, 0.2, 0.4, 0.6, 0.8, 1.0):
                 q = s.point_at(t)
                 d = min(math.hypot(q[0] - c[0], q[1] - c[1]) for c in locus)
                 w = max(w, d)
         return w
 
-    worst_point = 0.0
+    worst_new = 0.0
     worst_seg = 0.0
+    n_arc_kept = 0
+    n_cases = 0
     for side in ('right', 'left'):
-        for R, off in ((0.65, 0.65), (1.30, 0.65), (0.325, 0.65),
-                       (0.55, 0.85)):
+        for R, off in ((1.30, 0.65), (0.90, 0.65), (0.65, 0.65),
+                       (0.40, 0.65)):
             lead = build_lead_in(axis.segments[0].a, (1.0, 0.0), side,
                                  line_length=1.0, arc_radius=R,
                                  approach_angle_deg=45.0)
             lp = Polypath(segments=[s for s in (lead.line, lead.arc)
                                     if s is not None], closed=False)
+            arc = [s for s in lp.segments if isinstance(s, Arc)][0]
+            comp = lead_compensated_radius(arc, off)
+            got = cutter_path_of_lead(lp, off)
             locus = true_locus(lp, off)
-            wp = worst_off(cutter_path_of_lead(lp, off), locus)
+            wn = worst_off(got, locus)
             ws = worst_off(offset_right_of_travel(lp, off), locus)
-            print(f'  {side:5s} R={R:4} смещение={off}: поточечно '
-                  f'{wp * 1000:6.1f} мкм, посегментно {ws * 1000:7.1f} мкм')
-            worst_point = max(worst_point, wp)
+            n_arcs = sum(1 for s in (got.segments if got else ())
+                         if isinstance(s, Arc))
+            n_cases += 1
+            if abs(comp) > 1e-6:
+                n_arc_kept += n_arcs
+                worst_new = max(worst_new, wn)
             worst_seg = max(worst_seg, ws)
+            print(f'  {side:5s} R={R:4} d={off}: после компенсации '
+                  f'{comp:+.3f}; поточно {wn * 1000:5.1f} мкм, '
+                  f'посегментно {ws * 1000:7.1f} мкм, дуг {n_arcs}')
 
-    # Поточечно — в пределах шага выборки (0.05 мм) на прогиб хорды,
-    # то есть единицы микрон.
-    assert worst_point < 0.005, (
-        f'поточечное смещение ушло от истинной кривой на '
-        f'{worst_point * 1000:.1f} мкм')
-    # И посегментное обязано быть ХУЖЕ на порядки — иначе проверять
-    # нечего и выбор функции не имеет значения.
+    assert worst_new < 0.001, (
+        f'смещённый лид ушёл от истинной кривой на {worst_new * 1000:.1f} мкм')
+    # Дуга обязана остаться ДУГОЙ (кроме вырожденного случая) — иначе
+    # вернулась ломаная, которую юзер увидел как «набор линий».
+    assert n_arc_kept >= n_cases - 2, (
+        f'дуг в результате {n_arc_kept} на {n_cases} случаев — лид '
+        f'снова рисуется ломаной')
     assert worst_seg > 0.05, (
         f'посегментное смещение отходит всего на {worst_seg * 1000:.1f} мкм '
         f'— тест перестал ловить причину провала v1.7.44')
+
+
+def test_lead_arc_must_survive_cutter_compensation():
+    """Радиус дуги лида обязан быть БОЛЬШЕ радиуса инструмента.
+
+    В `.anc` уходит осевая, дугу стойка пересчитывает в концентрическую
+    радиусом R − d (лид всегда загибает в сторону инструмента). При
+    R <= d такой дуги не существует.
+
+    Замерено на корнер-программе 124173 (T3, d = 0.55) ДО правки: из 27
+    заходов радиус после компенсации был 0.0 или −0.22 у всех 27.
+    Причина — радиус считался как `множитель × эквидистанта`, а у
+    доработки множитель 0.5, то есть ровно d.
+    """
+    import math
+    from camsys.geometry.primitives import Polypath, Line, Arc
+    from camsys.geometry.lead_collision import (
+        PassLeadParams, plan_pass_leads, LEAD_MIN_COMP_RADIUS)
+
+    class _G:
+        id = 'g1'
+        polypath = None
+
+    axis = Polypath(segments=[Line(a=(0.0, 0.0), b=(30.0, 0.0))],
+                    closed=False)
+
+    bad = []
+    for scale, mult in ((1.1, 0.5), (1.3, 1.0), (1.3, 0.5), (1.1, 1.0)):
+        d = scale / 2.0
+        pr = PassLeadParams(
+            pass_side='OUTSIDE', is_corner_rework=False,
+            tool_offset=d, lead_scale=scale,
+            radius_mult=mult, length_mult=mult,
+            entry_enabled=True, entry_angle=45.0,
+            entry_length=1.0, entry_radius=1.0,
+            exit_enabled=True, exit_angle=45.0,
+            exit_length=1.0, exit_radius=1.0)
+        res = plan_pass_leads(axis, _G(), pr, [], [])
+        for name, lead in (('заход', res.lead_in), ('выход', res.lead_out)):
+            arcs = [s for s in (lead.segments if lead else ())
+                    if isinstance(s, Arc)]
+            if not arcs:
+                continue
+            comp = arcs[0].radius - d
+            print(f'  эквидистанта {scale}, множитель {mult}, {name}: '
+                  f'R={arcs[0].radius:.3f}, после компенсации {comp:+.3f}')
+            if comp < LEAD_MIN_COMP_RADIUS - 1e-9:
+                bad.append((scale, mult, name, comp))
+    assert not bad, (
+        'дуга лида не переживает компенсацию: '
+        + '; '.join(f'эквидистанта {s}, множитель {m}, {n}: {c:+.3f} мм'
+                    for s, m, n, c in bad))
 
 
 def test_rework_fragment_is_one_function_with_the_post_pad():
