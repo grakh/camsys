@@ -853,6 +853,12 @@ class MtxAndersonGVM(PostProcessor):
             # исправляется (v1.7.57).
             entry_hint=(op.attributes.get('_lead_entry', {})
                         .get(tp.side.name)),
+            # Сдвиг из превью — предпочтительнее координаты: вьювер
+            # пришёл в позицию `shift_start_along_contour`, и повторять
+            # её надо той же функцией (v1.7.62).
+            entry_shift_hint=float(
+                (op.attributes.get('_lead_entry_shift', {})
+                 .get(tp.side.name)) or 0.0),
         )
 
         # Соседние ножи нужны аварийному подбору лида доработки.

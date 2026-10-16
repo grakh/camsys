@@ -248,3 +248,85 @@ def test_sample_cache_survives_id_reuse():
     assert stored[1] is pts
     # повторный вызов отдаёт то же самое, без пересчёта
     assert _cached_points(poly, 0.02) is pts
+
+
+def test_preview_position_reproduces_bit_exactly():
+    """Пост обязан повторить позицию вьювера БИТ В БИТ.
+
+    Вьювер считает заход и отдаёт его посту, пост ставит старт туда и
+    перепроверяет. Пока позиция передавалась КООРДИНАТОЙ, пост приходил
+    в неё другой функцией (`shift_start_to_point` вместо
+    `shift_start_along_contour`), и лид расходился в 11-м знаке —
+    0.08 нм. На границе проверки этого хватало, чтобы вердикт
+    перевернулся: вьювер считал позицию чистой, пост на той же точке
+    видел коллизию и уезжал на 5 мм. В картинке заход стоял в одном
+    месте, в программе — в другом (124173, Knife_26, 2.2 мм).
+
+    Поэтому передаётся СДВИГ, и пост применяет его той же функцией.
+    Здесь это и проверяется: повторный проход с полученным сдвигом даёт
+    тот же старт и тот же лид до последнего бита.
+    """
+    import math
+    from camsys.geometry.primitives import Polypath, Line, Arc
+    from camsys.geometry.lead_collision import (
+        PassLeadParams, plan_pass_leads, build_contours_cache)
+
+    # Контур-«таблетка»: две прямые и две полуокружности.
+    r, L = 6.0, 20.0
+    segs = [
+        Line(a=(0.0, -r), b=(L, -r)),
+        Arc(a=(L, -r), b=(L, r), center=(L, 0.0), ccw=True),
+        Line(a=(L, r), b=(0.0, r)),
+        Arc(a=(0.0, r), b=(0.0, -r), center=(0.0, 0.0), ccw=True),
+    ]
+    pp = Polypath(segments=segs, closed=True)
+
+    class _G:
+        id = 'g1'
+        is_closed = True
+        polypath = pp
+
+    g = _G()
+    cl, cb = build_contours_cache([g])
+
+    def _params(**kw):
+        return PassLeadParams(
+            pass_side='OUTSIDE', is_corner_rework=False,
+            tool_offset=0.65, lead_scale=1.3,
+            entry_enabled=True, entry_angle=45.0,
+            entry_length=1.0, entry_radius=1.0,
+            exit_enabled=True, exit_angle=45.0,
+            exit_length=1.0, exit_radius=1.0, **kw)
+
+    first = plan_pass_leads(pp, g, _params(), cl, cb)
+    again = plan_pass_leads(
+        pp, g, _params(entry_shift_hint=first.entry_shift), cl, cb)
+
+    a1 = first.axis.segments[0].a
+    a2 = again.axis.segments[0].a
+    print(f'  сдвиг {first.entry_shift:.4f} мм; старт '
+          f'({a1[0]!r}, {a1[1]!r}) → ({a2[0]!r}, {a2[1]!r})')
+    assert a1 == a2, (
+        f'старт не повторился: {a1} против {a2} — пост придёт не туда, '
+        f'куда пришёл вьювер')
+
+    for name, l1, l2 in (('заход', first.lead_in, again.lead_in),
+                         ('выход', first.lead_out, again.lead_out)):
+        assert (l1 is None) == (l2 is None), f'{name}: есть/нет не совпало'
+        if l1 is None:
+            continue
+        assert len(l1.segments) == len(l2.segments), \
+            f'{name}: число сегментов не совпало'
+        for k, (s1, s2) in enumerate(zip(l1.segments, l2.segments)):
+            assert s1.a == s2.a and s1.b == s2.b, (
+                f'{name}, сегмент {k}: координаты разошлись — '
+                f'{s1.a},{s1.b} против {s2.a},{s2.b}')
+            if hasattr(s1, 'radius'):
+                assert s1.radius == s2.radius and s1.ccw == s2.ccw, (
+                    f'{name}, сегмент {k}: дуга разошлась')
+    # И вердикт проверки обязан быть тем же — иначе пост «исправит»
+    # позицию, которую вьювер уже признал чистой.
+    assert first.lead_in_collision == again.lead_in_collision, \
+        'вердикт по заходу изменился при повторе'
+    assert first.lead_out_collision == again.lead_out_collision, \
+        'вердикт по выходу изменился при повторе'

@@ -616,7 +616,16 @@ def auto_avoid_collision(start_polypath: Polypath,
         min_line_length: минимальная длина line (default 0.6мм)
     
     Returns:
-        (best_polypath, best_lead, collision_flag)
+        (best_polypath, best_lead, collision_flag, shift_mm)
+
+        shift_mm — НА СКОЛЬКО сдвинут старт вдоль контура от
+        исходного. Нужен, чтобы пост повторил позицию вьювера ТОЙ ЖЕ
+        функцией: привязка по координате точки (`shift_start_to_
+        point`) даёт тот же старт, но другой набор float'ов, и лид
+        расходится в 11-м знаке. На границе проверки этого хватает,
+        чтобы вердикт перевернулся — вьювер считал позицию чистой, а
+        пост на той же точке видел коллизию и уезжал на 5 мм
+        (v1.7.62, элемент Knife_26 заказа 124173).
     """
     from .path_offset import shift_start_along_contour
     
@@ -637,7 +646,7 @@ def auto_avoid_collision(start_polypath: Polypath,
     # ── Этап 1а: исходная позиция, базовые параметры ──
     lead, ok = _try(start_polypath, base_angle_deg, 1.0)
     if ok:
-        return start_polypath, lead, False
+        return start_polypath, lead, False, 0.0
     
     candidates = [(0.0, start_polypath, lead, _score(start_polypath, lead) if lead else float('inf'))]
     
@@ -647,7 +656,7 @@ def auto_avoid_collision(start_polypath: Polypath,
             pp = shift_start_along_contour(start_polypath, shift_mm)
             lead_s, ok = _try(pp, base_angle_deg, 1.0)
             if ok:
-                return pp, lead_s, False
+                return pp, lead_s, False, shift_mm
             if lead_s:
                 candidates.append((shift_mm, pp, lead_s, _score(pp, lead_s)))
         except Exception:
@@ -686,7 +695,7 @@ def auto_avoid_collision(start_polypath: Polypath,
                 pp = shift_start_along_contour(start_polypath, shift)
                 lead_f, ok = _try(pp, base_angle_deg, 1.0)
                 if ok:
-                    return pp, lead_f, False
+                    return pp, lead_f, False, shift
                 if lead_f:
                     candidates.append((shift, pp, lead_f, _score(pp, lead_f)))
             except Exception:
@@ -695,7 +704,7 @@ def auto_avoid_collision(start_polypath: Polypath,
     if not try_angles:
         candidates.sort(key=lambda c: c[3])
         _shift, pp, lead, _v = candidates[0]
-        return pp, lead, True
+        return pp, lead, True, _shift
     
     # ── Этап 2: на «наименее плохой» позиции варьировать УГОЛ и ДЛИНУ ──
     candidates.sort(key=lambda c: c[3])
@@ -709,7 +718,7 @@ def auto_avoid_collision(start_polypath: Polypath,
                 break
             cand_lead, ok = _try(best_pp, ang, 1.0)
             if ok:
-                return best_pp, cand_lead, False
+                return best_pp, cand_lead, False, best_shift
     
     # Варьируем ДЛИНУ через shrink (line_length × shrink ≥ min_line_length)
     if base_line_length > min_line_length:
@@ -718,11 +727,11 @@ def auto_avoid_collision(start_polypath: Polypath,
         while shrink >= min_shrink:
             cand_lead, ok = _try(best_pp, base_angle_deg, shrink)
             if ok:
-                return best_pp, cand_lead, False
+                return best_pp, cand_lead, False, best_shift
             shrink -= 0.1
     
     # ── Этап 3: ничего не помогло → возвращаем «наименее плохой» ──
-    return best_pp, best_lead, True
+    return best_pp, best_lead, True, best_shift
 
 
 
@@ -818,7 +827,7 @@ def plan_lead_in(polypath: Polypath,
                   overlap: float = 0.0,
                   path_is_cutter: bool = False,
                   own_strict: bool = False,
-                  ) -> Tuple[Polypath, Optional[Polypath], bool, object]:
+                  ) -> Tuple[Polypath, Optional[Polypath], bool, object, float]:
     """ПЛАНИРОВАНИЕ lead-in с ТРЁХФАЗНЫМ подбором безопасности.
     
     Если передан exit_request, то на каждом кандидате-сдвиге проверяются 
@@ -928,7 +937,7 @@ def plan_lead_in(polypath: Polypath,
         lead = _build(polypath, request.angle_deg, 1.0)
         coll = _make_combined_check(safety_factor)(lead, polypath) if lead else False
         geom = _polypath_to_lead_geometry(lead, request.is_entry) if lead else None
-        return polypath, lead, coll, geom
+        return polypath, lead, coll, geom, 0.0
     
     # ФАЗЫ 1-3 ниже сами разберутся: если позиция юзера уже чиста по строгой 
     # мере — Phase 1 вернёт её первой. Если нет — попробуют сдвиги. Если 
@@ -936,7 +945,7 @@ def plan_lead_in(polypath: Polypath,
     
     # Реальное пересечение есть — начинаем автоподбор через фазы
     # ФАЗА 1: строгая
-    final_pp, lead, coll = auto_avoid_collision(
+    final_pp, lead, coll, _shift_used = auto_avoid_collision(
         polypath, _build, _make_combined_check(safety_factor), request.pass_side,
         base_angle_deg=request.angle_deg,
         base_line_length=request.line_length,
@@ -944,11 +953,11 @@ def plan_lead_in(polypath: Polypath,
         try_angles=True)
     if not coll:
         geom = _polypath_to_lead_geometry(lead, request.is_entry) if lead else None
-        return final_pp, lead, coll, geom
+        return final_pp, lead, coll, geom, _shift_used
     
     # ФАЗА 2: мягкая
     if fallback_safety_factor < safety_factor:
-        final_pp2, lead2, coll2 = auto_avoid_collision(
+        final_pp2, lead2, coll2, _shift2 = auto_avoid_collision(
             polypath, _build, _make_combined_check(fallback_safety_factor),
             request.pass_side,
             base_angle_deg=request.angle_deg,
@@ -957,11 +966,12 @@ def plan_lead_in(polypath: Polypath,
             try_angles=True)
         if not coll2:
             geom = _polypath_to_lead_geometry(lead2, request.is_entry)
-            return final_pp2, lead2, coll2, geom
-        final_pp, lead, coll = final_pp2, lead2, coll2
+            return final_pp2, lead2, coll2, geom, _shift2
+        final_pp, lead, coll, _shift_used = (
+            final_pp2, lead2, coll2, _shift2)
     
     # ФАЗА 3: intersection-only
-    final_pp3, lead3, coll3 = auto_avoid_collision(
+    final_pp3, lead3, coll3, _shift3 = auto_avoid_collision(
         polypath, _build, _make_combined_check(0.01), request.pass_side,
         base_angle_deg=request.angle_deg,
         base_line_length=request.line_length,
@@ -969,7 +979,7 @@ def plan_lead_in(polypath: Polypath,
         try_angles=True)
     if not coll3:
         geom = _polypath_to_lead_geometry(lead3, request.is_entry)
-        return final_pp3, lead3, coll3, geom
+        return final_pp3, lead3, coll3, geom, _shift3
     
     # ФАЗА 4: противоположная сторона lead-in
     if request.forced_side is None:
@@ -998,7 +1008,7 @@ def plan_lead_in(polypath: Polypath,
         
         for sf_try in (safety_factor, fallback_safety_factor, 0.01):
             if sf_try < 0.005: continue
-            final_pp4, lead4, coll4 = auto_avoid_collision(
+            final_pp4, lead4, coll4, _shift4 = auto_avoid_collision(
                 polypath, _build_flipped, _make_combined_check(sf_try),
                 request.pass_side,
                 base_angle_deg=request.angle_deg,
@@ -1007,10 +1017,10 @@ def plan_lead_in(polypath: Polypath,
                 try_angles=True)
             if not coll4:
                 geom = _polypath_to_lead_geometry(lead4, request.is_entry)
-                return final_pp4, lead4, coll4, geom
+                return final_pp4, lead4, coll4, geom, _shift4
     
     geom = _polypath_to_lead_geometry(lead, request.is_entry) if lead else None
-    return final_pp, lead, coll, geom
+    return final_pp, lead, coll, geom, _shift_used
 
 
 def plan_lead_out(polypath: Polypath,
@@ -1192,6 +1202,9 @@ class PassLeadParams:
     overlap: float = 0.0        # перебег, мм (применяется ПОСЛЕ подбора)
     no_avoid: bool = False      # ручная позиция — автоподбор не двигает
     entry_hint: Optional[Point] = None   # готовая точка захода
+    # Готовый СДВИГ старта вдоль контура, мм — предпочтительнее точки
+    # (см. plan_pass_leads). 0 — сдвига нет.
+    entry_shift_hint: float = 0.0
 
 
 @dataclass
@@ -1203,6 +1216,10 @@ class PassLeadResult:
     # определена однозначно), а перебег разомкнул бы его и нормаль могла
     # уйти в другую сторону.
     axis_rerooted: Optional[Polypath] = None
+    # На сколько мм подбор сдвинул старт вдоль контура. Вьювер отдаёт
+    # это посту вместо координаты точки, чтобы оба пришли в позицию ОДНОЙ
+    # функцией и получили бит-в-бит одинаковый лид (v1.7.62).
+    entry_shift: float = 0.0
     lead_in: Optional[Polypath] = None
     lead_out: Optional[Polypath] = None
     lead_in_geom: object = None         # .line/.arc для эмиссии NC
@@ -1382,7 +1399,25 @@ def plan_pass_leads(axis: Polypath,
         # туда, но автоподбор НЕ выключаем: он начинает с этой позиции,
         # поэтому безопасная точка остаётся на месте, а небезопасная
         # исправляется (v1.7.57).
-        if p.entry_hint and axis.closed:
+        # ── ПОЗИЦИЯ ИЗ ПРЕВЬЮ ──
+        # Предпочитаем СДВИГ, а не координату точки: вьювер пришёл в
+        # позицию функцией `shift_start_along_contour`, и повторять её
+        # надо той же функцией. Привязка по координате
+        # (`shift_start_to_point`) даёт тот же старт, но другой набор
+        # float'ов — лид расходится в 11-м знаке, и на границе проверки
+        # этого хватает, чтобы вердикт перевернулся: вьювер считал
+        # позицию чистой, пост на той же точке видел коллизию и уезжал
+        # на 5 мм (v1.7.62, Knife_26 заказа 124173). Координата остаётся
+        # запасным путём для проектов, сохранённых прежними версиями.
+        if axis.closed and abs(p.entry_shift_hint) > 1e-12:
+            try:
+                from .path_offset import shift_start_along_contour
+                cand = shift_start_along_contour(axis, p.entry_shift_hint)
+                if cand and cand.segments and cand.closed:
+                    axis = cand
+            except Exception:
+                pass
+        elif p.entry_hint and axis.closed:
             try:
                 from .path_offset import shift_start_to_point
                 before_n = len(axis.segments)
@@ -1422,7 +1457,8 @@ def plan_pass_leads(axis: Polypath,
                 forced_side=(None if p.pass_side in ("INSIDE", "OUTSIDE")
                              else res.lead_out_side),
                 side_ref=_sref, min_arc_radius=_r_min)
-        axis, res.lead_in, res.lead_in_collision, res.lead_in_geom = \
+        (axis, res.lead_in, res.lead_in_collision, res.lead_in_geom,
+         _shift_done) = \
             plan_lead_in(
                 axis, req_in, contours_lines, contours_bboxes,
                 own_geom.id, _tool_off,
@@ -1430,6 +1466,9 @@ def plan_pass_leads(axis: Polypath,
                 exit_request=_exit_in_search,
                 overlap=p.overlap,
                 own_strict=p.is_corner_rework)
+        # Суммарный сдвиг: что уже пришло из превью плюс что добавил
+        # собственный подбор.
+        res.entry_shift = p.entry_shift_hint + (_shift_done or 0.0)
 
     # ── ПЕРЕБЕГ — ПОСЛЕ подбора ──
     # Применённый раньше, он разомкнул бы контур, и сдвиг старта тащил

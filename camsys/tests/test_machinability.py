@@ -1771,6 +1771,121 @@ def test_preview_lead_matches_the_program_lead():
         f'рисунок расходится с программой на {worst * 1000:.1f} мкм '
         f'{worst_at} — превью врёт')
 
+def test_preview_lead_position_is_the_program_position():
+    """Каждый нарисованный лид находит себя в программе.
+
+    Отдельно от допуска в микронах: здесь ловится случай, когда заход
+    стоит ПРОСТО В ДРУГОМ МЕСТЕ. На 124173 так расходились оба лида
+    Knife_26 — в картинке на 2.2 мм от программных.
+
+    Причина была в том, что позиция передавалась посту КООРДИНАТОЙ, и он
+    приходил в неё другой функцией. Лид расходился в 11-м знаке, а на
+    границе проверки этого хватало, чтобы вердикт перевернулся: вьювер
+    считал позицию чистой, пост на той же точке видел коллизию и уезжал.
+    Теперь передаётся СДВИГ и применяется той же функцией (v1.7.62).
+
+    Заказ взят 124173, а не 126387: прямоугольники 126387 этот случай не
+    дают, там все позиции далеко от границы.
+    """
+    ai = '/mnt/user-data/uploads/124173_test.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет 124173_test.ai')
+        return
+    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+    try:
+        from camsys.ui.viewer_2d import _build_toolpath_geometry
+    except Exception as e:
+        print(f'  SKIP — вьювер не загрузился ({type(e).__name__})')
+        return
+    import re
+    import camsys.post.mtx_anderson  # noqa: F401
+    from camsys.core.session import CamSession
+    from camsys.core.project import OperationKind
+    import camsys.core.macros as macros_mod
+    from camsys.post.package_export import PackageExporter
+
+    tip = 0.8
+    s = CamSession()
+    s.load_ai(ai)
+    for g in s.project.get_layer_by_name('Knife').geometries:
+        if g.polypath:
+            s.project.add_blade_operation(g.id)
+    macros_mod.sort_operations_by_grid(s.project)
+    p = s.cutting_params
+    p.knife_angle, p.tip_diameter, p.bottom = 90.0, tip, 0.25
+    eq = tip + 2 * 0.25 * math.tan(math.radians(45))
+    half = eq / 2
+    extras = {'tool_radius': tip / 2, 'tool_equidistant': eq,
+              'corner_tool_radius': 0.3, 'corner_tool_equidistant': 1.1,
+              'auto_avoid_all': True, 'lead_mode': 0, 'selected_op_id': None}
+
+    drawn = []
+    for op in s.project.operations:
+        if op.kind != OperationKind.BLADE_FORMING:
+            continue
+        for tp in op.toolpaths:
+            r = _build_toolpath_geometry(s.project, op, tp, extras, p)
+            if not r:
+                continue
+            for key, is_in in (('lead_in', True), ('lead_out', False)):
+                L = r.get(key)
+                if not L or not getattr(L, 'segments', None):
+                    continue
+                drawn.append((is_in, L.segments[-1].b if is_in
+                              else L.segments[0].a))
+    assert len(drawn) > 50, f'нарисовано лидов всего {len(drawn)}'
+
+    anc = list(PackageExporter(s.project, p).generate(
+        only_stages=('rough_all',)).values())[0]
+
+    num = r'-?\d+\.?\d*'
+    joints = []
+    x = y = 0.0
+    cur = None
+    for line in anc.splitlines():
+        gx = re.search(r'\bX\s*(' + num + ')', line)
+        gy = re.search(r'\bY\s*(' + num + ')', line)
+        nx = float(gx.group(1)) if gx else x
+        ny = float(gy.group(1)) if gy else y
+        if 'G42' in line or 'G41' in line:
+            cur = True
+        elif cur and (';50,10' in line or ';60,10' in line):
+            joints.append((True, (nx, ny)))
+            cur = None
+        elif ';50,15' in line or ';60,15' in line:
+            joints.append((False, (x, y)))
+        if gx or gy:
+            x, y = nx, ny
+    assert len(joints) == len(drawn), (
+        f'лидов в программе {len(joints)}, нарисовано {len(drawn)}')
+
+    # Стык нарисованного лида лежит на ЭКВИДИСТАНТЕ, программного — на
+    # осевой; между ними ровно полуширина. Поэтому ищем пару в радиусе
+    # «полуширина + запас».
+    worst = 0.0
+    unmatched = 0
+    worst_at = None
+    for is_in, j in drawn:
+        bd = 9e9
+        for ii, aj in joints:
+            if ii != is_in:
+                continue
+            d = math.hypot(aj[0] - j[0], aj[1] - j[1])
+            if d < bd:
+                bd = d
+        if bd > half + 0.5:
+            unmatched += 1
+            if bd > worst:
+                worst, worst_at = bd, (round(j[0], 2), round(j[1], 2))
+    print(f'  лидов {len(drawn)}; стоят не там, где программа: '
+          f'{unmatched}' + (f', худший на {worst:.2f} мм {worst_at}'
+                            if unmatched else ''))
+    assert unmatched == 0, (
+        f'{unmatched} нарисованных лидов стоят не там, где программные '
+        f'(худший на {worst:.2f} мм {worst_at}) — картинка показывает '
+        f'заход в одном месте, станок режет в другом')
+
+
 def test_preview_rework_lead_matches_the_program_lead():
     """То же для ЛИДОВ ДОРАБОТКИ: рисунок обязан совпасть с программой.
 

@@ -1403,6 +1403,14 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
                 _e = polypath.segments[0].a
                 op.attributes.setdefault('_lead_entry', {})[tp.side.name] = [
                     float(_e[0]), float(_e[1])]
+                # Плюс СДВИГ, которым сюда пришли: по нему пост повторит
+                # позицию ТОЙ ЖЕ функцией и получит бит-в-бит такой же
+                # лид. По одной координате это не выходит — другой путь
+                # вычислений даёт расхождение в 11-м знаке, а на границе
+                # проверки его хватает, чтобы вердикт перевернулся
+                # (v1.7.62).
+                op.attributes.setdefault('_lead_entry_shift', {})[
+                    tp.side.name] = float(_plan.entry_shift)
         except Exception:
             pass
 
