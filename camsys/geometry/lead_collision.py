@@ -24,7 +24,7 @@ import math
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Callable
 
-from .primitives import Polypath, Segment, Line, Arc, Point
+from .primitives import Polypath, Segment, Line, Arc, Point, EPS
 
 
 # (Алгоритм сдвигов теперь использует +5мм и доли периметра — см. 
@@ -171,6 +171,63 @@ def _point_to_segment_distance(p: Point, a: Point, b: Point) -> float:
 JOIN_TOUCH_MM = 0.08
 
 
+def _dist_point_to_segment_exact(px: float, py: float, seg: Segment) -> float:
+    """Расстояние от точки до сегмента — ТОЧНОЕ, без ломаной.
+
+    Нужно для собственного контура, где лид в рабочем положении лежит
+    ровно в радиусе инструмента от него: там ломаная с хордой 0.5 мм
+    врёт на величину прогиба (до 130 мкм у скругления R 0.3), и порог
+    «не ближе радиуса инструмента» по ней не поставить — либо ложные
+    срабатывания на вогнутых участках, либо пропуск настоящих.
+    """
+    if isinstance(seg, Arc):
+        cx, cy = seg.center
+        dx, dy = px - cx, py - cy
+        d = math.hypot(dx, dy)
+        if d > EPS:
+            ang = math.atan2(dy, dx)
+            a0 = math.atan2(seg.a[1] - cy, seg.a[0] - cx)
+            a1 = math.atan2(seg.b[1] - cy, seg.b[0] - cx)
+            sweep = (a1 - a0) % (2 * math.pi)
+            if not seg.ccw:
+                sweep = sweep - 2 * math.pi
+            rel = (ang - a0) % (2 * math.pi)
+            if not seg.ccw:
+                rel = rel - 2 * math.pi
+            # внутри дуги — расстояние до окружности
+            if (0.0 <= rel <= sweep) or (sweep <= rel <= 0.0):
+                return abs(d - seg.radius)
+        return min(math.hypot(px - seg.a[0], py - seg.a[1]),
+                   math.hypot(px - seg.b[0], py - seg.b[1]))
+    return _point_to_segment_distance((px, py), seg.a, seg.b)
+
+
+def own_contour_clearance(cut_points, own_polypath, entry_point,
+                          join_skip: float) -> float:
+    """Минимальное расстояние от ПУТИ ФРЕЗЫ до собственного контура.
+
+    Точки пути ближе `join_skip` к точке стыка пропускаются: там фреза
+    и должна лежать на эквидистанте контура, это её рабочее положение.
+    """
+    if not cut_points or own_polypath is None:
+        return float('inf')
+    segs = getattr(own_polypath, 'segments', None)
+    if not segs:
+        return float('inf')
+    best = float('inf')
+    ex, ey = entry_point
+    for px, py in cut_points:
+        if math.hypot(px - ex, py - ey) < join_skip:
+            continue
+        for sg in segs:
+            d = _dist_point_to_segment_exact(px, py, sg)
+            if d < best:
+                best = d
+                if best <= 0.0:
+                    return 0.0
+    return best
+
+
 def lead_crosses_contours(lead_poly: Optional[Polypath],
                            contours_lines: List[Tuple[str, List[Tuple[Point, Point]]]],
                            own_geom_id: str,
@@ -180,7 +237,8 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
                            skip_radius: Optional[float] = None,
                            contours_bboxes: Optional[List[Tuple[str, Tuple]]] = None,
                            path_is_cutter: bool = False,
-                           own_strict: bool = False
+                           own_strict: bool = False,
+                           own_exact=None
                            ) -> bool:
     """Проверка коллизии lead'а с упрощёнными line-only контурами.
     
@@ -326,6 +384,25 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
             ys2 = [p[1] for L in c_lines for p in L]
             contours_bboxes.append((cid, (min(xs2), min(ys2), max(xs2), max(ys2))))
     
+    # ── СВОЙ КОНТУР: ТОЧНЫЙ ЗАМЕР ПУТИ ФРЕЗЫ (v1.7.63) ──
+    # Прежняя проверка своего контура мерила ОСЕВУЮ и освобождала зону
+    # по РАЗМЕРУ ЛИДА (0.8 его габарита). У пологого захода лид длинный,
+    # зона выходила в несколько миллиметров — и весь опасный участок
+    # оказывался внутри неё. На 124173, Knife_28 (круг) при угле захода
+    # 10° заход шёл вдоль собственного лезвия с зазором 0.000 мм при
+    # нужных 0.850, и ни одна проверка не срабатывала.
+    #
+    # Теперь путь фрезы меряется до ТОЧНОЙ геометрии своего контура
+    # (дуги аналитически, без ломаной), а освобождается только
+    # окрестность стыка.
+    if own_exact is not None:
+        _own_clr = own_contour_clearance(
+            [la for (la, _lb) in cut_lines] + ([cut_lines[-1][1]]
+                                               if cut_lines else []),
+            own_exact, entry_point, max(0.05, tool_offset * 0.5))
+        if _own_clr < tool_offset - 0.005:
+            return True
+
     bbox_dict = dict(contours_bboxes)
     
     for cid, c_lines in contours_lines:
@@ -827,6 +904,7 @@ def plan_lead_in(polypath: Polypath,
                   overlap: float = 0.0,
                   path_is_cutter: bool = False,
                   own_strict: bool = False,
+                  own_exact=None,
                   ) -> Tuple[Polypath, Optional[Polypath], bool, object, float]:
     """ПЛАНИРОВАНИЕ lead-in с ТРЁХФАЗНЫМ подбором безопасности.
     
@@ -852,7 +930,7 @@ def plan_lead_in(polypath: Polypath,
                 lead, contours_lines, own_geom_id, entry_pt,
                 tool_offset=tool_offset, safety_factor=sf,
                 contours_bboxes=contours_bboxes, path_is_cutter=path_is_cutter,
-                own_strict=own_strict)
+                own_strict=own_strict, own_exact=own_exact)
         return _check
     
     def _make_scorer(sf):
@@ -897,7 +975,8 @@ def plan_lead_in(polypath: Polypath,
                     lead_out, contours_lines, own_geom_id, join_pt,
                     tool_offset=tool_offset, safety_factor=sf,
                     contours_bboxes=contours_bboxes,
-                    path_is_cutter=path_is_cutter, own_strict=own_strict):
+                    path_is_cutter=path_is_cutter, own_strict=own_strict,
+                    own_exact=own_exact):
                 return True
             # Заход и выход не должны пересекаться между собой (v1.7.17)
             return leads_cross_each_other(lead_in, lead_out)
@@ -1032,7 +1111,8 @@ def plan_lead_out(polypath: Polypath,
                    safety_factor: float = 1.2,
                    fallback_safety_factor: float = 1.0,
                    path_is_cutter: bool = False,
-                   own_strict: bool = False
+                   own_strict: bool = False,
+                   own_exact=None
                    ) -> Tuple[Optional[Polypath], bool, object]:
     """ПЛАНИРОВАНИЕ lead-out: построение + проверка коллизии.
     
@@ -1054,7 +1134,7 @@ def plan_lead_out(polypath: Polypath,
         lead, contours_lines, own_geom_id, join_pt,
         tool_offset=tool_offset, safety_factor=safety_factor,
         contours_bboxes=contours_bboxes, path_is_cutter=path_is_cutter,
-        own_strict=own_strict)
+        own_strict=own_strict, own_exact=own_exact)
     
     # Мягкая — для определения «реально ли есть пересечение» (а не просто
     # тесный зазор в пределах safety запаса)
@@ -1063,7 +1143,7 @@ def plan_lead_out(polypath: Polypath,
             lead, contours_lines, own_geom_id, join_pt,
             tool_offset=tool_offset, safety_factor=fallback_safety_factor,
             contours_bboxes=contours_bboxes, path_is_cutter=path_is_cutter,
-            own_strict=own_strict)
+            own_strict=own_strict, own_exact=own_exact)
     
     geom = _polypath_to_lead_geometry(lead, request.is_entry)
     return lead, coll, geom
@@ -1465,7 +1545,8 @@ def plan_pass_leads(axis: Polypath,
                 auto_avoid=(not p.no_avoid), safety_factor=1.2,
                 exit_request=_exit_in_search,
                 overlap=p.overlap,
-                own_strict=p.is_corner_rework)
+                own_strict=p.is_corner_rework,
+                own_exact=own_pp)
         # Суммарный сдвиг: что уже пришло из превью плюс что добавил
         # собственный подбор.
         res.entry_shift = p.entry_shift_hint + (_shift_done or 0.0)
@@ -1485,7 +1566,7 @@ def plan_pass_leads(axis: Polypath,
             plan_lead_out(
                 axis, req_out, contours_lines, contours_bboxes,
                 own_geom.id, _tool_off, safety_factor=1.2,
-                own_strict=p.is_corner_rework)
+                own_strict=p.is_corner_rework, own_exact=own_pp)
 
     # ── АВАРИЙНЫЙ ЛИД ТАМ, ГДЕ ОБЫЧНЫЙ РЕЖЕТ ЛЕЗВИЕ ──
     # Доработка идёт теми же лидами, что основной проход (v1.7.61), и в

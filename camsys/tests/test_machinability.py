@@ -1771,6 +1771,98 @@ def test_preview_lead_matches_the_program_lead():
         f'рисунок расходится с программой на {worst * 1000:.1f} мкм '
         f'{worst_at} — превью врёт')
 
+def test_shallow_angle_lead_never_crosses_the_blade():
+    """Заход под пологим углом не идёт через лезвие. Заказ 124173.
+
+    Жалоба была на элемент 28 заказа 124173_test, точка (115.5, 149):
+    «заход так и идёт через лезвие». Это круг R 4.9, и воспроизводится
+    он только при малом угле захода — 10°, который юзер ставит, когда
+    лид не влезает. При таком угле прямая = боковой зазор / sin(10°),
+    лид почти ложится на контур и идёт вдоль собственного лезвия.
+
+    Проверка этого не видела: для СВОЕГО контура она мерила осевую и
+    освобождала зону по размеру лида (0.8 габарита), а у пологого
+    захода лид длинный — весь опасный участок попадал внутрь зоны. До
+    правки перебор по пятке, смещению, длине и углу давал 68 сочетаний
+    с заходом через лезвие, худшее — врезание на 850 мкм при нужных
+    850, то есть фреза шла ровно по кромке.
+    """
+    ai = '/mnt/user-data/uploads/124173_test.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет 124173_test.ai')
+        return
+    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+    try:
+        from camsys.ui.viewer_2d import _build_toolpath_geometry
+    except Exception as e:
+        print(f'  SKIP — вьювер не загрузился ({type(e).__name__})')
+        return
+    from camsys.core.session import CamSession
+    import camsys.core.macros as macros_mod
+    from camsys.geometry.path_offset import _exact_axis_points
+
+    s = CamSession()
+    s.load_ai(ai)
+    knives = [g for g in s.project.get_layer_by_name('Knife').geometries
+              if g.polypath]
+    for g in knives:
+        s.project.add_blade_operation(g.id)
+    macros_mod.sort_operations_by_grid(s.project)
+    target = [g for g in knives if g.name == 'Knife_28']
+    if not target:
+        print('  SKIP — в заказе нет Knife_28')
+        return
+    G = target[0]
+    blade = [q for _t, q in _exact_axis_points(G.polypath, 0.005)[0]]
+    p = s.cutting_params
+
+    bad = []
+    checked = 0
+    for tip in (0.8, 1.2):
+        eq = tip + 2 * 0.25 * math.tan(math.radians(45))
+        half = eq / 2
+        extras = {'tool_radius': tip / 2, 'tool_equidistant': eq,
+                  'corner_tool_radius': 0.3, 'corner_tool_equidistant': 1.1,
+                  'auto_avoid_all': True, 'lead_mode': 0,
+                  'selected_op_id': None}
+        for off in (-5.0, 0.0, 5.0):
+            for ang in (10.0, 20.0, 45.0):
+                p.knife_angle, p.tip_diameter, p.bottom = 90.0, tip, 0.25
+                for src in (p.lead_inside, p.lead_outside):
+                    src.offset, src.length, src.angle = off, 1.0, ang
+                for op in s.project.operations:
+                    if G.id not in op.geometry_ids:
+                        continue
+                    for tp in op.toolpaths:
+                        r = _build_toolpath_geometry(s.project, op, tp,
+                                                     extras, p)
+                        if not r:
+                            continue
+                        for key, flag in (('lead_in', 'lead_in_collision'),
+                                          ('lead_out', 'lead_out_collision')):
+                            L = r.get(key)
+                            if not L or not getattr(L, 'segments', None):
+                                continue
+                            checked += 1
+                            lp = [q for _t, q in
+                                  _exact_axis_points(L, 0.01)[0]]
+                            d = min(min(math.hypot(q[0] - b[0], q[1] - b[1])
+                                        for b in blade) for q in lp)
+                            if d < half - 0.01 and not r.get(flag):
+                                bad.append((half - d, tip, off, ang,
+                                            tp.side.name, key, d, half))
+    bad.sort(reverse=True)
+    print(f'  сочетаний проверено {checked}; заходов через лезвие без '
+          f'пометки: {len(bad)}'
+          + (f'; худшее врезание {bad[0][0] * 1000:.0f} мкм' if bad else ''))
+    assert checked > 50, f'проверено всего {checked} лидов'
+    assert not bad, (
+        'лид идёт через собственное лезвие и не помечен: пятка {}, '
+        'смещение {}, угол {}, {}/{} — зазор {:.3f} при нужных {:.3f}'
+        .format(bad[0][1], bad[0][2], bad[0][3], bad[0][4], bad[0][5],
+                bad[0][6], bad[0][7]))
+
+
 def test_preview_lead_position_is_the_program_position():
     """Каждый нарисованный лид находит себя в программе.
 

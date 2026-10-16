@@ -330,3 +330,94 @@ def test_preview_position_reproduces_bit_exactly():
         'вердикт по заходу изменился при повторе'
     assert first.lead_out_collision == again.lead_out_collision, \
         'вердикт по выходу изменился при повторе'
+
+
+def test_shallow_lead_does_not_run_along_its_own_blade():
+    """Пологий заход не идёт вдоль собственного лезвия.
+
+    Угол захода 10° юзер ставит, когда лид не влезает («иногда даже 10
+    приходится ставить»). При таком угле длина прямой = боковой зазор /
+    sin(10°), то есть лид почти ложится на контур — и идёт вдоль него.
+
+    Проверка этого не видела. Для СВОЕГО контура она мерила ОСЕВУЮ и
+    освобождала зону по РАЗМЕРУ ЛИДА (0.8 его габарита): у пологого
+    захода лид длинный, зона выходила в несколько миллиметров, и весь
+    опасный участок оказывался внутри неё. На 124173, Knife_28 (круг
+    R 4.9) заход шёл по собственному лезвию с зазором 0.000 мм при
+    нужных 0.850 — и ни одна проверка не срабатывала.
+
+    Теперь путь фрезы меряется до ТОЧНОЙ геометрии своего контура (дуги
+    аналитически, без ломаной с хордой 0.5 мм, которая на скруглении
+    R 0.3 врёт на 130 мкм), освобождается только окрестность стыка.
+    """
+    import math
+    from camsys.geometry.primitives import Polypath, Arc
+    from camsys.geometry.lead_collision import (
+        PassLeadParams, plan_pass_leads, build_contours_cache,
+        own_contour_clearance)
+    from camsys.geometry.path_offset import _exact_axis_points
+
+    # Круг R 4.9 — как Knife_28 заказа 124173.
+    R, C = 4.9, (0.0, 0.0)
+    pp = Polypath(segments=[
+        Arc(a=(R, 0.0), b=(-R, 0.0), center=C, ccw=True),
+        Arc(a=(-R, 0.0), b=(R, 0.0), center=C, ccw=True),
+    ], closed=True)
+
+    class _G:
+        id = 'g1'
+        is_closed = True
+        polypath = pp
+
+    g = _G()
+    cl, cb = build_contours_cache([g])
+    half = 0.85          # пятка 1.2 при 90°/0.25
+    from camsys.geometry.direction import normalize_for_side
+
+    worst = float('inf')
+    worst_at = None
+    for side in ('OUTSIDE', 'INSIDE'):
+        # Намотку задаёт та же функция, что и в программе: без неё лид
+        # строится в другую сторону и тест меряет не то.
+        axis = normalize_for_side(pp, side)
+        for ang in (10.0, 20.0, 45.0, 90.0):
+            prm = PassLeadParams(
+                pass_side=side, is_corner_rework=False,
+                tool_offset=half, lead_scale=half * 2,
+                entry_enabled=True, entry_angle=ang,
+                entry_length=1.0, entry_radius=1.0,
+                exit_enabled=True, exit_angle=ang,
+                exit_length=1.0, exit_radius=1.0)
+            res = plan_pass_leads(axis, g, prm, cl, cb)
+            for name, lead, flagged in (
+                    ('заход', res.lead_in, res.lead_in_collision),
+                    ('выход', res.lead_out, res.lead_out_collision)):
+                if not lead or not lead.segments:
+                    continue
+                pts = [q for _t, q in _exact_axis_points(lead, 0.01)[0]]
+                cut = []
+                for i in range(len(pts) - 1):
+                    x0, y0 = pts[i]
+                    x1, y1 = pts[i + 1]
+                    dx, dy = x1 - x0, y1 - y0
+                    L = math.hypot(dx, dy)
+                    if L < 1e-12:
+                        continue
+                    cut.append((x0 + dy / L * half, y0 - dx / L * half))
+                join = lead.segments[-1].b if name == 'заход' \
+                    else lead.segments[0].a
+                d = own_contour_clearance(cut, pp, join, half * 0.5)
+                # На ИДЕАЛЬНОМ круге сдвиг старта не меняет ничего
+                # (вращательная симметрия), а угол подбор только
+                # понижает — значит при 10° чистого решения может не
+                # быть вовсе. Требование тогда другое: не молча.
+                if d < half - 0.05 and not flagged:
+                    worst = min(worst, d)
+                    worst_at = (side, ang, name)
+                elif d < worst and flagged is False:
+                    worst, worst_at = d, (side, ang, name)
+    print(f'  худший НЕПОМЕЧЕННЫЙ зазор до своего лезвия {worst:.3f} мм '
+          f'(надо {half:.3f}) {worst_at}')
+    assert worst >= half - 0.05, (
+        f'лид идёт по собственному лезвию и НЕ помечен коллизией: '
+        f'зазор {worst:.3f} при нужных {half:.3f} ({worst_at})')
