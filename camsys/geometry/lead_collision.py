@@ -170,6 +170,12 @@ def _point_to_segment_distance(p: Point, a: Point, b: Point) -> float:
 # считается касанием, а не коллизией: там они сходятся по построению.
 JOIN_TOUCH_MM = 0.08
 
+# Окно «касание у стыка» для проверки ПЕРЕСЕЧЕНИЯ. Лид раскладывается в
+# ломаную с хордой до 0.3 мм (`_segment_to_polyline`), поэтому окно
+# обязано быть больше шага: иначе отрезок, который всего лишь касается
+# контура у стыка, объявляется пересечением (v1.7.64).
+_JOIN_SEG_MM = 0.3 + JOIN_TOUCH_MM
+
 
 def _dist_point_to_segment_exact(px: float, py: float, seg: Segment) -> float:
     """Расстояние от точки до сегмента — ТОЧНОЕ, без ломаной.
@@ -203,28 +209,60 @@ def _dist_point_to_segment_exact(px: float, py: float, seg: Segment) -> float:
 
 
 def own_contour_clearance(cut_points, own_polypath, entry_point,
-                          join_skip: float) -> float:
+                          join_skip: float, step: float = 0.15) -> float:
     """Минимальное расстояние от ПУТИ ФРЕЗЫ до собственного контура.
 
-    Точки пути ближе `join_skip` к точке стыка пропускаются: там фреза
-    и должна лежать на эквидистанте контура, это её рабочее положение.
+    `cut_points` — ЛОМАНАЯ пути фрезы. Считать только по её вершинам
+    нельзя: прямая часть лида раскладывается в ОДИН отрезок (длиной до
+    десятка миллиметров), и вся его середина — ровно та, что идёт вдоль
+    лезвия у пологого захода, — осталась бы непроверенной. Поэтому
+    каждое звено дополнительно делится с шагом `step`.
+
+    Точки ближе `join_skip` к стыку пропускаются: там фреза и должна
+    лежать на эквидистанте контура, это её рабочее положение.
     """
     if not cut_points or own_polypath is None:
         return float('inf')
     segs = getattr(own_polypath, 'segments', None)
     if not segs:
         return float('inf')
+    # Габариты сегментов — чтобы не считать точное расстояние до каждого.
+    boxes = []
+    for sg in segs:
+        xs = (sg.a[0], sg.b[0])
+        ys = (sg.a[1], sg.b[1])
+        pad = 0.0
+        if isinstance(sg, Arc):
+            pad = sg.radius          # дуга может выпирать за концы
+            cx, cy = sg.center
+            boxes.append((sg, cx - pad, cy - pad, cx + pad, cy + pad))
+            continue
+        boxes.append((sg, min(xs), min(ys), max(xs), max(ys)))
+
     best = float('inf')
     ex, ey = entry_point
-    for px, py in cut_points:
-        if math.hypot(px - ex, py - ey) < join_skip:
-            continue
-        for sg in segs:
-            d = _dist_point_to_segment_exact(px, py, sg)
-            if d < best:
-                best = d
-                if best <= 0.0:
-                    return 0.0
+    st = max(0.02, step)
+    for i in range(len(cut_points)):
+        x0, y0 = cut_points[i]
+        if i + 1 < len(cut_points):
+            x1, y1 = cut_points[i + 1]
+            n = max(1, int(math.ceil(math.hypot(x1 - x0, y1 - y0) / st)))
+        else:
+            x1, y1, n = x0, y0, 1
+        for k in range(n):
+            px = x0 + (x1 - x0) * k / n
+            py = y0 + (y1 - y0) * k / n
+            if math.hypot(px - ex, py - ey) < join_skip:
+                continue
+            for sg, bx0, by0, bx1, by1 in boxes:
+                if (px < bx0 - best or px > bx1 + best
+                        or py < by0 - best or py > by1 + best):
+                    continue
+                d = _dist_point_to_segment_exact(px, py, sg)
+                if d < best:
+                    best = d
+                    if best <= 0.0:
+                        return 0.0
     return best
 
 
@@ -414,6 +452,19 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
                 continue
         
         is_own = (cid == own_geom_id)
+        # ЗАЗОР до своего контура уже померен ТОЧНО, выше. Старая мера
+        # здесь брала ОСЕВУЮ и требовала от неё радиус инструмента ×1.2
+        # (0.78 вместо 0.65), освобождая только «рядом по контуру». На
+        # мелкой окружности рядом ВСЁ: лид идёт внутри неё, и осевая
+        # почти везде ближе 0.78 к стенке. Поэтому на 124173 пятнадцать
+        # совершенно чистых заходов (зазор ровно 0.650) горели красным —
+        # все на кругах и скруглённых элементах (было и до v1.7.63).
+        #
+        # А вот ПЕРЕСЕЧЕНИЕ со своим контуром здесь остаётся: это
+        # отдельное и дешёвое условие, и оно ловит то, что замер зазора
+        # пропускает (осевая лида перелезает через контур, а путь фрезы
+        # при этом проходит в стороне).
+        _own_skip_distance = (is_own and own_exact is not None)
         # ── ПРОПУСК ПО ДЛИНЕ ВДОЛЬ КОНТУРА (v1.7.16) ──
         # На своём контуре нельзя пропускать сегменты по ЕВКЛИДОВУ
         # расстоянию от точки стыковки: на мелком элементе
@@ -467,12 +518,22 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
                 if _segments_intersect_2d(la, lb, ca, cb):
                     if _near_join:
                         # У самой точки стыковки лид и контур сходятся —
-                        # это касание, а не пересечение. Игнорируем только
-                        # его, в пределах JOIN_TOUCH_MM.
-                        _mx = (la[0] + lb[0]) * 0.5
-                        _my = (la[1] + lb[1]) * 0.5
-                        if math.hypot(_mx - entry_point[0],
-                                      _my - entry_point[1]) < JOIN_TOUCH_MM:
+                        # это касание, а не пересечение.
+                        #
+                        # Мерить надо расстояние от стыка до САМОГО
+                        # отрезка, а не до его середины, и окно брать не
+                        # меньше шага ломаной (v1.7.64). Лид режется на
+                        # хорды до 0.3 мм, значит середина ближайшего к
+                        # стыку отрезка отстоит от него на ~0.15 мм — а
+                        # окно было 0.08. На ПРЯМОЙ стенке это сходило с
+                        # рук: касательный лид её не пересекает. А на
+                        # КРУГЕ хорда лида и хорда контура загибаются в
+                        # разные стороны и честно пересекаются у стыка —
+                        # и все заходы на кругах горели красным, хотя
+                        # зазор у них ровно в норме (0.650 при нужных
+                        # 0.650). На 124173 таких было 14 из 124.
+                        if _point_to_segment_distance(
+                                entry_point, la, lb) < _JOIN_SEG_MM:
                             continue
                     return True
                 # 2. Distance-check (внутри зоны эквидистанты соседа) — 
@@ -481,7 +542,7 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
                 # На своём это ловит случай когда lead-line проходит близко 
                 # к своей же offset-toolpath на противоположной стороне 
                 # выпуклого изгиба (тангенс срезает материал).
-                if _near_join:
+                if _near_join or _own_skip_distance:
                     continue
                 if is_own and own_strict:
                     _mx = (la[0] + lb[0]) * 0.5
