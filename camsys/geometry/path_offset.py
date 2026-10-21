@@ -5166,29 +5166,56 @@ def pocket_fragment_with_gentle_ends(parent: Polypath, s0: float, s1: float,
     total = sum(x.length() for x in parent.segments)
     if total <= 0:
         return []
-    # Предел продления по каждому концу отдельно (v1.7.65). У куска,
-    # обрезанного по ширине щели, предел нулевой: продлить такой конец —
-    # значит вернуть фрезу ровно в ту щель, из-за которой кусок и обрезан.
-    pb = pad_max_mm if pad_before_max is None else max(0.0, pad_before_max)
-    pa = pad_max_mm if pad_after_max is None else max(0.0, pad_after_max)
-    ceiling = max(pb, pa)
+    # ── КАЖДЫЙ КОНЕЦ ПОДБИРАЕТСЯ ОТДЕЛЬНО (v1.7.65) ──
+    # Свободный конец кармана ищет пологое место НАРУЖУ, как и раньше.
+    # А конец, появившийся от обрезки по ширине щели, наружу двигать
+    # нельзя — там ровно та щель, из-за которой кусок и обрезан. Такой
+    # конец отступает ВНУТРЬ куска: лид всё равно должен начинаться на
+    # пологом, иначе заход сходит с бугра прямо в лезвие.
+    free_head = pad_max_mm if pad_before_max is None else max(
+        0.0, pad_before_max)
+    free_tail = pad_max_mm if pad_after_max is None else max(
+        0.0, pad_after_max)
+    run = (s1 - s0) % total
+    shrink_max = min(1.5, run * 0.4)
 
-    def _cut(p):
-        return _subpath_forward(parent, (s0 - min(p, pb)) % total,
-                                (s1 + min(p, pa)) % total)
+    def _frag(dh, dt):
+        return _subpath_forward(parent, (s0 - dh) % total, (s1 + dt) % total)
 
-    pad = pad_mm
-    segs = _cut(pad)
-    while pad < ceiling:
+    def _gentle(segs, head: bool) -> bool:
         if not segs:
+            return False
+        try:
+            return end_curvature_radius(
+                Polypath(segments=segs, closed=False), head) >= r_min_mm
+        except Exception:
+            return False
+
+    def _steps(free):
+        start = pad_mm if free > 0 else 0.0
+        out = [start]
+        d = start + 0.5
+        while d <= free + 1e-9:
+            out.append(d)
+            d += 0.5
+        d = start - 0.25
+        while d >= -shrink_max - 1e-9:
+            out.append(d)
+            d -= 0.25
+        return out
+
+    head_steps = _steps(free_head)
+    tail_steps = _steps(free_tail)
+    dh, dt = head_steps[0], tail_steps[0]
+    for d in head_steps:
+        if _gentle(_frag(d, dt), True):
+            dh = d
             break
-        frag = Polypath(segments=segs, closed=False)
-        if (end_curvature_radius(frag, True) >= r_min_mm
-                and end_curvature_radius(frag, False) >= r_min_mm):
+    for d in tail_steps:
+        if _gentle(_frag(dh, d), False):
+            dt = d
             break
-        pad = min(pad + 0.5, ceiling)
-        segs = _cut(pad)
-    return segs
+    return _frag(dh, dt)
 
 
 # ════════════════════════════════════════════════════════════════════════
