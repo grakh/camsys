@@ -2528,6 +2528,102 @@ def _exact_axis_points(polypath: Polypath, step: float):
     return out, cum
 
 
+def pocket_runs_where_tool_fits(parent: Polypath, s0: float, s1: float,
+                                cut_width: float,
+                                min_clearance_mm: float = 0.030,
+                                min_run_mm: float = 0.8,
+                                min_contour_separation_mm: float = 2.0,
+                                step_mm: float = 0.02
+                                ) -> List[Tuple[float, float]]:
+    """Куски проточки кармана, где тонкая фреза реально проходит (v1.7.65).
+
+    Карман — это провал контура, куда не влезла основная фреза. Но он
+    может сузиться и под ТОНКУЮ: на 124173, Knife_3, щель 13.1 мм
+    сходится с 1.451 до 1.068 мм при ширине реза T3 1.10, а дальше, за
+    бугром, вырождается в остриё 0.100 мм. Проточка шла насквозь, и путь
+    фрезы пересекал сам себя — фреза идёт по одной стенке и срезает
+    противоположную, по 16 мкм на стенку в перешейке и по-крупному у
+    острия.
+
+    Стойка такое не ловит: её компенсация смотрит только соседние кадры,
+    а тут пересекаются участки, разнесённые вдоль контура на 5.8 и
+    9.5 мм.
+
+    Критерий тот же, что у основного прохода
+    (`find_tool_clearance_issues`): зазор = расстояние между вершинами
+    лезвия ДВУХ РАЗНЫХ участков минус ширина реза, и «разных» — значит
+    разнесённых вдоль контура больше `min_contour_separation_mm`. Эта
+    развязка принципиальна: в остром углу стенки сходятся вплотную, но
+    они РЯДОМ по контуру, компенсация стойки срезает такую петлю сама, и
+    трогать угловые фрагменты нельзя — иначе доработка угла исчезнет
+    вовсе. На 124173 петли Knife_1, Knife_19 и Knife_11 разнесены на
+    0.09…0.24 мм (остриё, норма), а Knife_3 — на 5.8 и 9.5 мм (щель).
+
+    Args:
+        parent: родительский контур, уже нормализованный под свою сторону.
+        s0, s1: границы кармана вдоль контура (по ходу обхода, возможен
+            переход через ноль).
+        cut_width: ширина реза тонкой фрезы (её ЭКВИДИСТАНТА), мм.
+        min_clearance_mm: запас сверх ширины реза, как у основного
+            прохода.
+        min_run_mm: куски короче не отдаём — лид к ним не прицепить.
+
+    Returns:
+        [(a, b)] — границы кусков вдоль контура, по ходу обхода от s0.
+        Пустой список — фреза не проходит нигде.
+    """
+    if not parent or not parent.segments or cut_width <= 0:
+        return []
+    pts, total = _exact_axis_points(parent, step_mm)
+    if not pts or total <= 0:
+        return []
+    span = (s1 - s0) % total
+    if span <= 1e-9:
+        return []
+    reach = cut_width + max(0.0, min_clearance_mm)
+    cell = max(reach, 1e-6)
+    grid: dict = {}
+    for k, (_s, q) in enumerate(pts):
+        grid.setdefault((int(q[0] / cell), int(q[1] / cell)), []).append(k)
+
+    inside = [(((s - s0) % total), s, p) for (s, p) in pts
+              if ((s - s0) % total) <= span]
+    inside.sort(key=lambda z: z[0])
+
+    runs: List[Tuple[float, float]] = []
+    cur_from = None
+    prev_s = None
+    for u, s, p in inside:
+        gx, gy = int(p[0] / cell), int(p[1] / cell)
+        ok = True
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for k in grid.get((gx + dx, gy + dy), ()):
+                    s2, q = pts[k]
+                    ds = abs(s2 - s)
+                    ds = min(ds, total - ds)
+                    if ds < min_contour_separation_mm:
+                        continue
+                    if math.hypot(q[0] - p[0], q[1] - p[1]) < reach:
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if not ok:
+                break
+        if ok:
+            if cur_from is None:
+                cur_from = s
+            prev_s = s
+        elif cur_from is not None:
+            runs.append((cur_from, prev_s))
+            cur_from = None
+    if cur_from is not None:
+        runs.append((cur_from, prev_s))
+
+    return [(a, b) for (a, b) in runs if ((b - a) % total) >= min_run_mm]
+
+
 def find_tool_clearance_issues(polypath: Polypath, cut_width: float,
                                min_clearance_mm: float = 0.030,
                                min_contour_separation_mm: float = 2.0,
@@ -5049,7 +5145,9 @@ def end_curvature_radius(polypath: Polypath, at_start: bool) -> float:
 def pocket_fragment_with_gentle_ends(parent: Polypath, s0: float, s1: float,
                                      pad_mm: float = 0.5,
                                      r_min_mm: float = 1.5,
-                                     pad_max_mm: float = 5.0):
+                                     pad_max_mm: float = 5.0,
+                                     pad_before_max: Optional[float] = None,
+                                     pad_after_max: Optional[float] = None):
     """Фрагмент кармана, продлённый до ПОЛОГИХ концов (v1.7.47).
 
     Лид доработки начинается на краю фрагмента. Если край попал на бугор
@@ -5068,17 +5166,28 @@ def pocket_fragment_with_gentle_ends(parent: Polypath, s0: float, s1: float,
     total = sum(x.length() for x in parent.segments)
     if total <= 0:
         return []
+    # Предел продления по каждому концу отдельно (v1.7.65). У куска,
+    # обрезанного по ширине щели, предел нулевой: продлить такой конец —
+    # значит вернуть фрезу ровно в ту щель, из-за которой кусок и обрезан.
+    pb = pad_max_mm if pad_before_max is None else max(0.0, pad_before_max)
+    pa = pad_max_mm if pad_after_max is None else max(0.0, pad_after_max)
+    ceiling = max(pb, pa)
+
+    def _cut(p):
+        return _subpath_forward(parent, (s0 - min(p, pb)) % total,
+                                (s1 + min(p, pa)) % total)
+
     pad = pad_mm
-    segs = _subpath_forward(parent, (s0 - pad) % total, (s1 + pad) % total)
-    while pad < pad_max_mm:
+    segs = _cut(pad)
+    while pad < ceiling:
         if not segs:
             break
         frag = Polypath(segments=segs, closed=False)
         if (end_curvature_radius(frag, True) >= r_min_mm
                 and end_curvature_radius(frag, False) >= r_min_mm):
             break
-        pad = min(pad + 0.5, pad_max_mm)
-        segs = _subpath_forward(parent, (s0 - pad) % total, (s1 + pad) % total)
+        pad = min(pad + 0.5, ceiling)
+        segs = _cut(pad)
     return segs
 
 
@@ -5135,9 +5244,16 @@ def rework_fragment(geom, op, pass_side_name: str,
     if 'pocket_s0' in at:
         par = normalize_for_side(parent, at.get('pocket_side', 'OUTSIDE'))
         segs = pocket_fragment_with_gentle_ends(
-            par, float(at['pocket_s0']), float(at['pocket_s1']), pad_mm=0.5)
+            par, float(at['pocket_s0']), float(at['pocket_s1']), pad_mm=0.5,
+            pad_before_max=at.get('pocket_pad_before_max'),
+            pad_after_max=at.get('pocket_pad_after_max'))
         if not segs:
             return None
+        if log is not None and at.get('pocket_lost_mm'):
+            log(f"КАРМАН ОБРЕЗАН: {float(at['pocket_lost_mm']):.2f} мм "
+                f"не снять — щель уже ширины реза "
+                f"{float(at.get('pocket_cut_width', 0.0)):.2f} мм; "
+                f"фреза там срезала бы противоположную стенку")
         # Разворачивать нечего: вырезано из контура, уже нормализованного
         # под свой проход.
         return Polypath(segments=segs, closed=False)

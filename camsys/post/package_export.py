@@ -812,7 +812,8 @@ class PackageExporter:
         from ..geometry.path_offset import (bridge_narrow_pits,
                                             bridge_radii_for_tool,
                                             _subpath_forward,
-                                            _exact_axis_points)
+                                            _exact_axis_points,
+                                            pocket_runs_where_tool_fits)
         from ..geometry.primitives import Polypath
         from ..geometry.direction import normalize_for_side
         import math as _m
@@ -833,6 +834,11 @@ class PackageExporter:
         r_mouth, r_bridge = bridge_radii_for_tool(
             tip, bottom, tool_eq,
             margin=float(getattr(self.params, 'machinable_margin', 0.02)))
+        # Ширина реза ТОНКОЙ фрезы — по ней режется карман на куски.
+        _cut_w = (float(getattr(self.params, 'corner_tip_diameter', 0.6)
+                        or 0.6)
+                  + 2.0 * bottom * _m.tan(
+                      _m.radians(float(self.params.knife_angle) / 2.0)))
 
         for blade_op in blade_ops:
             if not blade_op.geometry_ids:
@@ -852,7 +858,33 @@ class PackageExporter:
                     continue
                 total = sum(x.length() for x in pp.segments)
                 for b_idx, br in enumerate(bridges):
-                    s0, s1 = br['sA'], br['sB']
+                  # ── КАРМАН РЕЖЕТСЯ НА КУСКИ, ГДЕ ФРЕЗА ВЛЕЗАЕТ (v1.7.65) ──
+                  # Карман — это провал, куда не прошла ОСНОВНАЯ фреза. Но он
+                  # может сузиться и под ТОНКУЮ: на 124173, Knife_3 щель
+                  # 12.13 мм сходится с 1.451 до 1.068 при ширине реза T3
+                  # 1.10, а за бугром вырождается в остриё 0.100. Проточка
+                  # шла насквозь, и путь фрезы пересекал сам себя — она идёт
+                  # по одной стенке и срезает противоположную. Стойка такое
+                  # не ловит: её компенсация смотрит только соседние кадры, а
+                  # тут пересекаются участки, разнесённые по контуру на 5.8 и
+                  # 9.5 мм.
+                  #
+                  # Каждый кусок — отдельная операция со своими лидами;
+                  # ниже по течению (пост, вьювер, проверки) ничего менять не
+                  # пришлось. Концы, появившиеся от обрезки, НЕ удлиняются до
+                  # пологого места — иначе продление вернёт фрезу ровно в ту
+                  # щель, из-за которой кусок и обрезан.
+                  _runs = pocket_runs_where_tool_fits(
+                      pp, br['sA'], br['sB'], _cut_w,
+                      min_clearance_mm=float(getattr(
+                          self.params, 'min_tool_clearance_mm', 0.030)))
+                  _span = (br['sB'] - br['sA']) % total
+                  _lost = _span - sum((b - a) % total for a, b in _runs)
+                  for _ri, (_r0, _r1) in enumerate(_runs):
+                    s0, s1 = _r0, _r1
+                    _clipped_head = abs((s0 - br['sA']) % total) > 1e-6
+                    _clipped_tail = abs((br['sB'] - s1) % total) > 1e-6
+                    _suffix = (f".{_ri + 1}" if len(_runs) > 1 else "")
                     try:
                         sub = _subpath_forward(pp, s0, s1)
                         pts = [q for _s, q in _exact_axis_points(
@@ -869,7 +901,7 @@ class PackageExporter:
                         prog_z_depth=0.3,
                     )
                     op = Operation(
-                        name=f"{blade_op.name} карман #{b_idx + 1}",
+                        name=f"{blade_op.name} карман #{b_idx + 1}{_suffix}",
                         kind=OperationKind.CORNER_REWORK,
                         geometry_ids=[geom_id],
                         settings=settings,
@@ -882,6 +914,14 @@ class PackageExporter:
                     op.attributes['pocket_s1'] = s1
                     op.attributes['pocket_skip'] = br['skip']
                     op.attributes['pocket_total'] = total
+                    # Обрезанный конец продлевать нельзя — вернёмся в щель.
+                    if _clipped_head:
+                        op.attributes['pocket_pad_before_max'] = 0.0
+                    if _clipped_tail:
+                        op.attributes['pocket_pad_after_max'] = 0.0
+                    if _lost > 1e-6:
+                        op.attributes['pocket_lost_mm'] = _lost
+                        op.attributes['pocket_cut_width'] = _cut_w
                     op.attributes['corner_apex'] = (
                         pts[len(pts) // 2] if pts else br['A'])
                     op.attributes['corner_side'] = side_name
