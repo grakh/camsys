@@ -882,8 +882,15 @@ class PackageExporter:
                   _lost = _span - sum((b - a) % total for a, b in _runs)
                   for _ri, (_r0, _r1) in enumerate(_runs):
                     s0, s1 = _r0, _r1
-                    _clipped_head = abs((s0 - br['sA']) % total) > 1e-6
-                    _clipped_tail = abs((br['sB'] - s1) % total) > 1e-6
+                    # Конец считается обрезанным, только если он реально
+                    # уехал внутрь. Допуск 0.1 мм — цена шага выборки:
+                    # первая и последняя точки диапазона почти всегда
+                    # выпадают, и без допуска «обрезанными» оказывались ВСЕ
+                    # концы, включая исходные устья кармана. Тогда ни один
+                    # конец не мог продлиться до пологого места, как делал
+                    # до обрезки, и лиды садились куда попало.
+                    _clipped_head = ((s0 - br['sA']) % total) > 0.1
+                    _clipped_tail = ((br['sB'] - s1) % total) > 0.1
                     _suffix = (f".{_ri + 1}" if len(_runs) > 1 else "")
                     try:
                         sub = _subpath_forward(pp, s0, s1)
