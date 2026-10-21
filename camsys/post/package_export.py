@@ -876,9 +876,33 @@ class PackageExporter:
                   # щель, из-за которой кусок и обрезан.
                   _runs = pocket_runs_where_tool_fits(
                       pp, br['sA'], br['sB'], _cut_w,
-                      min_clearance_mm=float(getattr(
-                          self.params, 'min_tool_clearance_mm', 0.030)))
+                      # Порог тут по ФАКТУ, без запаса: режем всё, куда
+                      # фреза физически проходит. Запас 30 мкм, которым
+                      # основной проход бракует узкие места, здесь выкинул
+                      # бы карман Knife_19 целиком — 15.9 мм при щели
+                      # 1.119 и резе 1.10, то есть проходимой.
+                      min_clearance_mm=0.0)
                   _span = (br['sB'] - br['sA']) % total
+                  _lost = _span - sum((b - a) % total for a, b in _runs)
+                  # ── К КУСКУ С ОБРЕЗАННЫМ КОНЦОМ НЕ ПОДОЙТИ ──
+                  # Лид строится НАРУЖУ от конца фрагмента — то есть ровно
+                  # в ту щель, из-за которой конец и обрезан. Места там
+                  # нет: при щели 1.1…1.4 мм и ширине реза 1.10 остаётся
+                  # 0.2 мм, а лиду под 45° нужно около полутора
+                  # миллиметров. Замер подтвердил: куски с обрезанными
+                  # концами дали лиды, задевающие лезвие на 143…160 мкм
+                  # вместо прежних 119.
+                  #
+                  # Правильный ответ — у такого конца лида не строить
+                  # вовсе, фреза опускается на месте: кромка там всё равно
+                  # недоделана. Но пост сейчас берёт параметры лида из
+                  # настроек, а не из тулпаса, и выключателя у конца нет
+                  # (пункт 4 очереди). Пока его нет, такой кусок НЕ
+                  # РЕЖЕТСЯ: оставить металл можно, зарезать лезвие —
+                  # нельзя.
+                  _runs = [(a, b) for (a, b) in _runs
+                           if ((a - br['sA']) % total) <= 0.3
+                           and ((br['sB'] - b) % total) <= 0.3]
                   _lost = _span - sum((b - a) % total for a, b in _runs)
                   for _ri, (_r0, _r1) in enumerate(_runs):
                     s0, s1 = _r0, _r1
@@ -889,8 +913,8 @@ class PackageExporter:
                     # концы, включая исходные устья кармана. Тогда ни один
                     # конец не мог продлиться до пологого места, как делал
                     # до обрезки, и лиды садились куда попало.
-                    _clipped_head = ((s0 - br['sA']) % total) > 0.1
-                    _clipped_tail = ((br['sB'] - s1) % total) > 0.1
+                    _clipped_head = ((s0 - br['sA']) % total) > 0.3
+                    _clipped_tail = ((br['sB'] - s1) % total) > 0.3
                     _suffix = (f".{_ri + 1}" if len(_runs) > 1 else "")
                     try:
                         sub = _subpath_forward(pp, s0, s1)
@@ -934,18 +958,30 @@ class PackageExporter:
                     op.attributes['corner_side'] = side_name
                     _side = (ContourSide.INSIDE if side_name == 'INSIDE'
                              else ContourSide.OUTSIDE)
+                    # ── У ОБРЕЗАННОГО КОНЦА ЛИДА НЕТ ──
+                    # Лид уходит НАРУЖУ от конца фрагмента — то есть ровно
+                    # в ту щель, из-за которой конец и обрезан. Места там
+                    # нет: при щели 1.1…1.4 мм и ширине реза 1.10 остаётся
+                    # 0.2 мм, а лиду под 45° нужно около полутора
+                    # миллиметров. Замер это подтвердил: после обрезки
+                    # лиды доработки стали задевать лезвие на 143…160 мкм
+                    # вместо 119.
+                    #
+                    # На обрезанном конце кромка всё равно недоделана —
+                    # металл там остаётся, — поэтому заходить туда плавно
+                    # незачем. Фреза опускается на месте.
                     tp = ToolPath(
                         geometry_id=geom_id,
                         side=_side,
                         entry=EntryExitConfig(
-                            enabled=True,
+                            enabled=not _clipped_head,
                             style=LeadStyle.LINE_ARC_TANGENTIAL,
                             line_length_x_tool_rad=1.0,
                             arc_radius_x_tool_rad=1.0,
                             approach_angle=45.0,
                         ),
                         exit=EntryExitConfig(
-                            enabled=True,
+                            enabled=not _clipped_tail,
                             style=LeadStyle.LINE_ARC_TANGENTIAL,
                             line_length_x_tool_rad=1.0,
                             arc_radius_x_tool_rad=1.0,
