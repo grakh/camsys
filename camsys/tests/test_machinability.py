@@ -906,6 +906,12 @@ def test_pocket_gets_full_t3_groove():
     только УГЛОВАЯ операция, а она строится вокруг найденного угла с
     запасом 1.5 мм, поэтому карман длиной 20 мм покрывала едва на
     десятую часть — «проточил не весь карман».
+
+    С v1.7.65 «весь карман» значит «весь, КУДА ФРЕЗА ВЛЕЗАЕТ». Карман
+    может сузиться и под тонкую фрезу: у Knife_3 щель сходится с 1.451
+    до 1.068 мм при резе T3 1.10, и проточка насквозь шла по одной
+    стенке, срезая противоположную. Такой карман не точится совсем —
+    оставить металл можно, зарезать лезвие нельзя.
     """
     ai = '/mnt/user-data/uploads/124173_test.ai'
     if not os.path.exists(ai):
@@ -929,8 +935,16 @@ def test_pocket_gets_full_t3_groove():
     ops, _ = PackageExporter(project, params)._build_corner_operations()
     pits = [o for o in ops if 'pocket_s0' in o.attributes]
     print(f'  проточек карманов: {len(pits)}')
-    # На этом заказе карманов шесть — те же, что обрезает пост
-    assert len(pits) == 6, f'проточек {len(pits)}, ожидалось 6'
+    # На этом заказе карманов шесть, но у Knife_3 щель сходится до
+    # 1.068 мм при ширине реза T3 1.10 — туда фреза не влезает, и
+    # проточки там нет вовсе (v1.7.65). Остальные пять — есть.
+    names = sorted(
+        getattr(project.get_geometry(o.geometry_ids[0]), 'name', '?')
+        for o in pits)
+    assert len(pits) == 5, f'проточек {len(pits)}, ожидалось 5: {names}'
+    assert 'Knife_3' not in names, (
+        'карман Knife_3 проточен, хотя T3 туда не проходит: щель 1.068 '
+        'при резе 1.10 — фреза срезала бы противоположную стенку')
 
     for op in pits:
         geom = project.get_geometry(op.geometry_ids[0])
@@ -948,6 +962,97 @@ def test_pocket_gets_full_t3_groove():
             f'короче кармана {skip:.2f} мм')
         assert op.toolpaths and op.toolpaths[0].side.name == side, (
             'проточка попала не на тот проход')
+
+
+def test_rework_path_never_crosses_itself_far_from_the_tip():
+    """Путь доработки не пересекает сам себя между ДАЛЁКИМИ участками.
+
+    Такое пересечение — не картинка, а зарез: фреза идёт по одной стенке
+    щели и срезает противоположную. Стойка это НЕ ловит, её компенсация
+    смотрит только соседние кадры.
+
+    Петля в самом острие угла — другое дело: там стенки сходятся
+    вплотную, но они РЯДОМ по контуру, и компенсация стойки срезает
+    такую петлю сама. Поэтому разнос вдоль пути и есть критерий: ближе
+    двух миллиметров — остриё, норма; дальше — щель, брак.
+
+    На v1.7.64 падает: карман Knife_3 заказа 124173 даёт две петли с
+    разносом 5.79 и 9.45 мм. Щель там сходится до 1.068 мм при ширине
+    реза T3 1.10.
+    """
+    ai = '/mnt/user-data/uploads/124173_test.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет 124173_test.ai')
+        return
+    import camsys.post.mtx_anderson  # noqa: F401
+    import camsys.core.importer as importer_mod
+    import camsys.core.macros as macros_mod
+    from camsys.core.cutting_macro import CuttingMacroParams
+    from camsys.post.package_export import PackageExporter
+    from camsys.geometry.path_offset import rework_fragment, _exact_axis_points
+
+    project = importer_mod.import_ai_to_project(ai)
+    for geom in project.get_layer_by_name("Knife").geometries:
+        project.add_blade_operation(geom.id)
+    macros_mod.sort_operations_by_grid(project)
+    params = CuttingMacroParams()
+    params.knife_angle, params.tip_diameter, params.bottom = 90.0, 0.8, 0.25
+    main_half = (params.tip_diameter
+                 + 2.0 * params.bottom * math.tan(math.radians(45.0))) / 2.0
+    t3_half = (float(getattr(params, 'corner_tip_diameter', 0.6))
+               + 2.0 * params.bottom * math.tan(math.radians(45.0))) / 2.0
+    ops2d, ops3d = PackageExporter(project, params)._build_corner_operations()
+
+    def _cross(a, b, c, d):
+        def cr(o, q, r):
+            return ((q[0] - o[0]) * (r[1] - o[1])
+                    - (q[1] - o[1]) * (r[0] - o[0]))
+        return (((cr(c, d, a) > 0) != (cr(c, d, b) > 0))
+                and ((cr(a, b, c) > 0) != (cr(a, b, d) > 0)))
+
+    bad = []
+    for op in ops2d + ops3d:
+        at = op.attributes or {}
+        geom = project.get_geometry(at.get('parent_geom_id'))
+        if geom is None:
+            continue
+        for tp in op.toolpaths:
+            frag = rework_fragment(geom, op, tp.side.name, main_half)
+            if frag is None or not frag.segments:
+                continue
+            pts = [q for _s, q in _exact_axis_points(frag, 0.03)[0]]
+            run = [0.0]
+            for i in range(1, len(pts)):
+                run.append(run[-1] + math.hypot(pts[i][0] - pts[i - 1][0],
+                                                pts[i][1] - pts[i - 1][1]))
+            cut, cut_s = [], []
+            for i in range(len(pts) - 1):
+                x0, y0 = pts[i]
+                x1, y1 = pts[i + 1]
+                dx, dy = x1 - x0, y1 - y0
+                d = math.hypot(dx, dy)
+                if d < 1e-9:
+                    continue
+                cut.append((x0 + dy / d * t3_half, y0 - dx / d * t3_half))
+                cut_s.append(run[i])
+            for i in range(len(cut) - 1):
+                for j in range(i + 3, len(cut) - 1):
+                    if cut_s[j] - cut_s[i] < 2.0:
+                        continue
+                    if _cross(cut[i], cut[i + 1], cut[j], cut[j + 1]):
+                        bad.append((op.name, cut_s[j] - cut_s[i], cut[i]))
+                        break
+                if bad and bad[-1][0] == op.name:
+                    break
+
+    print(f'  фрагментов доработки {len(ops2d) + len(ops3d)}; '
+          f'петель между далёкими участками: {len(bad)}')
+    for name, gap, q in bad[:5]:
+        print(f'    {name}: разнос {gap:.2f} мм у '
+              f'({q[0]:.2f},{q[1]:.2f})')
+    assert not bad, (
+        'путь доработки режет сам себя: '
+        + '; '.join(f'{n} (разнос {g:.2f} мм)' for n, g, _ in bad[:3]))
 
 
 def test_pocket_groove_lead_enters_from_cut_side():
