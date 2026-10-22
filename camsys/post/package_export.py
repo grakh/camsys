@@ -813,7 +813,8 @@ class PackageExporter:
                                             bridge_radii_for_tool,
                                             _subpath_forward,
                                             _exact_axis_points,
-                                            pocket_runs_where_tool_fits)
+                                            pocket_runs_where_tool_fits,
+                                            contour_proximity_index)
         from ..geometry.primitives import Polypath
         from ..geometry.direction import normalize_for_side
         import math as _m
@@ -857,6 +858,8 @@ class PackageExporter:
                 if not bridges:
                     continue
                 total = sum(x.length() for x in pp.segments)
+                # Сетка «что рядом» — один раз на контур, не на карман.
+                _prox = contour_proximity_index(pp, _cut_w)
                 for b_idx, br in enumerate(bridges):
                   # ── КАРМАН РЕЖЕТСЯ НА КУСКИ, ГДЕ ФРЕЗА ВЛЕЗАЕТ (v1.7.65) ──
                   # Карман — это провал, куда не прошла ОСНОВНАЯ фреза. Но он
@@ -881,7 +884,7 @@ class PackageExporter:
                       # основной проход бракует узкие места, здесь выкинул
                       # бы карман Knife_19 целиком — 15.9 мм при щели
                       # 1.119 и резе 1.10, то есть проходимой.
-                      min_clearance_mm=0.0)
+                      min_clearance_mm=0.0, index=_prox)
                   _span = (br['sB'] - br['sA']) % total
                   _lost = _span - sum((b - a) % total for a, b in _runs)
                   # ── К КУСКУ С ОБРЕЗАННЫМ КОНЦОМ НЕ ПОДОЙТИ ──

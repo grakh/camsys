@@ -2528,12 +2528,33 @@ def _exact_axis_points(polypath: Polypath, step: float):
     return out, cum
 
 
+def contour_proximity_index(parent: Polypath, reach: float,
+                            step_mm: float = 0.05):
+    """Сетка точек контура для поиска «что рядом» (v1.7.65).
+
+    Считается ОДИН раз на контур и переиспользуется всеми карманами
+    этого ножа: пересчёт на каждый карман стоил столько, что модуль
+    машинируемости перестал укладываться в свой потолок времени.
+
+    Returns:
+        (pts, total, grid, cell) — точки с длиной вдоль контура, полная
+        длина, сетка индексов по ячейкам и размер ячейки.
+    """
+    pts, total = _exact_axis_points(parent, step_mm)
+    cell = max(reach, 1e-6)
+    grid: dict = {}
+    for k, (_s, q) in enumerate(pts):
+        grid.setdefault((int(q[0] / cell), int(q[1] / cell)), []).append(k)
+    return pts, total, grid, cell
+
+
 def pocket_runs_where_tool_fits(parent: Polypath, s0: float, s1: float,
                                 cut_width: float,
                                 min_clearance_mm: float = 0.030,
                                 min_run_mm: float = 0.8,
                                 min_contour_separation_mm: float = 2.0,
-                                step_mm: float = 0.02
+                                step_mm: float = 0.05,
+                                index=None
                                 ) -> List[Tuple[float, float]]:
     """Куски проточки кармана, где тонкая фреза реально проходит (v1.7.65).
 
@@ -2574,17 +2595,15 @@ def pocket_runs_where_tool_fits(parent: Polypath, s0: float, s1: float,
     """
     if not parent or not parent.segments or cut_width <= 0:
         return []
-    pts, total = _exact_axis_points(parent, step_mm)
+    reach = cut_width + max(0.0, min_clearance_mm)
+    if index is None:
+        index = contour_proximity_index(parent, reach, step_mm)
+    pts, total, grid, cell = index
     if not pts or total <= 0:
         return []
     span = (s1 - s0) % total
     if span <= 1e-9:
         return []
-    reach = cut_width + max(0.0, min_clearance_mm)
-    cell = max(reach, 1e-6)
-    grid: dict = {}
-    for k, (_s, q) in enumerate(pts):
-        grid.setdefault((int(q[0] / cell), int(q[1] / cell)), []).append(k)
 
     inside = [(((s - s0) % total), s, p) for (s, p) in pts
               if ((s - s0) % total) <= span]
