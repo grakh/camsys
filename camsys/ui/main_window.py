@@ -2513,9 +2513,19 @@ class MainWindow(QtWidgets.QMainWindow):
             # к контуру.
             tool_eq = tip + 2 * bottom * math.tan(math.radians(angle/2))
             
-            # Для CORNER операций используется тонкая фреза T3 (пятка 0.6мм)
+            # Для CORNER операций используется тонкая фреза T3
             # с пропорционально меньшей эквидистантой.
-            corner_tip = 0.6  # фреза T3 для углов 2D
+            #
+            # Пятка берётся ИЗ НАСТРОЕК (v1.7.66). Здесь стояло жёстко
+            # 0.6, и стоило поменять настройку — картинка и программа
+            # расходились: пост считал проточку и лиды по новой пятке, а
+            # вьювер рисовал по старой. Это тот же класс ошибки, что
+            # чинился в v1.7.58, только для тонкой фрезы.
+            corner_tip = float(
+                params.get('corner_tip_diameter', None)
+                or getattr(getattr(self.session, 'cutting_params', None),
+                           'corner_tip_diameter', None)
+                or 0.6)
             corner_tool_radius = corner_tip / 2.0
             corner_tool_eq = corner_tip + 2 * bottom * math.tan(math.radians(angle/2))
             

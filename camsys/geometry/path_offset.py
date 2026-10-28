@@ -5332,9 +5332,44 @@ def rework_fragment(geom, op, pass_side_name: str,
 
     # ── 2D-УГОЛ: фрагмент по индексам сегментов скругления ──
     if 'corner_first_idx' in at and 'corner_last_idx' in at:
+        # ── ПРИПУСК ОТ ОСТРОТЫ УГЛА, А НЕ КОНСТАНТОЙ (v1.7.66) ──
+        # Пользователь: «наплыв образуется при травлении и очень зависит
+        # от остроты угла, где плохо протравливается». Считать наплыв по
+        # геометрии нельзя — это химия, а не траектория. Но чем острее
+        # угол, тем дальше от вершины он тянется, и ровно так уже
+        # считается припуск 3D-углов. Здесь стояло плоское 1.5 мм на
+        # любой угол — отсюда и «корнер правильный, но маленький».
+        #
+        # Острота берётся из самого скругления: фаска поворачивает
+        # касательную на (180° − внутренний угол), значит угол =
+        # 180° минус развёртка дуг скругления.
+        _turn = 0.0
+        try:
+            _i0 = int(at['corner_first_idx'])
+            _i1 = int(at['corner_last_idx'])
+            _n = len(parent.segments)
+            _k = _i0
+            while True:
+                _sg = parent.segments[_k % _n]
+                if isinstance(_sg, Arc):
+                    _turn += abs(math.degrees(_arc_sweep(_sg)))
+                if _k % _n == _i1 % _n:
+                    break
+                _k += 1
+                if _k - _i0 > _n:
+                    break
+        except (TypeError, ValueError, IndexError, KeyError):
+            _turn = 0.0
+        _pad = 1.5
+        if 0.0 < _turn < 180.0:
+            _pad = corner_pad_for_angle(180.0 - _turn, main_tool_offset)
+            if log is not None and _pad > 1.55:
+                log(f"УГОЛ 2D {180.0 - _turn:.1f}°: припуск {_pad:.2f} мм "
+                    f"вместо прежних 1.50 — чем острее угол, тем дальше "
+                    f"от вершины тянется наплыв")
         frag = extract_subpath_around_indices(
             parent, at['corner_first_idx'], at['corner_last_idx'],
-            pad_mm=1.5)
+            pad_mm=_pad)
         if not frag or not frag.segments:
             return None
         # Направление — по намотке РОДИТЕЛЬСКОГО контура (v1.7.37).
