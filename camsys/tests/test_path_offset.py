@@ -785,7 +785,14 @@ def test_rework_fragment_is_one_function_with_the_post_pad():
                 encoding='utf-8').read()
 
     assert 'def rework_fragment(' in geo, 'общая функция участка пропала'
-    assert 'pad_mm=1.5' in geo, 'припуск 2D-угла не постовский'
+    # Припуск 2D-угла с v1.7.66 считается от ОСТРОТЫ, а не константой:
+    # наплыв от травления тем дальше тянется от вершины, чем острее
+    # угол. Прежние 1.5 мм остались нижней границей — на тупых углах
+    # ничего не изменилось. Тот же расчёт давно работает на 3D-углах.
+    assert 'corner_pad_for_angle(180.0 - _turn' in geo, \
+        'припуск 2D-угла снова стал константой'
+    assert 'min_pad_mm: float = 1.5' in geo, \
+        'нижняя граница припуска угла уехала с прежних 1.5 мм'
 
     for name, src in (('mtx_anderson.py', post), ('viewer_2d.py', view)):
         assert 'rework_fragment(' in src, \
