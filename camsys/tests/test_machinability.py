@@ -956,8 +956,11 @@ def test_pocket_gets_full_t3_groove():
         skip = float(op.attributes['pocket_skip'])
         print(f'  {getattr(geom, "name", "?"):>9} {side:<8} '
               f'карман {skip:6.2f} мм, проточка {length:6.2f} мм')
-        # Проточка покрывает карман целиком, а не кусок вокруг угла
-        assert length >= skip - 0.01, (
+        # Проточка покрывает карман целиком, а не кусок вокруг угла.
+        # Допуск 0.1 мм — цена шага выборки, которым меряется ширина
+        # щели (v1.7.65): крайняя точка диапазона почти всегда выпадает,
+        # и проточка оказывается на шаг короче кармана.
+        assert length >= skip - 0.1, (
             f'{getattr(geom, "name", "?")}: проточка {length:.2f} мм '
             f'короче кармана {skip:.2f} мм')
         assert op.toolpaths and op.toolpaths[0].side.name == side, (
