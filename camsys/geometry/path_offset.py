@@ -5289,8 +5289,18 @@ def rework_fragment(geom, op, pass_side_name: str,
     # краю, и если край попал на бугор — заход сходит с него в лезвие.
     if 'pocket_s0' in at:
         par = normalize_for_side(parent, at.get('pocket_side', 'OUTSIDE'))
+        # ── СВОБОДНЫЙ КОНЕЦ ВЫХОДИТ ЗА ПЕРЕМЫЧКУ НА ДИАМЕТР РЕЗА ──
+        # Пользователь: «длина должна быть не меньше диаметра фрезы».
+        # Прежние 0.5 мм давали вот что: на Knife_11 перемычка 2.10,
+        # фрагмент 3.08, а режущего хода остаётся 1.61 — остальное
+        # съедает сам оффсет, потому что у острия щели радиус контура
+        # 0.37 при полуэквидистанте T3 0.55, и фреза туда не входит.
+        # Выходим за перемычку на полный диаметр реза: там основная
+        # фреза уже прошла, щель шире, и проточка перекрывает стык.
+        _pocket_pad = max(0.5, float(at.get('pocket_cut_width', 0.0) or 0.0))
         segs = pocket_fragment_with_gentle_ends(
-            par, float(at['pocket_s0']), float(at['pocket_s1']), pad_mm=0.5,
+            par, float(at['pocket_s0']), float(at['pocket_s1']),
+            pad_mm=_pocket_pad,
             pad_before_max=at.get('pocket_pad_before_max'),
             pad_after_max=at.get('pocket_pad_after_max'))
         if not segs:

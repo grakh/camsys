@@ -957,9 +957,9 @@ class PackageExporter:
                         op.attributes['pocket_pad_before_max'] = 0.0
                     if _clipped_tail:
                         op.attributes['pocket_pad_after_max'] = 0.0
+                    op.attributes['pocket_cut_width'] = _cut_w
                     if _lost > 1e-6:
                         op.attributes['pocket_lost_mm'] = _lost
-                        op.attributes['pocket_cut_width'] = _cut_w
                     op.attributes['corner_apex'] = (
                         pts[len(pts) // 2] if pts else br['A'])
                     op.attributes['corner_side'] = side_name
