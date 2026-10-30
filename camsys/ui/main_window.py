@@ -412,6 +412,21 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         self.bottom.setSingleStep(0.01); self.bottom.setValue(0.250)
         self.bottom.setToolTip("Глубина реза, абсолютная (ABS — absolute)")
         knife_form.addRow("ABS:", self.bottom)
+
+        # ── ПЯТКА ТОНКОЙ ФРЕЗЫ T3 (v1.7.67) ──
+        # Поле было только в настройках программы, в панели его не было:
+        # задать пятку из интерфейса было нечем. А решает она много —
+        # на 124173 карман Knife_3 с пяткой 0.6 (рез 1.10) не берётся
+        # вовсе, перешеек там 1.068; с пяткой 0.5 (рез 1.00) берётся
+        # целиком, одним проходом.
+        self.corner_tip = QtWidgets.QDoubleSpinBox()
+        self.corner_tip.setRange(0.1, 2.0); self.corner_tip.setDecimals(2)
+        self.corner_tip.setSingleStep(0.05); self.corner_tip.setValue(0.60)
+        self.corner_tip.setToolTip(
+            "Пятка тонкой фрезы T3 — ею дорабатываются углы и карманы.\n"
+            "Ширина её реза = пятка + 2 × ABS × tg(угол/2).\n"
+            "Чем меньше пятка, тем в более узкую щель фреза входит.")
+        knife_form.addRow("Пятка T3:", self.corner_tip)
         
         layout.addWidget(knife_group)
         
@@ -871,6 +886,7 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         return {
             'knife_angle': _angle_val,
             'tip_diameter': tip_value,
+            'corner_tip_diameter': self.corner_tip.value(),
             'top': _top_val,
             'bottom': self.bottom.value(),
             'direction': 'horizontal' if self.dir_horiz.isChecked() else 'vertical',
