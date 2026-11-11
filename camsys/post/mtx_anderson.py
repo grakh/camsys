@@ -573,8 +573,11 @@ class MtxAndersonGVM(PostProcessor):
                 shift_start_from_diagonal_zero, straight_entry_min_len)
             # Вход — на прямую, где можно (v1.7.72, ошибки стойки
             # Andersen на входе в дуге). Ручная правка ножа — как задал юзер.
-            _min_straight = (0.0 if _lead_ov_early else straight_entry_min_len(
-                options.extras.get('tool_equidistant', 1.3)))
+            # Только в «Авто»: в ручных режимах решает человек (v1.7.73).
+            from ..geometry.lead_inout import knife_is_auto
+            _min_straight = (straight_entry_min_len(
+                options.extras.get('tool_equidistant', 1.3))
+                if knife_is_auto(project, op) else 0.0)
             polypath = shift_start_from_diagonal_zero(
                 polypath, _override_offset, _min_straight)
         

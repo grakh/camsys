@@ -987,9 +987,10 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
             from ..geometry.path_offset import shift_start_from_diagonal_zero as _ssdz
             from ..geometry.path_offset import straight_entry_min_len as _seml
             # Вход на прямую, где можно (v1.7.72) — как в посте.
-            _min_straight_v = (0.0 if op.attributes.get('lead_override')
-                               else _seml(options_extras.get(
-                                   'tool_equidistant', 1.3)))
+            # Только в «Авто» (v1.7.73) — та же проверка, что в посте.
+            from ..geometry.lead_inout import knife_is_auto as _kia
+            _min_straight_v = (_seml(options_extras.get(
+                'tool_equidistant', 1.3)) if _kia(project, op) else 0.0)
             polypath = _ssdz(polypath, user_offset, _min_straight_v)
 
         # ── ОБРЕЗКА КАРМАНОВ (v1.7.35) ──

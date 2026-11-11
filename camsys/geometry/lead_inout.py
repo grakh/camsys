@@ -943,3 +943,19 @@ def auto_inner_lead_for_op(project, op, side_name: str, tip_diameter: float,
     if flags.get('length'):
         out['length'] = length
     return out or None
+
+
+def knife_is_auto(project, op) -> bool:
+    """Нож в автоматическом режиме: «Авто» и без ручной правки (v1.7.73).
+
+    Все правила подбора — вход на прямую, угол/длина внутреннего лида —
+    работают ТОЛЬКО здесь. В «Все элементы» и «Выделенные» решает
+    человек: «ручной режим — правила не работают».
+    """
+    attrs = getattr(project, 'attributes', None) or {}
+    try:
+        if int(attrs.get('lead_mode', 0)) != 0:
+            return False
+    except Exception:
+        return False
+    return not op.attributes.get('lead_override')

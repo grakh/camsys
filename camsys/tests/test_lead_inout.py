@@ -591,3 +591,60 @@ def test_lead_check_measures_cutter_like_the_control():
     for m in (1.0, 0.8, 0.6, 0.4, 0.2, 0.1):
         assert _inner_lead_fits(4.0, 45.0, m, 1.3), m
     assert not _inner_lead_fits(1.5, 90.0, 1.0, 1.3)
+
+
+def test_rules_only_in_auto_mode():
+    """«Ручной режим — правила не работают, пусть решает человек»
+    (v1.7.73): вход на прямую и автоподбор лида — только в «Авто» и без
+    ручной правки ножа."""
+    from camsys.geometry.lead_inout import knife_is_auto, auto_inner_lead_for_op
+    for mode, expect in ((0, True), (1, False), (2, False)):
+        prj = _two_knife_project(lead_mode=mode)
+        op = prj.operations[0]
+        assert knife_is_auto(prj, op) is expect, mode
+    prj = _two_knife_project(lead_mode=0)
+    op = prj.operations[0]
+    op.attributes['lead_override'] = {'lead_inside': {'offset': -2.0}}
+    assert not knife_is_auto(prj, op)
+    assert auto_inner_lead_for_op(prj, op, 'OUTSIDE', 0.8) is None
+
+
+def test_straight_entry_not_applied_in_manual_mode():
+    """Программа: нож с углом R10 справа вверху. В «Авто» вход уходит на
+    верхнюю прямую, в «Все элементы» остаётся там, где его ставят поля."""
+    from camsys.geometry.primitives import Line, Arc, Polypath
+    from camsys.core.project import Project, Geometry
+    from camsys.core.cutting_macro import CuttingMacroParams
+    from camsys.post.package_export import PackageExporter
+    import camsys.post.mtx_anderson  # noqa
+    import re
+
+    def prog(mode):
+        R, W, H = 10.0, 60.0, 40.0
+        pp = Polypath(segments=[
+            Line(a=(0, 0), b=(W, 0)), Line(a=(W, 0), b=(W, H - R)),
+            Arc(a=(W, H - R), b=(W - R, H), center=(W - R, H - R), ccw=True),
+            Line(a=(W - R, H), b=(0, H)), Line(a=(0, H), b=(0, 0))],
+            closed=True)
+        prj = Project(name="R10")
+        lay = prj.add_layer("Knife")
+        g = Geometry(name="Knife_1", polypath=pp, source_layer="Knife")
+        lay.geometries.append(g)
+        prj.add_blade_operation(g.id)
+        prj.attributes['lead_mode'] = mode
+        p = CuttingMacroParams()
+        p.knife_angle, p.tip_diameter, p.bottom = 90.0, 0.8, 0.25
+        p.lead_inside.offset = p.lead_outside.offset = -5.0
+        text = list(PackageExporter(prj, p).generate(
+            only_stages=('rough_all',)).values())[0]
+        # точка входа = конец дуги лида (;50,10)
+        pts = [tuple(map(float, re.findall(r'[XY](-?[\d.]+)', ln)[:2]))
+               for ln in text.splitlines() if ';50,10' in ln]
+        return pts
+
+    auto, manual = prog(0), prog(1)
+    assert auto and manual
+    for x, y in auto:
+        assert abs(y - 40.0) < 1e-3 and abs(x - 25.0) < 1e-3, (x, y)
+    for x, y in manual:
+        assert not (abs(y - 40.0) < 1e-3 and abs(x - 25.0) < 1e-3), (x, y)
