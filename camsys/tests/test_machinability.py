@@ -2566,3 +2566,36 @@ def test_rework_leads_keep_clearance_from_the_blade():
     assert worst >= half - 0.130, (
         f'лид доработки режет лезвие на {(half - worst) * 1000:.0f} мкм '
         f'{worst_at}: зазор {worst:.3f} при нужных {half:.3f}')
+
+
+def test_neck_bridged_with_large_tip():
+    """Knife_19 из 124173_test, пятка 1.2 (эквидистанта 1.7): шейка петли
+    1.2…1.7 мм — основная фреза не проходит, петля должна обрезаться
+    мостом. Окно поиска устья было жёстко 0.5 мм, а здесь до хорды
+    «диаметр минус запас» 0.60 мм — моста не было, и эквидистанта в шейке
+    пересекала сама себя (v1.7.75). При пятке 0.8 мост прежний."""
+    ai = '/mnt/user-data/uploads/124173_test.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет 124173_test.ai')
+        return
+    from camsys.core.session import CamSession
+    from camsys.geometry.path_offset import (
+        bridge_narrow_pits, bridge_radii_for_tool,
+        shift_start_from_diagonal_zero)
+    from camsys.geometry.direction import normalize_for_side
+    s = CamSession()
+    s.load_ai(ai)
+    g = [x for x in s.project.get_layer_by_name('Knife').geometries
+         if x.name == 'Knife_19'][0]
+    pp = shift_start_from_diagonal_zero(
+        normalize_for_side(g.polypath, 'OUTSIDE'), -5.0)
+    got = {}
+    for tip in (0.8, 1.2):
+        rm, rb = bridge_radii_for_tool(tip, 0.25, tip + 0.5, margin=0.02)
+        _o, br = bridge_narrow_pits(pp, rb, r_mouth=rm)
+        got[tip] = [round(b['skip'], 2) for b in br]
+        for b in br:
+            assert b.get('mouth_chord', 0) <= 2 * rm, b
+    print(f'  мосты: {got}')
+    assert got[0.8] == [15.93], got
+    assert len(got[1.2]) == 1 and 12.0 < got[1.2][0] < 15.0, got

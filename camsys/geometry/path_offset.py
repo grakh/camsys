@@ -3130,19 +3130,43 @@ def _bridge_one(polypath: Polypath, r_bridge: float,
             # 270 мм даёт 135 тысяч точек и минуты счёта (v1.7.33).
             sa0, sb0 = pts[ia0][0], pts[ib0][0]
             found = None
-            steps = int(0.5 / fine_step_mm)   # окно поиска устья
-            for tot_in in range(0, steps + 1):
-                for da in range(0, tot_in + 1):
-                    db = tot_in - da
-                    sa = sa0 - da * fine_step_mm
-                    sb = sb0 + db * fine_step_mm
-                    A = _point_at_s(polypath, sa, lidx)
-                    B = _point_at_s(polypath, sb, lidx)
-                    if math.hypot(B[0] - A[0], B[1] - A[1]) <= diam - mouth_margin_mm:
-                        found = (sa, sb, A, B)
+            # Окно поиска устья (v1.7.75): было жёстко 0.5 мм. Конец
+            # узкого участка — где зазор впервые меньше диаметра, а до
+            # хорды «диаметр минус запас» надо пройти тем дальше, чем
+            # положе сходятся берега и чем крупнее фреза. Knife_19 при
+            # пятке 1.2: 0.60 мм — мост не находился, эквидистанта в
+            # шейке петли пересекала сама себя. Теперь окно — до длины
+            # узкого участка (не больше 3 мм): грубо шагом 0.02, потом
+            # уточнение прежним мелким шагом.
+            run_x = pts[runs[x][1]][0] - pts[runs[x][0]][0]
+            run_y = pts[runs[y][1]][0] - pts[runs[y][0]][0]
+            win = max(0.5, min(3.0, run_x, run_y))
+            coarse = 0.02
+            def _ok(sa, sb):
+                A = _point_at_s(polypath, sa, lidx)
+                B = _point_at_s(polypath, sb, lidx)
+                if math.hypot(B[0] - A[0], B[1] - A[1]) <= diam - mouth_margin_mm:
+                    return (sa, sb, A, B)
+                return None
+            tot_c = None
+            for tc in range(0, int(win / coarse) + 1):
+                for da in range(0, tc + 1):
+                    if _ok(sa0 - da * coarse, sb0 + (tc - da) * coarse):
+                        tot_c = tc
                         break
-                if found:
+                if tot_c is not None:
                     break
+            if tot_c is not None:
+                k = int(round(coarse / fine_step_mm))
+                lo = max(0, (tot_c - 1) * k)
+                for tot_in in range(lo, tot_c * k + 1):
+                    for da in range(0, tot_in + 1):
+                        found = _ok(sa0 - da * fine_step_mm,
+                                    sb0 + (tot_in - da) * fine_step_mm)
+                        if found:
+                            break
+                    if found:
+                        break
             if not found:
                 continue
             sa, sb, _A, _B = found
