@@ -509,7 +509,10 @@ class CamScene(QtWidgets.QGraphicsScene):
                 self.addItem(item)
                 self._geom_items[geom.id] = item
                 items.append(item)
-            self._layer_items[layer.name] = items
+            # Слои с одинаковым именем (два комплекта слоёв в файле
+            # сшивки) — копим, а не перезаписываем: иначе галка слоя
+            # управляла только последним из одноимённых (v1.7.70).
+            self._layer_items.setdefault(layer.name, []).extend(items)
         
         # Реперы поверх — с привязкой к своим FIDUCIAL_DRILL операциям
         # чтобы ПКМ на репере мог включать/отключать соответствующую op.

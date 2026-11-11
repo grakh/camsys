@@ -157,7 +157,11 @@ def import_ai_to_project(ai_path: str,
         fiducial_centers.append((cx, cy))
     
     # Импорт всех слоёв
-    layer_names = list_layers(ai_path)
+    # Имена слоёв без повторов: в некоторых .ai (124173_test и др.) список
+    # OCG содержит каждый слой дважды, а get_layer_paths по имени отдаёт
+    # одно и то же — вся геометрия импортировалась в двух копиях, и
+    # галка второго «Knife»/«RLL» ничего не скрывала (v1.7.70).
+    layer_names = list(dict.fromkeys(list_layers(ai_path)))
     for layer_name in layer_names:
         color = DEFAULT_LAYER_COLORS.get(layer_name, "#ffffff")
         layer = project.add_layer(layer_name, color=color)

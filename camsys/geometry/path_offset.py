@@ -287,13 +287,15 @@ def polypath_bbox(polypath: Polypath) -> Tuple[float, float, float, float]:
             # 4 экстремума окружности: углы 0, π/2, π, 3π/2
             for ext_ang in (0.0, math.pi/2, math.pi, 3*math.pi/2):
                 # Проверим попадает ли ext_ang в диапазон [sa, sa+sweep]
-                delta = ext_ang - sa
+                # Приводим к одному обороту в ОБЕ стороны (v1.7.70): при
+                # sa<0 угол 3π/2 давал delta>2π и экстремум терялся —
+                # нижний край окружности, порезанной на дуги, выпадал.
+                delta = (ext_ang - sa) % (2*math.pi)
                 if s.ccw:
-                    while delta < 0: delta += 2*math.pi
-                    on_arc = 0 <= delta <= sweep
+                    on_arc = delta <= sweep
                 else:
-                    while delta > 0: delta -= 2*math.pi
-                    on_arc = sweep <= delta <= 0
+                    delta -= 2*math.pi
+                    on_arc = sweep <= delta or delta == -2*math.pi
                 if on_arc:
                     xs.append(cx + r * math.cos(ext_ang))
                     ys.append(cy + r * math.sin(ext_ang))
@@ -522,9 +524,10 @@ def shift_start_from_diagonal_zero(polypath: Polypath,
     if not polypath or not polypath.segments:
         return polypath
     import math as _m
-    xs = [c for s in polypath.segments for c in (s.a[0], s.b[0])]
-    ys = [c for s in polypath.segments for c in (s.a[1], s.b[1])]
-    minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
+    # Настоящий габарит, с выпуклостями дуг (v1.7.70). По концам
+    # сегментов он зависел от того, как окружность порезана на дуги в
+    # файле: два одинаковых кружка получали разный «ноль» и разные лиды.
+    minx, miny, maxx, maxy = polypath_bbox(polypath)
     P = (maxx, maxy)  # верхне-правый угол bbox
     C = ((minx + maxx) / 2.0, (miny + maxy) / 2.0)  # центр
     dx, dy = C[0] - P[0], C[1] - P[1]

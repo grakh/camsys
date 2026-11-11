@@ -804,3 +804,42 @@ def test_rework_fragment_is_one_function_with_the_post_pad():
                           'orient_corner_fragment('):
             assert forbidden not in src, \
                 f'{name}: остался свой вырез участка ({forbidden})'
+
+
+# ── v1.7.70: одинаковые кружки — одинаковый старт ──
+
+def _split_circle(r, phase, n, ccw=True):
+    import math as _m
+    from camsys.geometry.primitives import Arc as _A, Polypath as _P
+    pts = [(r * _m.cos(phase + 2 * _m.pi * i / n),
+            r * _m.sin(phase + 2 * _m.pi * i / n)) for i in range(n)]
+    if not ccw:
+        pts = pts[::-1]
+    return _P(segments=[_A(a=pts[i], b=pts[(i + 1) % n], center=(0.0, 0.0),
+                           ccw=ccw) for i in range(n)], closed=True)
+
+
+def test_bbox_of_circle_split_into_arcs():
+    """Габарит не зависит от того, как окружность порезана на дуги.
+
+    Раньше при отрицательном угле начала дуги нижний экстремум (3π/2)
+    терялся: у кружка Ø3 из двух дуг низ был −0.72 вместо −1.5.
+    """
+    from camsys.geometry.path_offset import polypath_bbox
+    for ph, n, ccw in ((0, 2, True), (0.5, 2, True), (0.3, 4, False),
+                       (1.0, 3, True), (2.5, 5, False)):
+        bb = polypath_bbox(_split_circle(1.5, ph, n, ccw))
+        assert all(abs(abs(v) - 1.5) < 1e-9 for v in bb), (ph, n, ccw, bb)
+
+
+def test_identical_circles_get_identical_start():
+    """«2 одинаковых кружка, а лиды разные» — старт от «нуля» на
+    диагонали габарита; габарит был по концам дуг и зависел от разбиения."""
+    from camsys.geometry.path_offset import shift_start_from_diagonal_zero
+    for off in (0.0, -5.0):
+        starts = set()
+        for ph, n in ((0, 2), (0.5, 2), (0.3, 4), (1.0, 3)):
+            a = shift_start_from_diagonal_zero(
+                _split_circle(1.5, ph, n), off).segments[0].a
+            starts.add((round(a[0], 3), round(a[1], 3)))
+        assert len(starts) == 1, (off, starts)

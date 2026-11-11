@@ -238,9 +238,10 @@ class CamSession:
     def set_layer_visibility(self, layer_name: str, visible: bool) -> None:
         if self.project is None:
             return
-        layer = self.project.get_layer_by_name(layer_name)
-        if layer is not None:
-            layer.visible = visible
+        # Все одноимённые слои (в файле сшивки их по комплекту на заказ).
+        for layer in self.project.layers.values():
+            if layer.name == layer_name:
+                layer.visible = visible
     
     def list_layers(self) -> List[Dict[str, Any]]:
         if self.project is None:

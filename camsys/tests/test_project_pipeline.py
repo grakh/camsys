@@ -118,3 +118,19 @@ if __name__ == "__main__":
             import traceback; traceback.print_exc()
     print(f"\n{passed}/{len(tests)} тестов пройдено")
     sys.exit(0 if not failed else 1)
+
+
+def test_duplicate_layer_names_imported_once():
+    """В 124173_test.ai каждый слой записан в списке OCG дважды — вся
+    геометрия шла двумя копиями, и галка второго слоя ничего не скрывала
+    (v1.7.70)."""
+    import os
+    ai = '/mnt/user-data/uploads/124173_test.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет 124173_test.ai')
+        return
+    import camsys.core.importer as im
+    prj = im.import_ai_to_project(ai)
+    names = [l.name for l in prj.layers.values()]
+    assert len(names) == len(set(names)), names
+    assert len(prj.get_layer_by_name('Knife').geometries) == 31

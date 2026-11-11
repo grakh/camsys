@@ -54,7 +54,19 @@ class LayerTree(QtWidgets.QTreeWidget):
             return
         
         state = sess.get_state()
+        # Одноимённые слои (по комплекту на каждый заказ сшивки) — одной
+        # строкой: две строки «Knife» не различить, а галка второй
+        # раньше не скрывала ничего (v1.7.70).
+        merged = {}
         for layer in state['project']['layers']:
+            m = merged.get(layer['name'])
+            if m is None:
+                merged[layer['name']] = dict(layer)
+            else:
+                m['closed_count'] += layer['closed_count']
+                m['open_count'] += layer['open_count']
+                m['visible'] = m['visible'] or layer['visible']
+        for layer in merged.values():
             item = QtWidgets.QTreeWidgetItem()
             item.setText(0, layer['name'])
             item.setText(1, f"{layer['closed_count']}з/{layer['open_count']}о")
