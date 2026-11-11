@@ -1114,6 +1114,64 @@ def test_unmachinable_pocket_is_reported_not_silent():
     assert not rep_b, f'с пяткой {need} отчёт всё ещё жалуется: {rep_b}'
 
 
+def test_unmachinable_pocket_is_drawn_red():
+    """Карман, куда T3 не влезает, виден на экране красным (v1.7.68).
+
+    Пользователь: «а рисовать вообще не будем?». Запись в отчёте
+    экспорта — мало: оператор смотрит на экран. Карман рисуется красным
+    пунктиром, с подсказкой, и при этом НЕ является операцией — в
+    программу не попадает. С пяткой, которая его берёт, красного нет,
+    вместо него обычная проточка.
+    """
+    ai = '/mnt/user-data/uploads/124173_test.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет 124173_test.ai')
+        return
+    from PySide6 import QtWidgets
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    import camsys.post.mtx_anderson  # noqa: F401
+    from camsys.core.session import CamSession
+    import camsys.core.macros as macros_mod
+    from camsys.post.package_export import PackageExporter
+    from camsys.ui.viewer_2d import CamScene, add_toolpaths_to_scene
+
+    def _scene(tip):
+        s = CamSession()
+        s.load_ai(ai)
+        for g in s.project.get_layer_by_name("Knife").geometries:
+            if g.polypath:
+                s.project.add_blade_operation(g.id)
+        macros_mod.sort_operations_by_grid(s.project)
+        s.set_cutting_params_from_dict({
+            'knife_angle': 90.0, 'tip_diameter': 0.8, 'bottom': 0.25,
+            'corner_tip_diameter': tip})
+        ex = PackageExporter(s.project, s.cutting_params)
+        c2, _c3 = ex._build_corner_operations()
+        s.project.operations.extend(c2)
+        # Сцену держим живой: иначе Qt удалит её вместе с элементами.
+        sc = CamScene()
+        items = add_toolpaths_to_scene(
+            sc, s.project,
+            {'tool_radius': 0.4, 'tool_equidistant': 1.3}, s.cutting_params)
+        red = [i for i in items if i.data(0) == 'unmachinable_pocket']
+        in_ops = any('НЕ ТОЧИТСЯ' in (o.name or '')
+                     for o in s.project.operations)
+        return red, in_ops, sc
+
+    red, in_ops, _sc = _scene(0.6)
+    print(f'  пятка 0.6: красных карманов {len(red)}')
+    assert len(red) == 1, f'ожидался 1 красный карман (Knife_3), их {len(red)}'
+    c = red[0].boundingRect().center()
+    assert 158 < c.x() < 170 and 103 < c.y() < 111, (
+        f'красный карман не там, где Knife_3: ({c.x():.1f},{c.y():.1f})')
+    assert 'Нужна пятка T3' in red[0].toolTip(), 'в подсказке нет совета'
+    assert not in_ops, 'красный карман попал в операции — уйдёт в программу'
+
+    red2, _, _sc2 = _scene(0.55)
+    print(f'  пятка 0.55: красных карманов {len(red2)}')
+    assert not red2, 'с пяткой, которая карман берёт, он всё ещё красный'
+
+
 def test_pocket_groove_lead_enters_from_cut_side():
     """Заход проточки идёт СПРАВА ПО ХОДУ — по уже снятому металлу.
 

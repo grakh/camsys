@@ -1658,6 +1658,39 @@ def add_toolpaths_to_scene(scene: 'CamScene', project, options_extras: dict = No
     except Exception:
         pass
 
+    # ── КАРМАНЫ, КУДА T3 НЕ ВЛЕЗАЕТ (v1.7.68) ──
+    # Операции для них нет — в программу они не идут. Но молчать на
+    # экране нельзя: пользователь видел пустое место и не понимал почему
+    # («а рисовать вообще не будем?»). Рисуем сам карман красным
+    # пунктиром поверх ножа; подсказка при наведении — что не так и какая
+    # пятка T3 его возьмёт.
+    if show_corner_2d:
+        try:
+            _excl = set()
+            for _op in project.operations:
+                if (_op.kind == OperationKind.BLADE_FORMING
+                        and _op.attributes.get('excluded', False)):
+                    _excl.update(_op.geometry_ids)
+            _pen_um = QtGui.QPen(QtGui.QColor('#ff3030'), 0)
+            _pen_um.setCosmetic(True)
+            _pen_um.setWidthF(2.5)
+            _pen_um.setStyle(QtCore.Qt.DashLine)
+            for _um in getattr(project, 'unmachinable_pockets', None) or []:
+                if _um.get('geom_id') in _excl:
+                    continue
+                _pp = _um.get('polypath')
+                if _pp is None or not _pp.segments:
+                    continue
+                _it = QtWidgets.QGraphicsPathItem(polypath_to_qpainter(_pp))
+                _it.setPen(_pen_um)
+                _it.setZValue(9)
+                _it.setToolTip(_um.get('text', 'Карман не точится тонкой фрезой'))
+                _it.setData(0, 'unmachinable_pocket')
+                scene.addItem(_it)
+                items.append(_it)
+        except Exception:
+            pass
+
     return items
 
 

@@ -823,10 +823,22 @@ class PackageExporter:
         # Поиск карманов — самая дорогая часть сборки операций (на заказе
         # из 31 ножа это ~40 с), а _build_corner_operations может
         # вызываться не один раз за экспорт. Считаем один раз (v1.7.39).
+        # Пятка T3 в ключе обязательна (v1.7.68): от неё зависит, какие
+        # карманы точатся. Без неё смена пятки в том же сеансе отдавала
+        # старые карманы из кэша.
         _ck = (id(self.project), float(self.params.tip_diameter),
-               float(self.params.bottom), float(self.params.knife_angle))
+               float(self.params.bottom), float(self.params.knife_angle),
+               float(getattr(self.params, 'corner_tip_diameter', 0.6) or 0.6))
         if getattr(self, '_pocket_cache_key', None) == _ck:
+            self.project.unmachinable_pockets = list(
+                getattr(self, '_unmachinable_cache', []))
             return self._pocket_cache
+        # ── КАРМАНЫ, КУДА T3 НЕ ВЛЕЗАЕТ — ОТДЕЛЬНЫМ СЛОЕМ (v1.7.68) ──
+        # Пользователь: «а рисовать вообще не будем?». Операции для них
+        # нет и быть не должно — в программу они идти не могут. Поэтому
+        # это не операция, а слой поверх: вьювер рисует его красным, а
+        # пост его не видит вовсе (смотрит только в operations).
+        unmachinable = []
         ops = []
         spans = {}
         tip = float(self.params.tip_diameter)
@@ -928,7 +940,7 @@ class PackageExporter:
                           self.machinability_report = _rep
                       if _gap < float('inf'):
                           _need = _m.floor((_gap - _add) / 0.05) * 0.05
-                          _rep.append(
+                          _txt = (
                               f"[{blade_op.name} / {side_name}] КАРМАН НЕ "
                               f"ТОЧИТСЯ: {_span:.2f} мм, щель сужается до "
                               f"{_gap:.3f} мм при ширине реза тонкой фрезы "
@@ -936,10 +948,23 @@ class PackageExporter:
                               f"{max(0.05, _need):.2f} мм или тоньше "
                               f"(сейчас {float(getattr(self.params, 'corner_tip_diameter', 0.6) or 0.6):.2f}).")
                       else:
-                          _rep.append(
+                          _txt = (
                               f"[{blade_op.name} / {side_name}] КАРМАН НЕ "
                               f"ТОЧИТСЯ: {_span:.2f} мм, тонкая фреза "
                               f"туда не проходит.")
+                      _rep.append(_txt)
+                      try:
+                          _segs = _subpath_forward(pp, br['sA'], br['sB'])
+                          if _segs:
+                              unmachinable.append({
+                                  'geom_id': geom_id,
+                                  'side': side_name,
+                                  'polypath': Polypath(segments=_segs,
+                                                       closed=False),
+                                  'text': _txt,
+                              })
+                      except Exception:
+                          pass
                   for _ri, (_r0, _r1) in enumerate(_runs):
                     s0, s1 = _r0, _r1
                     # Конец считается обрезанным, только если он реально
@@ -1028,6 +1053,8 @@ class PackageExporter:
                     ops.append(op)
         self._pocket_cache_key = _ck
         self._pocket_cache = (ops, spans)
+        self._unmachinable_cache = unmachinable
+        self.project.unmachinable_pockets = list(unmachinable)
         return ops, spans
 
     def _build_corner_operations(self) -> Tuple[List[Operation], List[Operation]]:
