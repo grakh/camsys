@@ -985,7 +985,12 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
             # угла. Единая точка для обоих проходов, не заворачивает вниз по
             # стороне (как делал сдвиг по периметру → каша на прямоугольниках).
             from ..geometry.path_offset import shift_start_from_diagonal_zero as _ssdz
-            polypath = _ssdz(polypath, user_offset)
+            from ..geometry.path_offset import straight_entry_min_len as _seml
+            # Вход на прямую, где можно (v1.7.72) — как в посте.
+            _min_straight_v = (0.0 if op.attributes.get('lead_override')
+                               else _seml(options_extras.get(
+                                   'tool_equidistant', 1.3)))
+            polypath = _ssdz(polypath, user_offset, _min_straight_v)
 
         # ── ОБРЕЗКА КАРМАНОВ (v1.7.35) ──
         # Пост выбрасывает участки, куда основная фреза не проходит, и
@@ -1015,7 +1020,7 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
                 _pp_v, _br_v = bridge_narrow_pits(polypath, _rb_v,
                                                   r_mouth=_rm_v)
                 if _br_v:
-                    polypath = _ssdz(_pp_v, user_offset)
+                    polypath = _ssdz(_pp_v, user_offset, _min_straight_v)
             except Exception:
                 pass
 

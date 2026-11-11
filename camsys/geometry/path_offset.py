@@ -510,8 +510,92 @@ def _point_on_arc_span(arc, pt, tol: float = 1e-6) -> bool:
         return a1 - tol <= ap <= a0 + tol
 
 
+def straight_entry_min_len(equidistant: float) -> float:
+    """Минимальная длина прямой под вход (v1.7.72): не короче 2 мм и не
+    короче 4 вылетов подвода — правило Anctor V7.2, выведенное на ошибках
+    стойки Andersen. Вылет — хорда лида по умолчанию (45°, длина 1.0):
+    дуга R=E на 45° плюс прямая E/sin45. Не зависит от прохода и ножа,
+    чтобы внутренний и внешний садились на ОДНУ прямую."""
+    import math as _m
+    E = float(equidistant) if equidistant and equidistant > 0 else 1.3
+    a = _m.radians(45.0)
+    ll = E / _m.sin(a)
+    x = -E * _m.sin(a) - ll * _m.cos(a)
+    y = E * (1 - _m.cos(a)) + ll * _m.sin(a)
+    return max(2.0, 4.0 * _m.hypot(x, y))
+
+
+def prefer_straight_entry(pp: Polypath, min_len: float,
+                          end_margin: float = 0.5) -> Polypath:
+    """Вход — на прямую, где это возможно (v1.7.72).
+
+    Стойка Andersen падает на входе внутри дуги рядом с микро-куском или
+    стыком дуг разного радиуса («Corner peaks», сервоошибка Z); прямая —
+    гарантированно безопасна. Правило как в Anctor V7.2:
+      • старт уже на прямой (не ближе end_margin к её концам) — не трогаем;
+      • иначе от старта ПРОТИВ ЧАСОВОЙ по геометрии (не по ходу прохода —
+        оба прохода выбирают одну прямую) первая прямая не короче
+        min_len, вход — её середина;
+      • прямой нет (круги, кривые) — как было.
+    """
+    if not pp or not pp.segments or not pp.closed or min_len <= 0:
+        return pp
+    import math as _m
+    segs = pp.segments
+    S = segs[0].a
+
+    def _is_line(sg):
+        return not isinstance(sg, Arc)
+
+    def _dir(sg):
+        return _m.atan2(sg.b[1] - sg.a[1], sg.b[0] - sg.a[0])
+
+    def _len(sg):
+        return _m.hypot(sg.b[0] - sg.a[0], sg.b[1] - sg.a[1])
+
+    first, last = segs[0], segs[-1]
+    split_line = (len(segs) > 1 and _is_line(first) and _is_line(last)
+                  and _len(first) > 1e-9 and _len(last) > 1e-9
+                  and abs((_dir(first) - _dir(last) + _m.pi)
+                          % (2 * _m.pi) - _m.pi) < 1e-4)
+    if split_line and _len(first) >= end_margin and _len(last) >= end_margin:
+        return pp
+    # Элементы контура (половинки разрезанной прямой — одной прямой)
+    els = []
+    if split_line:
+        els.append((last.a, first.b))
+        body = segs[1:-1]
+    else:
+        body = segs
+    for sg in body:
+        els.append((sg.a, sg.b) if _is_line(sg) else None)
+    # обход против часовой по геометрии
+    area = 0.0
+    for sg in segs:
+        n = 1 if _is_line(sg) else 8
+        for k in range(n):
+            p0 = sg.point_at(k / n)
+            p1 = sg.point_at((k + 1) / n)
+            area += p0[0] * p1[1] - p1[0] * p0[1]
+    if area > 0:
+        order = list(range(len(els)))
+    else:
+        order = ([0] + list(range(len(els) - 1, 0, -1))) if split_line \
+            else list(range(len(els) - 1, -1, -1))
+    for k in order:
+        e = els[k]
+        if e is None:
+            continue
+        a, b = e
+        if _m.hypot(b[0] - a[0], b[1] - a[1]) >= min_len:
+            mid = ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
+            return shift_start_to_point(pp, mid)
+    return pp
+
+
 def shift_start_from_diagonal_zero(polypath: Polypath,
-                                   offset: float) -> Polypath:
+                                   offset: float,
+                                   min_straight: float = 0.0) -> Polypath:
     """Смещение старта по alphacam-модели: 0 = точка, где ДИАГОНАЛЬ из
     верхне-правого угла bbox к центру пересекает контур (на скруглённом
     углу — его 45°-точка, однозначная для ОБОИХ проходов). От неё:
@@ -568,7 +652,7 @@ def shift_start_from_diagonal_zero(polypath: Polypath,
     zero_pt = best[1] if best else P
     pp = shift_start_to_point(polypath, zero_pt)
     if abs(offset) < 1e-9:
-        return pp
+        return prefer_straight_entry(pp, min_straight)
     base = pp.segments[0].a
     # off<0 → X уменьшается (влево по верху); off>0 → Y уменьшается (вниз)
     chosen = None
@@ -580,7 +664,8 @@ def shift_start_from_diagonal_zero(polypath: Polypath,
         if chosen_score is None or score > chosen_score:
             chosen_score = score
             chosen = cand
-    return chosen if chosen is not None else pp
+    return prefer_straight_entry(chosen if chosen is not None else pp,
+                                 min_straight)
 
 
 def shift_start_to_top_x(polypath: Polypath, offset_from_rt: float,

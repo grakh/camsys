@@ -861,3 +861,42 @@ def test_sharp_rectangle_start_is_top_right():
         assert abs(a[0] - 151.122) < 1e-6 and abs(a[1] - 342.072) < 1e-6, a
         a = shift_start_from_diagonal_zero(pp, -5.0).segments[0].a
         assert abs(a[0] - 146.122) < 1e-6 and abs(a[1] - 342.072) < 1e-6, a
+
+
+def test_entry_moves_to_nearest_straight_ccw():
+    """Вход — на прямую (v1.7.72, ошибки стойки Andersen на входе в дуге):
+    угол R10 справа вверху, «ноль» и −5 мм лежат на дуге → вход уходит на
+    середину ближайшей прямой ПРОТИВ ЧАСОВОЙ (верхней) — одинаково для
+    обоих направлений обхода. Круг не трогается."""
+    import math as _m
+    from camsys.geometry.primitives import Line as _L, Arc as _A, Polypath as _P
+    from camsys.geometry.path_offset import (shift_start_from_diagonal_zero,
+                                             straight_entry_min_len)
+    R = 10.0
+    W, H = 60.0, 40.0
+    segs = [_L(a=(0, 0), b=(W, 0)), _L(a=(W, 0), b=(W, H - R)),
+            _A(a=(W, H - R), b=(W - R, H), center=(W - R, H - R), ccw=True),
+            _L(a=(W - R, H), b=(0, H)), _L(a=(0, H), b=(0, 0))]
+    ccw = _P(segments=segs, closed=True)
+    cw = ccw.reversed() if hasattr(ccw, 'reversed') else _P(
+        segments=[(_A(a=s.b, b=s.a, center=s.center, ccw=not s.ccw)
+                   if isinstance(s, _A) else _L(a=s.b, b=s.a))
+                  for s in reversed(segs)], closed=True)
+    need = straight_entry_min_len(1.3)
+    for pp in (ccw, cw):
+        old = shift_start_from_diagonal_zero(pp, -5.0).segments[0].a
+        assert isinstance(old, tuple) or True
+        a = shift_start_from_diagonal_zero(pp, -5.0, need).segments[0].a
+        assert abs(a[0] - (W - R) / 2) < 1e-6 and abs(a[1] - H) < 1e-6, a
+    # на прямой уже — не трогаем (прямоугольник: −5 по верху)
+    rect = _P(segments=[_L(a=(0, 0), b=(W, 0)), _L(a=(W, 0), b=(W, H)),
+                        _L(a=(W, H), b=(0, H)), _L(a=(0, H), b=(0, 0))],
+              closed=True)
+    a = shift_start_from_diagonal_zero(rect, -5.0, need).segments[0].a
+    assert abs(a[0] - (W - 5)) < 1e-6 and abs(a[1] - H) < 1e-6, a
+    # круг — без прямых, как было
+    c = _P(segments=[_A(a=(3, 0), b=(-3, 0), center=(0, 0), ccw=True),
+                     _A(a=(-3, 0), b=(3, 0), center=(0, 0), ccw=True)],
+           closed=True)
+    assert (shift_start_from_diagonal_zero(c, -5.0, need).segments[0].a ==
+            shift_start_from_diagonal_zero(c, -5.0).segments[0].a)

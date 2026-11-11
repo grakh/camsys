@@ -563,13 +563,20 @@ class MtxAndersonGVM(PostProcessor):
             _override_offset = _ov.get('offset', _override_offset)
             _override_overlap = _ov.get('overlap', _override_overlap)
         
+        _min_straight = 0.0
         if (not is_corner_rework and geom.is_closed and tp.entry.enabled):
             # СМЕЩЕНИЕ ВДОЛЬ ВЕРХНЕЙ ГРАНИ от верхне-правого угла контура:
             # 0 = угол, <0 = влево по верху, >0 = зажим у угла. Единая точка
             # для обоих проходов → внутр/внешн выровнены. Не заворачивает за
             # угол вниз по стороне (как делал сдвиг по периметру → каша).
-            from ..geometry.path_offset import shift_start_from_diagonal_zero
-            polypath = shift_start_from_diagonal_zero(polypath, _override_offset)
+            from ..geometry.path_offset import (
+                shift_start_from_diagonal_zero, straight_entry_min_len)
+            # Вход — на прямую, где можно (v1.7.72, ошибки стойки
+            # Andersen на входе в дуге). Ручная правка ножа — как задал юзер.
+            _min_straight = (0.0 if _lead_ov_early else straight_entry_min_len(
+                options.extras.get('tool_equidistant', 1.3)))
+            polypath = shift_start_from_diagonal_zero(
+                polypath, _override_offset, _min_straight)
         
         # ── OVERLAP откладывается до ПОСЛЕ автоподбора ──
         # Если применить overlap здесь, polypath перестанет быть замкнутым 
@@ -620,7 +627,8 @@ class MtxAndersonGVM(PostProcessor):
                     try:
                         from ..geometry.path_offset import (
                             shift_start_from_diagonal_zero as _shift2)
-                        polypath = _shift2(polypath, _override_offset)
+                        polypath = _shift2(polypath, _override_offset,
+                                           _min_straight)
                     except Exception:
                         pass
                     for _b in _brs:
