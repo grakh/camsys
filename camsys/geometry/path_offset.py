@@ -2548,6 +2548,48 @@ def contour_proximity_index(parent: Polypath, reach: float,
     return pts, total, grid, cell
 
 
+def pocket_min_gap(parent: Polypath, s0: float, s1: float, index,
+                   min_contour_separation_mm: float = 2.0) -> float:
+    """Самое узкое место кармана — между вершинами лезвия (v1.7.68).
+
+    Нужно, чтобы СКАЗАТЬ, почему карман не точится и какая пятка его
+    возьмёт. Раньше такой карман просто исчезал: операция не
+    создавалась, а значит и в журнал ничего не писалось — на экране
+    пусто и ни слова почему.
+
+    «Разными» считаются участки, разнесённые вдоль контура больше
+    `min_contour_separation_mm`: у острия стенки сходятся вплотную, но
+    они рядом по контуру, и компенсация стойки там справляется сама.
+
+    Returns:
+        Ширину самого узкого места, мм. inf — если ближе охвата сетки
+        ничего нет, то есть карман нигде не узкий.
+    """
+    pts, total, grid, cell = index
+    if not pts or total <= 0:
+        return float('inf')
+    span = (s1 - s0) % total
+    if span <= 1e-9:
+        return float('inf')
+    best = float('inf')
+    for (s, p) in pts:
+        if ((s - s0) % total) > span:
+            continue
+        gx, gy = int(p[0] / cell), int(p[1] / cell)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for k in grid.get((gx + dx, gy + dy), ()):
+                    s2, q = pts[k]
+                    ds = abs(s2 - s)
+                    ds = min(ds, total - ds)
+                    if ds < min_contour_separation_mm:
+                        continue
+                    d = math.hypot(q[0] - p[0], q[1] - p[1])
+                    if d < best:
+                        best = d
+    return best
+
+
 def pocket_runs_where_tool_fits(parent: Polypath, s0: float, s1: float,
                                 cut_width: float,
                                 min_clearance_mm: float = 0.030,

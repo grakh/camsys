@@ -3042,6 +3042,15 @@ class MainWindow(QtWidgets.QMainWindow):
         w_tip.setCurrentText(self._get_default("tip", "0_8"))
         form.addRow("Пятка:", w_tip)
 
+        # Пятка тонкой фрезы T3 — сохраняется между запусками (v1.7.68).
+        # Без этого поле в панели сбрасывалось на 0.6 при каждом старте.
+        w_corner_tip = _spin((0.1, 2.0), 2, 0.05,
+                             self._get_default("corner_tip_diameter", 0.60))
+        w_corner_tip.setSuffix(" мм")
+        w_corner_tip.setToolTip(
+            "Пятка тонкой фрезы T3 — ею дорабатываются углы и карманы.")
+        form.addRow("Пятка T3:", w_corner_tip)
+
         # Порог радиуса угла — относится к «Острым углам 2D».
         w_corner_thr = _spin((0.1, 5.0), 2, 0.05,
                              self._get_default("corner_radius_threshold", 0.70))
@@ -3107,6 +3116,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_defaults({
             "angle": w_angle.currentText(),
             "tip": w_tip.currentText(),
+            "corner_tip_diameter": w_corner_tip.value(),
             "corner_radius_threshold": w_corner_thr.value(),
             "abs_boundary": w_abs_bnd.value(),
             "abs_low": w_abs_lo.value(),
@@ -3179,6 +3189,8 @@ class MainWindow(QtWidgets.QMainWindow):
         _set(lambda: p.max_geom_len.setValue(self._get_default("limit", 3000.0)))
         _set(lambda: p.corner_radius_threshold.setValue(
             self._get_default("corner_radius_threshold", 0.70)))
+        _set(lambda: p.corner_tip.setValue(
+            float(self._get_default("corner_tip_diameter", 0.60))))
         _set(lambda: p.lead_in_angle.setValue(self._get_default("lead_in_angle", 45.0)))
         _set(lambda: p.lead_in_length.setValue(self._get_default("lead_in_length", 1.0)))
         _set(lambda: p.set_lead_in_offset_value(self._get_default("lead_in_offset", -5.0)))

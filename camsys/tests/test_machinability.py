@@ -1058,6 +1058,62 @@ def test_rework_path_never_crosses_itself_far_from_the_tip():
         + '; '.join(f'{n} (разнос {g:.2f} мм)' for n, g, _ in bad[:3]))
 
 
+def test_unmachinable_pocket_is_reported_not_silent():
+    """Карман, куда тонкая фреза не влезает, не исчезает молча (v1.7.68).
+
+    Раньше операция для него просто не создавалась, а значит и в журнал
+    ничего не писалось: на экране пусто, в отчёте пусто. Пользователь
+    трижды: «как не было Т3 так и нет». Теперь в отчёте проходимости
+    сказано, почему, и какая пятка T3 его возьмёт.
+
+    И совет обязан быть верным: с названной пяткой карман реально
+    точится.
+    """
+    ai = '/mnt/user-data/uploads/124173_test.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет 124173_test.ai')
+        return
+    import re
+    import camsys.post.mtx_anderson  # noqa: F401
+    from camsys.core.session import CamSession
+    import camsys.core.macros as macros_mod
+    from camsys.post.package_export import PackageExporter
+
+    def _build(tip):
+        s = CamSession()
+        s.load_ai(ai)
+        for g in s.project.get_layer_by_name("Knife").geometries:
+            if g.polypath:
+                s.project.add_blade_operation(g.id)
+        macros_mod.sort_operations_by_grid(s.project)
+        # ровно как панель: дикт → set_cutting_params_from_dict
+        s.set_cutting_params_from_dict({
+            'knife_angle': 90.0, 'tip_diameter': 0.8, 'bottom': 0.25,
+            'corner_tip_diameter': tip})
+        ex = PackageExporter(s.project, s.cutting_params)
+        ops, _ = ex._build_corner_operations()
+        k3 = [o for o in ops
+              if 'Knife_3 ' in o.name + ' ' and 'карман' in o.name]
+        rep = [r for r in getattr(ex, 'machinability_report', [])
+               if 'Knife_3' in r and 'НЕ ТОЧИТСЯ' in r]
+        return k3, rep
+
+    k3, rep = _build(0.6)
+    print(f'  пятка 0.6: проточек Knife_3 {len(k3)}; отчёт: {rep}')
+    assert not k3, 'при пятке 0.6 карман Knife_3 проточен, а не должен'
+    assert rep, ('карман Knife_3 не точится, и об этом НИГДЕ не сказано '
+                 '— пользователь видит пустое место без объяснения')
+    m = re.search(r'Нужна пятка T3 ([0-9.]+)', rep[0])
+    assert m, f'в отчёте нет нужной пятки: {rep[0]}'
+    need = float(m.group(1))
+
+    k3b, rep_b = _build(need)
+    print(f'  пятка {need}: проточек Knife_3 {len(k3b)}')
+    assert k3b, (f'отчёт советует пятку {need}, но с ней карман Knife_3 '
+                 f'всё равно не точится — совет неверный')
+    assert not rep_b, f'с пяткой {need} отчёт всё ещё жалуется: {rep_b}'
+
+
 def test_pocket_groove_lead_enters_from_cut_side():
     """Заход проточки идёт СПРАВА ПО ХОДУ — по уже снятому металлу.
 

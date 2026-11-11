@@ -814,7 +814,8 @@ class PackageExporter:
                                             _subpath_forward,
                                             _exact_axis_points,
                                             pocket_runs_where_tool_fits,
-                                            contour_proximity_index)
+                                            contour_proximity_index,
+                                            pocket_min_gap)
         from ..geometry.primitives import Polypath
         from ..geometry.direction import normalize_for_side
         import math as _m
@@ -911,6 +912,34 @@ class PackageExporter:
                            if ((a - br['sA']) % total) <= 0.3
                            and ((br['sB'] - b) % total) <= 0.3]
                   _lost = _span - sum((b - a) % total for a, b in _runs)
+                  # ── КАРМАН, КОТОРЫЙ НЕ ТОЧИТСЯ, НЕ ИСЧЕЗАЕТ МОЛЧА ──
+                  # Если кусков не осталось, операция не создаётся, и
+                  # раньше об этом не говорилось НИГДЕ: на экране пусто,
+                  # в журнале пусто. Пользователь на Knife_3 трижды:
+                  # «как не было Т3 так и нет». Теперь пишем, почему не
+                  # точится и какая пятка его возьмёт.
+                  if not _runs:
+                      _gap = pocket_min_gap(pp, br['sA'], br['sB'], _prox)
+                      _add = 2.0 * bottom * _m.tan(
+                          _m.radians(float(self.params.knife_angle) / 2.0))
+                      _rep = getattr(self, 'machinability_report', None)
+                      if _rep is None:
+                          _rep = []
+                          self.machinability_report = _rep
+                      if _gap < float('inf'):
+                          _need = _m.floor((_gap - _add) / 0.05) * 0.05
+                          _rep.append(
+                              f"[{blade_op.name} / {side_name}] КАРМАН НЕ "
+                              f"ТОЧИТСЯ: {_span:.2f} мм, щель сужается до "
+                              f"{_gap:.3f} мм при ширине реза тонкой фрезы "
+                              f"{_cut_w:.2f}. Нужна пятка T3 "
+                              f"{max(0.05, _need):.2f} мм или тоньше "
+                              f"(сейчас {float(getattr(self.params, 'corner_tip_diameter', 0.6) or 0.6):.2f}).")
+                      else:
+                          _rep.append(
+                              f"[{blade_op.name} / {side_name}] КАРМАН НЕ "
+                              f"ТОЧИТСЯ: {_span:.2f} мм, тонкая фреза "
+                              f"туда не проходит.")
                   for _ri, (_r0, _r1) in enumerate(_runs):
                     s0, s1 = _r0, _r1
                     # Конец считается обрезанным, только если он реально
