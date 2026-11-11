@@ -421,3 +421,131 @@ def test_shallow_lead_does_not_run_along_its_own_blade():
     assert worst >= half - 0.05, (
         f'лид идёт по собственному лезвию и НЕ помечен коллизией: '
         f'зазор {worst:.3f} при нужных {half:.3f} ({worst_at})')
+
+
+# ── v1.7.69: автоподбор внутреннего лида по ножу, а не по проекту ──
+
+def _two_knife_project(lead_mode=0, flags=True, only=None):
+    """Маленький кружок Ø3 и большой прямоугольник 40×30 в одном проекте."""
+    from camsys.geometry.primitives import Line, Arc, Polypath
+    from camsys.core.project import Project, Geometry
+    prj = Project(name="MIX")
+    lay = prj.add_layer("Knife")
+    r = 1.5
+    circ = Polypath(segments=[
+        Arc(a=(r, 0.0), b=(-r, 0.0), center=(0.0, 0.0), ccw=True),
+        Arc(a=(-r, 0.0), b=(r, 0.0), center=(0.0, 0.0), ccw=True)],
+        closed=True)
+    V = [(20.0, 0.0), (60.0, 0.0), (60.0, 30.0), (20.0, 30.0)]
+    rect = Polypath(segments=[Line(a=V[i], b=V[(i + 1) % 4])
+                              for i in range(4)], closed=True)
+    for name, poly in (("Knife_1", circ), ("Knife_2", rect)):
+        if only and name != only:
+            continue
+        g = Geometry(name=name, polypath=poly, source_layer="Knife")
+        lay.geometries.append(g)
+        prj.add_blade_operation(g.id)
+    prj.attributes['lead_mode'] = lead_mode
+    if flags:
+        prj.attributes['lead_auto_inner'] = {'angle': True, 'length': True}
+    return prj
+
+
+def test_auto_inner_lead_is_per_knife():
+    """Кружок получает свой 90°, прямоугольник — умолчание 45° / 1.0.
+
+    Раньше подбор брал самый мелкий нож проекта и ставил его угол всем:
+    «надо - не надо лепит 90 везде, даже в других заказах».
+    """
+    from camsys.geometry.lead_inout import auto_inner_lead_for_op
+    prj = _two_knife_project()
+    circ_op, rect_op = prj.operations[0], prj.operations[1]
+    a = auto_inner_lead_for_op(prj, circ_op, 'OUTSIDE', 0.8)
+    b = auto_inner_lead_for_op(prj, rect_op, 'OUTSIDE', 0.8)
+    print(f'  кружок {a}, прямоугольник {b}')
+    assert a['angle'] == 90.0
+    assert b == {'angle': 45.0, 'length': 1.0}
+    # Внешний рез автоподбор не трогает
+    assert auto_inner_lead_for_op(prj, circ_op, 'INSIDE', 0.8) is None
+    # Ручная правка ножа побеждает
+    circ_op.attributes['lead_override'] = {'lead_inside': {'angle': 30}}
+    assert auto_inner_lead_for_op(prj, circ_op, 'OUTSIDE', 0.8) is None
+    # «Все элементы» — поля панели как есть
+    prj2 = _two_knife_project(lead_mode=1)
+    assert auto_inner_lead_for_op(
+        prj2, prj2.operations[0], 'OUTSIDE', 0.8) is None
+    # Юзер трогал угол — угол его, длину ещё подбираем
+    prj3 = _two_knife_project()
+    prj3.attributes['lead_auto_inner'] = {'angle': False, 'length': True}
+    c = auto_inner_lead_for_op(prj3, prj3.operations[0], 'OUTSIDE', 0.8)
+    assert 'angle' not in c and 'length' in c
+
+
+def test_auto_lead_small_knife_does_not_touch_big_one():
+    """Прямоугольник в программе режется ровно как без автоподбора,
+    а кружок — как если бы ему одному поставили 90° в поле панели."""
+    from camsys.core.cutting_macro import CuttingMacroParams
+    from camsys.post.package_export import PackageExporter
+    import camsys.post.mtx_anderson  # noqa
+
+    def prog(prj, angle=45.0, length=1.0):
+        p = CuttingMacroParams()
+        p.knife_angle, p.tip_diameter, p.bottom = 90.0, 0.8, 0.25
+        p.lead_inside.angle, p.lead_inside.length = angle, length
+        files = PackageExporter(prj, p).generate(only_stages=('rough_all',))
+        return [ln for ln in list(files.values())[0].splitlines()
+                if 'NC-Program created on' not in ln]
+
+    rect_auto = prog(_two_knife_project(flags=True, only='Knife_2'))
+    rect_plain = prog(_two_knife_project(flags=False, only='Knife_2'))
+    assert rect_auto == rect_plain, 'автоподбор изменил прямоугольник'
+    circ_auto = prog(_two_knife_project(flags=True, only='Knife_1'))
+    circ_plain = prog(_two_knife_project(flags=False, only='Knife_1'))
+    circ_90 = prog(_two_knife_project(flags=False, only='Knife_1'),
+                   angle=90.0, length=1.0)
+    assert circ_auto != circ_plain, 'кружку автоподбор не дал своего лида'
+    assert circ_auto == circ_90, 'кружок получил не то, что даёт поле 90°'
+
+
+def test_auto_lead_viewer_matches_post_rule():
+    """Вьювер рисует то же правило: прямоугольник как без автоподбора,
+    кружок — как с полем 90°."""
+    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+    try:
+        from PySide6 import QtWidgets
+    except Exception:
+        print('  SKIP — нет PySide6')
+        return
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    from camsys.core.cutting_macro import CuttingMacroParams
+    from camsys.ui.viewer_2d import CamScene, add_toolpaths_to_scene
+
+    keep = []
+
+    def boxes(prj, angle=45.0):
+        p = CuttingMacroParams()
+        p.knife_angle, p.tip_diameter, p.bottom = 90.0, 0.8, 0.25
+        p.lead_inside.angle = angle
+        sc = CamScene()
+        keep.append(sc)
+        items = add_toolpaths_to_scene(
+            sc, prj, {'tool_radius': 0.4, 'tool_equidistant': 1.3}, p)
+        names = {o.id: prj.get_geometry(o.geometry_ids[0]).name
+                 for o in prj.operations}
+        out = {}
+        for i in items:
+            oid = getattr(i, 'op_id', None)
+            if oid not in names:
+                continue
+            r = i.boundingRect()
+            out.setdefault(names[oid], []).append(
+                (str(getattr(i, 'kind', '')), round(r.x(), 4),
+                 round(r.y(), 4), round(r.width(), 4), round(r.height(), 4)))
+        return out
+
+    auto = boxes(_two_knife_project(flags=True))
+    plain = boxes(_two_knife_project(flags=False))
+    at90 = boxes(_two_knife_project(flags=False), angle=90.0)
+    assert auto['Knife_2'] == plain['Knife_2'], 'прямоугольник изменился'
+    assert auto['Knife_1'] != plain['Knife_1'], 'кружок без своего лида'
+    assert auto['Knife_1'] == at90['Knife_1'], 'кружок не как с полем 90°'

@@ -918,6 +918,15 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
             # каждому ножу иметь СВОИ параметры lead'а, не привязанные к 
             # текущим глобальным полям.
             ov = op.attributes.get('lead_override', {}).get(src_key, {})
+            if not ov:
+                # Режим «Авто»: внутренний лид от размера ЭТОГО ножа
+                # (та же функция, что в посте).
+                from ..geometry.lead_inout import auto_inner_lead_for_op
+                _auto = auto_inner_lead_for_op(
+                    project, op, tp.side.name,
+                    getattr(cutting_params, 'tip_diameter', 0.8))
+                if _auto:
+                    ov = _auto
             user_offset = ov.get('offset', src.offset)
             lead_in_angle = ov.get('angle', src.angle)
             lead_in_length_mult = ov.get('length', src.length)

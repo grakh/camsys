@@ -804,6 +804,15 @@ class MtxAndersonGVM(PostProcessor):
             _ov_in = _ov_out = _lead_ov.get('lead_outside', {})
         else:
             _ov_in = _ov_out = {}
+        # Режим «Авто»: внутренний лид — от размера ЭТОГО ножа
+        # (auto_inner_lead_for_op — та же функция во вьювере).
+        if not _lead_ov and not is_corner_rework:
+            from ..geometry.lead_inout import auto_inner_lead_for_op
+            _auto = auto_inner_lead_for_op(
+                project, op, tp.side.name,
+                2.0 * _x('tool_radius', 0.4))
+            if _auto:
+                _ov_in = _ov_out = dict(_auto)
 
         # Автоподбор отключаем, если позицию задал юзер (ручная правка
         # или режим «Все элементы»): его точка — закон, автосдвиг её

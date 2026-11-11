@@ -816,3 +816,75 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
     if best is not None:
         return best[1], best[2], best[3], best[4]
     return prefer, 1.0, angle_deg, -1.0
+
+
+# ── Автоподбор внутреннего лида ПО НОЖУ (v1.7.69) ──
+# Раньше подбор шёл по самому мелкому ножу проекта и писался в общее поле
+# панели — и маленький кружок одного заказа ставил 90° всем ножам, даже
+# большим прямоугольникам другого заказа. Теперь каждый нож получает свой
+# угол/длину от СВОЕГО размера. Одна функция для вьювера и поста.
+
+def auto_inner_lead(polypath, tip_diameter: float):
+    """(angle_deg, length_mult) внутреннего лида для ножа по его габариту.
+
+    Формула прежняя (эталон: диаметр 2 мм, пятка 0.8 → L=0.7·R):
+    угол <5R → 90°, <10R → 60°, иначе 45°. Для крупных ножей даёт
+    производственное умолчание 45° / 1.0.
+    """
+    import math
+    from .path_offset import polypath_bbox
+    x0, y0, x1, y1 = polypath_bbox(polypath)
+    diam = math.hypot(x1 - x0, y1 - y0) / math.sqrt(2)
+    pyatka = float(tip_diameter) if tip_diameter and tip_diameter > 0 else 0.8
+    tool_radius = pyatka / 2.0
+    if diam < 2 * pyatka:
+        L_mm = 0.1
+    elif diam < 4 * pyatka:
+        L_mm = (diam - pyatka) / 4.0
+    elif diam < 8 * pyatka:
+        L_mm = tool_radius
+    else:
+        L_mm = 2 * tool_radius
+    length = L_mm / tool_radius
+    length = max(0.1, min(1.0, round(length * 10) / 10))
+    char_width = diam / 2.0
+    if char_width < tool_radius * 5:
+        angle = 90.0
+    elif char_width < tool_radius * 10:
+        angle = 60.0
+    else:
+        angle = 45.0
+    return angle, length
+
+
+def auto_inner_lead_for_op(project, op, side_name: str, tip_diameter: float):
+    """Значения автоподбора для этого прохода или None, если не применяется.
+
+    Применяется только в режиме «Авто» (lead_mode 0), только к внутреннему
+    резу (сторона OUTSIDE), без ручной правки ножа и только к тем полям,
+    которые юзер не трогал (project.attributes['lead_auto_inner']).
+    Возвращает dict с ключами 'angle' и/или 'length'.
+    """
+    attrs = getattr(project, 'attributes', None) or {}
+    try:
+        if int(attrs.get('lead_mode', 0)) != 0:
+            return None
+    except Exception:
+        return None
+    flags = attrs.get('lead_auto_inner')
+    if not flags or side_name != 'OUTSIDE':
+        return None
+    if op.attributes.get('lead_override'):
+        return None
+    if not op.geometry_ids:
+        return None
+    g = project.get_geometry(op.geometry_ids[0])
+    if g is None or not g.polypath or not g.polypath.segments:
+        return None
+    angle, length = auto_inner_lead(g.polypath, tip_diameter)
+    out = {}
+    if flags.get('angle'):
+        out['angle'] = angle
+    if flags.get('length'):
+        out['length'] = length
+    return out or None

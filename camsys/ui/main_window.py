@@ -919,97 +919,30 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         }
     
     def _on_auto_lead_clicked(self):
-        """Автоподбор угла и длины ВНУТРЕННЕГО лида (lead_in_*).
-        
-        Эмпирическая формула, калиброванная под пользовательский эталон
-        (диам=2мм пятка=0.8 → L=0.7). Угол: <5R→90°, <10R→60°, иначе 45°.
-        
-        Применяет ТОЛЬКО к Внутреннему; внешний не трогает.
-        Подсветка изменённых полей остаётся ДО экспорта или ручной правки.
+        """Автоподбор ВНУТРЕННЕГО лида — теперь ПО НОЖУ (v1.7.69).
+
+        Раньше угол/длина считались по самому мелкому ножу проекта и
+        писались в общие поля панели: маленький кружок одного заказа
+        ставил 90° всем ножам, в том числе большим прямоугольникам
+        другого заказа. Теперь поля панели НЕ трогаются (остаются 45° /
+        1.0 или то, что ввёл юзер), а в проекте отмечается, какие поля
+        автоподбор вправе заменять у отдельного ножа. Сам подбор делает
+        geometry.lead_inout.auto_inner_lead_for_op — одна функция для
+        вьювера и поста.
         """
         main = self.window()
         sess = getattr(main, 'session', None)
-        if sess is None or not sess.project.operations:
+        if sess is None or sess.project is None:
             return
-        
-        from camsys.geometry.path_offset import polypath_bbox
-        from camsys.core.project import OperationKind
-        import math
-        
-        min_diag = float('inf')
-        for op in sess.project.operations:
-            if op.kind != OperationKind.BLADE_FORMING: continue
-            if not op.geometry_ids: continue
-            g = sess.project.get_geometry(op.geometry_ids[0])
-            if not g or not g.polypath: continue
-            x0, y0, x1, y1 = polypath_bbox(g.polypath)
-            diag = math.hypot(x1 - x0, y1 - y0)
-            if diag < min_diag:
-                min_diag = diag
-        if min_diag == float('inf'):
-            return
-        
         try:
-            tip_str = self.tip.currentText().replace('_', '.')
-            pyatka = float(tip_str)
+            sess.project.attributes['lead_auto_inner'] = {
+                'angle': not getattr(self, '_lead_in_angle_user_set', False),
+                'length': not getattr(self, '_lead_in_length_user_set', False),
+            }
         except Exception:
-            pyatka = 0.8
-        tool_radius = pyatka / 2.0
-        
-        diam = min_diag / math.sqrt(2)
-        if diam < 2 * pyatka:
-            L_mm = 0.1
-        elif diam < 4 * pyatka:
-            L_mm = (diam - pyatka) / 4.0
-        elif diam < 8 * pyatka:
-            L_mm = tool_radius
-        else:
-            L_mm = 2 * tool_radius
-        best_length = L_mm / tool_radius if tool_radius > 1e-9 else 1.0
-        best_length = max(0.1, min(1.0, round(best_length * 10) / 10))
-        
-        char_width = diam / 2.0
-        if char_width < tool_radius * 5:
-            angle = 90.0
-        elif char_width < tool_radius * 10:
-            angle = 60.0
-        else:
-            angle = 45.0
-        
-        old_angle = self.lead_in_angle.value()
-        old_length = self.lead_in_length.value()
-        # Ручная правка юзера превыше автоподбора: если он трогал поле — 
-        # оставляем как есть и не подсвечиваем.
-        change_angle = (abs(old_angle - angle) > 1e-3 
-                        and not getattr(self, '_lead_in_angle_user_set', False))
-        change_length = (abs(old_length - best_length) > 1e-3 
-                         and not getattr(self, '_lead_in_length_user_set', False))
-        if not change_angle and not change_length:
-            return
-        # Подменяем значения с блокировкой сигналов, чтобы не взвести флаги
-        if change_angle:
-            self.lead_in_angle.blockSignals(True)
-            self.lead_in_angle.setValue(angle)
-            self.lead_in_angle.blockSignals(False)
-        if change_length:
-            self.lead_in_length.blockSignals(True)
-            self.lead_in_length.setValue(best_length)
-            self.lead_in_length.blockSignals(False)
-        hi = "background-color: #fff3a0;"
-        # Подсветка ОСТАЁТСЯ — снимется при экспорте или ручной правке поля.
-        if change_angle:
-            self.lead_in_angle.setStyleSheet(hi)
-            try:
-                self.lead_in_angle.valueChanged.disconnect(self._clear_lead_in_angle_hi)
-            except Exception: pass
-            self.lead_in_angle.valueChanged.connect(self._clear_lead_in_angle_hi)
-        if change_length:
-            self.lead_in_length.setStyleSheet(hi)
-            try:
-                self.lead_in_length.valueChanged.disconnect(self._clear_lead_in_length_hi)
-            except Exception: pass
-            self.lead_in_length.valueChanged.connect(self._clear_lead_in_length_hi)
-    
+            pass
+        self.clear_auto_lead_highlight()
+
     def _clear_lead_in_angle_hi(self, *_):
         self.lead_in_angle.setStyleSheet("")
     
@@ -2424,7 +2357,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         
-        # ── Автоподбор лидов перед отрисовкой ──
+        # ── Автоподбор лидов перед отрисовкой (по ножу, поля не трогаются) ──
         # Анализируем макет и подставляем оптимальные angle/length внутреннего
         # лида (lead_in_*). Поле подсвечивается жёлтым на 2 сек если изменилось.
         # Юзер видит что было предложено и может поправить, нажать «Обновить».
