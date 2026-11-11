@@ -463,7 +463,9 @@ def test_auto_inner_lead_is_per_knife():
     a = auto_inner_lead_for_op(prj, circ_op, 'OUTSIDE', 0.8)
     b = auto_inner_lead_for_op(prj, rect_op, 'OUTSIDE', 0.8)
     print(f'  кружок {a}, прямоугольник {b}')
-    assert a['angle'] == 90.0
+    # Ø3: 90° и длина 0.8 — наибольшая, при которой заход влезает
+    # (1.0 уходит в противоположную стенку, v1.7.71)
+    assert a == {'angle': 90.0, 'length': 0.8}, a
     assert b == {'angle': 45.0, 'length': 1.0}
     # Внешний рез автоподбор не трогает
     assert auto_inner_lead_for_op(prj, circ_op, 'INSIDE', 0.8) is None
@@ -502,7 +504,7 @@ def test_auto_lead_small_knife_does_not_touch_big_one():
     circ_auto = prog(_two_knife_project(flags=True, only='Knife_1'))
     circ_plain = prog(_two_knife_project(flags=False, only='Knife_1'))
     circ_90 = prog(_two_knife_project(flags=False, only='Knife_1'),
-                   angle=90.0, length=1.0)
+                   angle=90.0, length=0.8)
     assert circ_auto != circ_plain, 'кружку автоподбор не дал своего лида'
     assert circ_auto == circ_90, 'кружок получил не то, что даёт поле 90°'
 
@@ -522,10 +524,11 @@ def test_auto_lead_viewer_matches_post_rule():
 
     keep = []
 
-    def boxes(prj, angle=45.0):
+    def boxes(prj, angle=45.0, length=1.0):
         p = CuttingMacroParams()
         p.knife_angle, p.tip_diameter, p.bottom = 90.0, 0.8, 0.25
         p.lead_inside.angle = angle
+        p.lead_inside.length = length
         sc = CamScene()
         keep.append(sc)
         items = add_toolpaths_to_scene(
@@ -545,7 +548,46 @@ def test_auto_lead_viewer_matches_post_rule():
 
     auto = boxes(_two_knife_project(flags=True))
     plain = boxes(_two_knife_project(flags=False))
-    at90 = boxes(_two_knife_project(flags=False), angle=90.0)
+    at90 = boxes(_two_knife_project(flags=False), angle=90.0, length=0.8)
     assert auto['Knife_2'] == plain['Knife_2'], 'прямоугольник изменился'
     assert auto['Knife_1'] != plain['Knife_1'], 'кружок без своего лида'
     assert auto['Knife_1'] == at90['Knife_1'], 'кружок не как с полем 90°'
+
+
+def test_auto_inner_lead_fits_the_hole():
+    """Длина автоподбора — наибольшая, при которой заход влезает в
+    кружок (сверено с полным построением во вьювере), а одинаковые
+    кружки на границе 90°/60° получают ОДИН угол."""
+    import math as _m
+    from camsys.geometry.primitives import Arc as _A, Polypath as _P
+    from camsys.geometry.lead_inout import auto_inner_lead
+
+    def circ(D, cx=0.0, cy=0.0):
+        r = D / 2.0
+        return _P(segments=[
+            _A(a=(cx + r, cy), b=(cx - r, cy), center=(cx, cy), ccw=True),
+            _A(a=(cx - r, cy), b=(cx + r, cy), center=(cx, cy), ccw=True)],
+            closed=True)
+    got = {D: auto_inner_lead(circ(D), 0.8, 1.3) for D in (2, 3, 4, 8)}
+    print(f'  {got}')
+    assert got[2] == (90.0, 0.4)
+    assert got[3] == (90.0, 0.8)
+    assert got[4] == (60.0, 1.0)
+    assert got[8] == (45.0, 1.0)
+    # Ø4 в разных местах листа (шум габарита) — один угол
+    angles = {auto_inner_lead(circ(4.0, x, y), 0.8, 1.3)[0]
+              for x, y in ((636.117, 84.0), (603.1, 51.0), (64.0, 479.0),
+                           (381.6, 479.0), (643.8, 412.9))}
+    assert len(angles) == 1, angles
+
+
+def test_lead_check_measures_cutter_like_the_control():
+    """Путь фрезы по лиду — дуга концентрическая, как у стойки: короткий
+    заход в кружок Ø8 больше не «коллизия» (0.636 вместо 0.650 было
+    ошибкой замера хордами, v1.7.71)."""
+    import math as _m
+    from camsys.geometry.primitives import Arc as _A, Polypath as _P
+    from camsys.geometry.lead_inout import _inner_lead_fits
+    for m in (1.0, 0.8, 0.6, 0.4, 0.2, 0.1):
+        assert _inner_lead_fits(4.0, 45.0, m, 1.3), m
+    assert not _inner_lead_fits(1.5, 90.0, 1.0, 1.3)

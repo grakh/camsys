@@ -810,7 +810,8 @@ class MtxAndersonGVM(PostProcessor):
             from ..geometry.lead_inout import auto_inner_lead_for_op
             _auto = auto_inner_lead_for_op(
                 project, op, tp.side.name,
-                2.0 * _x('tool_radius', 0.4))
+                2.0 * _x('tool_radius', 0.4),
+                _x('tool_equidistant', 1.3))
             if _auto:
                 _ov_in = _ov_out = dict(_auto)
 

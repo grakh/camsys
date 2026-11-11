@@ -927,7 +927,8 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
                 from ..geometry.lead_inout import auto_inner_lead_for_op
                 _auto = auto_inner_lead_for_op(
                     project, op, tp.side.name,
-                    getattr(cutting_params, 'tip_diameter', 0.8))
+                    getattr(cutting_params, 'tip_diameter', 0.8),
+                    float(options_extras.get('tool_equidistant', 1.3)))
                 if _auto:
                     ov = _auto
             user_offset = ov.get('offset', src.offset)

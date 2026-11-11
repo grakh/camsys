@@ -824,40 +824,95 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
 # большим прямоугольникам другого заказа. Теперь каждый нож получает свой
 # угол/длину от СВОЕГО размера. Одна функция для вьювера и поста.
 
-def auto_inner_lead(polypath, tip_diameter: float):
+import functools as _functools
+
+
+@_functools.lru_cache(maxsize=4096)
+def _inner_lead_fits(r_hole: float, angle: float, mult: float,
+                     equidistant: float) -> bool:
+    """Влезает ли внутренний лид (заход) в отверстие радиуса r_hole.
+
+    Строится настоящий лид — той же функцией и с теми же правилами
+    (длина прямой по альфе, дуга = mult × эквидистанта, нижний порог
+    радиуса под компенсацию), что у прохода, — на круге радиуса r_hole,
+    и меряется путь фрезы (как у стойки) до лезвия.
+    """
+    import math
+    from .primitives import Arc, Polypath
+    from .lead_collision import (
+        LeadGeometryRequest, build_lead_for_polypath, own_contour_clearance,
+        _exact_cut_lines, LEAD_MIN_COMP_RADIUS)
+    if r_hole <= 0:
+        return False
+    d = equidistant / 2.0
+    # Внутренний рез идёт ПО ЧАСОВОЙ: G42 уводит фрезу внутрь (так
+    # проход OUTSIDE и строится в посте после нормализации направления).
+    circ = Polypath(segments=[
+        Arc(a=(r_hole, 0.0), b=(-r_hole, 0.0), center=(0.0, 0.0), ccw=False),
+        Arc(a=(-r_hole, 0.0), b=(r_hole, 0.0), center=(0.0, 0.0), ccw=False)],
+        closed=True)
+    sin_a = max(0.05, math.sin(math.radians(max(5.0, min(175.0, angle)))))
+    req = LeadGeometryRequest(
+        is_entry=True, pass_side="OUTSIDE", angle_deg=angle,
+        line_length=mult * equidistant / sin_a,
+        arc_radius=mult * equidistant, style="line_arc",
+        side_ref=circ, min_arc_radius=d + LEAD_MIN_COMP_RADIUS)
+    try:
+        lead = build_lead_for_polypath(circ, req)
+    except Exception:
+        return False
+    if lead is None or not lead.segments:
+        return False
+    cut = _exact_cut_lines(lead, d)
+    if not cut:
+        return False
+    pts = [la for (la, _lb) in cut] + [cut[-1][1]]
+    clr = own_contour_clearance(pts, circ, lead.segments[-1].b,
+                                max(0.05, d * 0.5))
+    return clr >= d - 0.005
+
+
+def auto_inner_lead(polypath, tip_diameter: float,
+                    equidistant: float = 1.3):
     """(angle_deg, length_mult) внутреннего лида для ножа по его габариту.
 
-    Формула прежняя (эталон: диаметр 2 мм, пятка 0.8 → L=0.7·R):
-    угол <5R → 90°, <10R → 60°, иначе 45°. Для крупных ножей даёт
-    производственное умолчание 45° / 1.0.
+    Угол — прежняя формула (<5R → 90°, <10R → 60°, иначе 45°).
+    Длина (v1.7.71) — НАИБОЛЬШАЯ из 1.0, 0.9 … 0.1, при которой лид с
+    этим углом влезает в ножа: проверка строит настоящий лид на круге,
+    вписанном в габарит. Прежняя формула считала длину в радиусах фрезы,
+    а поле — в эквидистантах (×1.3 против ×0.4): кружку Ø3 давала 1.0 и
+    90°, и заход уходил в противоположную стенку на 0.43 мм. Крупным
+    ножам по-прежнему 45° / 1.0.
     """
     import math
     from .path_offset import polypath_bbox
     x0, y0, x1, y1 = polypath_bbox(polypath)
-    diam = math.hypot(x1 - x0, y1 - y0) / math.sqrt(2)
+    # Округление до микрона (v1.7.71): кружок Ø4 при пятке 0.8 лежит
+    # РОВНО на границе 90°/60° (2.0 против 5·0.4), и шум в 15-м знаке
+    # габарита давал двум одинаковым кружкам разные углы.
+    diam = round(math.hypot(x1 - x0, y1 - y0) / math.sqrt(2), 3)
     pyatka = float(tip_diameter) if tip_diameter and tip_diameter > 0 else 0.8
     tool_radius = pyatka / 2.0
-    if diam < 2 * pyatka:
-        L_mm = 0.1
-    elif diam < 4 * pyatka:
-        L_mm = (diam - pyatka) / 4.0
-    elif diam < 8 * pyatka:
-        L_mm = tool_radius
-    else:
-        L_mm = 2 * tool_radius
-    length = L_mm / tool_radius
-    length = max(0.1, min(1.0, round(length * 10) / 10))
-    char_width = diam / 2.0
-    if char_width < tool_radius * 5:
+    char_width = round(diam / 2.0, 3)
+    if char_width < round(tool_radius * 5, 3):
         angle = 90.0
-    elif char_width < tool_radius * 10:
+    elif char_width < round(tool_radius * 10, 3):
         angle = 60.0
     else:
         angle = 45.0
+    r_in = round(min(x1 - x0, y1 - y0) / 2.0, 3)
+    eq = float(equidistant) if equidistant and equidistant > 0 else 1.3
+    length = 0.1
+    for k in range(10, 0, -1):
+        m = k / 10.0
+        if _inner_lead_fits(round(r_in, 4), angle, m, round(eq, 4)):
+            length = m
+            break
     return angle, length
 
 
-def auto_inner_lead_for_op(project, op, side_name: str, tip_diameter: float):
+def auto_inner_lead_for_op(project, op, side_name: str, tip_diameter: float,
+                           equidistant: float = 1.3):
     """Значения автоподбора для этого прохода или None, если не применяется.
 
     Применяется только в режиме «Авто» (lead_mode 0), только к внутреннему
@@ -881,7 +936,7 @@ def auto_inner_lead_for_op(project, op, side_name: str, tip_diameter: float):
     g = project.get_geometry(op.geometry_ids[0])
     if g is None or not g.polypath or not g.polypath.segments:
         return None
-    angle, length = auto_inner_lead(g.polypath, tip_diameter)
+    angle, length = auto_inner_lead(g.polypath, tip_diameter, equidistant)
     out = {}
     if flags.get('angle'):
         out['angle'] = angle

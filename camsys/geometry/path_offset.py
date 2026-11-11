@@ -546,7 +546,7 @@ def shift_start_from_diagonal_zero(polypath: Polypath,
                 continue
             sd = _m.sqrt(disc)
             for t in ((-B - sd) / 2.0, (-B + sd) / 2.0):
-                if t > 1e-6:
+                if t > -1e-9:
                     pt = (P[0] + t * dx, P[1] + t * dy)
                     if _point_on_arc_span(s, pt) and (
                             best is None or t < best[0]):
@@ -559,7 +559,10 @@ def shift_start_from_diagonal_zero(polypath: Polypath,
                 continue
             t = ((ax - P[0]) * ey - (ay - P[1]) * ex) / den
             u = ((ax - P[0]) * dy - (ay - P[1]) * dx) / den
-            if t > 1e-6 and -1e-6 <= u <= 1 + 1e-6 and (
+            # t ≥ 0, а не > 0 (v1.7.71): у ОСТРОГО угла луч начинается
+            # прямо в вершине. Её отбрасывали, и «ноль» уезжал в
+            # ПРОТИВОПОЛОЖНЫЙ угол — лид прямоугольника вставал внизу слева.
+            if t > -1e-9 and -1e-6 <= u <= 1 + 1e-6 and (
                     best is None or t < best[0]):
                 best = (t, (P[0] + t * dx, P[1] + t * dy))
     zero_pt = best[1] if best else P

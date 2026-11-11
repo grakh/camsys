@@ -266,6 +266,36 @@ def own_contour_clearance(cut_points, own_polypath, entry_point,
     return best
 
 
+def _exact_cut_lines(lead_poly, tool_offset: float):
+    """Путь фрезы по лиду — как у стойки по G42: прямая в параллельную,
+    дуга в КОНЦЕНТРИЧЕСКУЮ (v1.7.71), затем в ломаную.
+
+    Раньше путь фрезы строился сдвигом ХОРД ломаной по их нормалям. На
+    малой дуге лида (радиус 0.75, хорда 0.3) концы хорд сдвигались не по
+    радиусу, и замер занижал зазор до своего лезвия на 15…70 мкм. Внутри
+    кружков это давало красный лид там, где фреза идёт ровно на 0.65 от
+    лезвия: на Ø8 заход длиной 1.0 был чистым, а КОРОЧЕ — «коллизия».
+    Пусто — если точный сдвиг не построился (вызывающий откатится на
+    старый способ).
+    """
+    try:
+        from .path_offset import offset_right_of_travel
+        cut = offset_right_of_travel(lead_poly, tool_offset)
+    except Exception:
+        return []
+    if not cut or not cut.segments:
+        return []
+    pts = []
+    for sg in cut.segments:
+        q = _segment_to_polyline(sg, max_chord=0.1)
+        if pts and q and math.hypot(pts[-1][0] - q[0][0],
+                                    pts[-1][1] - q[0][1]) < 1e-9:
+            pts.extend(q[1:])
+        else:
+            pts.extend(q)
+    return [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+
+
 def lead_crosses_contours(lead_poly: Optional[Polypath],
                            contours_lines: List[Tuple[str, List[Tuple[Point, Point]]]],
                            own_geom_id: str,
@@ -360,6 +390,8 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
     if path_is_cutter:
         cut_lines = lead_lines
     else:
+        cut_lines = _exact_cut_lines(lead_poly, tool_offset)
+    if not path_is_cutter and not cut_lines:
         cut_lines = []
         for _i in range(len(lead_pts) - 1):
             _x0, _y0 = lead_pts[_i]

@@ -843,3 +843,21 @@ def test_identical_circles_get_identical_start():
                 _split_circle(1.5, ph, n), off).segments[0].a
             starts.add((round(a[0], 3), round(a[1], 3)))
         assert len(starts) == 1, (off, starts)
+
+
+def test_sharp_rectangle_start_is_top_right():
+    """Прямоугольник с ОСТРЫМИ углами: старт у правого верхнего угла,
+    на 5 мм влево по верху. Луч диагонали начинается в самой вершине —
+    её отбрасывали (t > 0), и «ноль» уезжал в левый нижний угол
+    (Knife_83/84 заказа 127422, v1.7.71)."""
+    from camsys.geometry.primitives import Line as _L, Polypath as _P
+    from camsys.geometry.path_offset import shift_start_from_diagonal_zero
+    V = [(151.122, 207.789), (57.237, 207.789), (57.237, 342.072),
+         (151.122, 342.072)]
+    for pts in (V, V[::-1]):
+        pp = _P(segments=[_L(a=pts[i], b=pts[(i + 1) % 4])
+                          for i in range(4)], closed=True)
+        a = shift_start_from_diagonal_zero(pp, 0.0).segments[0].a
+        assert abs(a[0] - 151.122) < 1e-6 and abs(a[1] - 342.072) < 1e-6, a
+        a = shift_start_from_diagonal_zero(pp, -5.0).segments[0].a
+        assert abs(a[0] - 146.122) < 1e-6 and abs(a[1] - 342.072) < 1e-6, a
