@@ -154,6 +154,53 @@ def _segments_intersect_2d(a1: Point, a2: Point,
     return False
 
 
+def _lead_crosses_own_axis(lead_poly, own_pp, entry_point, lead_bb,
+                           step: float = 0.03, join_skip: float = 0.35):
+    """Пересекает ли осевая лида осевую своего ножа дальше `join_skip`
+    от стыка. Обе кривые — точной геометрией, с шагом `step`."""
+    pad = 0.5
+    x0, y0, x1, y1 = (lead_bb[0] - pad, lead_bb[1] - pad,
+                      lead_bb[2] + pad, lead_bb[3] + pad)
+
+    def dense(sg):
+        n = max(2, int(math.ceil(sg.length() / step)))
+        return [sg.point_at(k / n) for k in range(n + 1)]
+
+    own_lines = []
+    for sg in own_pp.segments:
+        q = dense(sg)
+        for i in range(len(q) - 1):
+            a, b = q[i], q[i + 1]
+            if (max(a[0], b[0]) < x0 or min(a[0], b[0]) > x1 or
+                    max(a[1], b[1]) < y0 or min(a[1], b[1]) > y1):
+                continue
+            own_lines.append((a, b))
+    if not own_lines:
+        return False
+    for sg in lead_poly.segments:
+        q = dense(sg)
+        for i in range(len(q) - 1):
+            a, b = q[i], q[i + 1]
+            mx, my = (a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5
+            if math.hypot(mx - entry_point[0], my - entry_point[1]) < join_skip:
+                continue
+            for (c, d) in own_lines:
+                if _segments_intersect_2d(a, b, c, d):
+                    return True
+    return False
+
+
+def _segment_intersection_point(a1, a2, b1, b2):
+    """Точка пересечения двух отрезков (или None, если параллельны)."""
+    rx, ry = a2[0] - a1[0], a2[1] - a1[1]
+    sx, sy = b2[0] - b1[0], b2[1] - b1[1]
+    den = rx * sy - ry * sx
+    if abs(den) < 1e-15:
+        return None
+    t = ((b1[0] - a1[0]) * sy - (b1[1] - a1[1]) * sx) / den
+    return (a1[0] + t * rx, a1[1] + t * ry)
+
+
 def _point_to_segment_distance(p: Point, a: Point, b: Point) -> float:
     """Точное минимальное расстояние от точки p до отрезка [a, b]."""
     dx, dy = b[0] - a[0], b[1] - a[1]
@@ -472,6 +519,13 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
             own_exact, entry_point, max(0.05, tool_offset * 0.5))
         if _own_clr < tool_offset - 0.005:
             return True
+        # Осевая лида не должна переходить через осевую своего ножа
+        # дальше окрестности стыка (v1.7.71). Ломаные кеша (хорды 0.5 и
+        # 0.3) пологое пересечение теряют — меряем по точной геометрии,
+        # мелким шагом, только рядом с лидом.
+        if _lead_crosses_own_axis(lead_poly, own_exact, entry_point,
+                                  lead_bb):
+            return True
 
     bbox_dict = dict(contours_bboxes)
     
@@ -564,8 +618,17 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
                         # и все заходы на кругах горели красным, хотя
                         # зазор у них ровно в норме (0.650 при нужных
                         # 0.650). На 124173 таких было 14 из 124.
-                        if _point_to_segment_distance(
-                                entry_point, la, lb) < _JOIN_SEG_MM:
+                        # Меряем от стыка ТОЧКУ ПЕРЕСЕЧЕНИЯ, а не хорду
+                        # (v1.7.71): хорда до 0.3 мм, и пересечение в
+                        # 0.54 мм от стыка (124819, Knife_14 — выход
+                        # переходил через свою осевую) попадало в окно
+                        # целиком. Пока замер зазора шёл по хордам, эту
+                        # позицию отсекал он — ошибкой; точный замер её
+                        # пропустил, и вскрылось это окно.
+                        _ip = _segment_intersection_point(la, lb, ca, cb)
+                        if _ip is None or math.hypot(
+                                _ip[0] - entry_point[0],
+                                _ip[1] - entry_point[1]) < _JOIN_SEG_MM:
                             continue
                     return True
                 # 2. Distance-check (внутри зоны эквидистанты соседа) — 
