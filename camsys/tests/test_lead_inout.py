@@ -446,8 +446,8 @@ def _two_knife_project(lead_mode=0, flags=True, only=None):
         lay.geometries.append(g)
         prj.add_blade_operation(g.id)
     prj.attributes['lead_mode'] = lead_mode
-    if flags:
-        prj.attributes['lead_auto_inner'] = {'angle': True, 'length': True}
+    prj.attributes['lead_auto_inner'] = {'angle': bool(flags),
+                                         'length': bool(flags)}
     return prj
 
 

@@ -926,7 +926,10 @@ def auto_inner_lead_for_op(project, op, side_name: str, tip_diameter: float,
             return None
     except Exception:
         return None
-    flags = attrs.get('lead_auto_inner')
+    # Флаги ставит главное окно (какие поля юзер трогал). Через API
+    # (CamSession без окна) их нет — значит, поля не трогали: подбираем
+    # оба, как «Авто» в окне с нетронутыми полями (v1.7.74).
+    flags = attrs.get('lead_auto_inner', {'angle': True, 'length': True})
     if not flags or side_name != 'OUTSIDE':
         return None
     if op.attributes.get('lead_override'):

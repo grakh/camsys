@@ -1272,6 +1272,22 @@ class CamSession:
     #  СОХРАНЕНИЕ / ЗАГРУЗКА СОСТОЯНИЯ СЕССИИ (JSON)
     # ─────────────────────────────────────────────────────────────────────
     
+    def set_lead_mode(self, mode: int = 0, auto_angle: bool = True,
+                      auto_length: bool = True) -> None:
+        """Режим заходов для API (v1.7.74) — как переключатель в окне.
+
+        mode: 0 «Авто» (правила подбора работают), 1 «Все элементы»,
+        2 «Выделенные» (правила не работают — заход строго по параметрам).
+        auto_angle / auto_length: в «Авто» подбирать ли угол / длину
+        внутреннего лида по ножу (False — как поле, тронутое в окне:
+        берётся значение из cutting_params на все ножи).
+        """
+        if self.project is None:
+            raise RuntimeError("Проект не загружен")
+        self.project.attributes['lead_mode'] = int(mode)
+        self.project.attributes['lead_auto_inner'] = {
+            'angle': bool(auto_angle), 'length': bool(auto_length)}
+
     def save_state_to_json(self, path: str) -> None:
         """Сохраняет cutting_params + post_name + состояние операций.
         

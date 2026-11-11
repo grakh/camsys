@@ -394,3 +394,27 @@ def test_corner_threshold_default_present_in_settings_file():
     print(f'  умолчание порога: {val}')
     assert val is not None, "ключ corner_radius_threshold отсутствует"
     assert 0.1 <= float(val) <= 5.0
+
+
+def test_api_lead_mode_matches_window():
+    """API (CamSession без окна) считает «Авто» как окно с нетронутыми
+    полями; set_lead_mode переключает режим (v1.7.74)."""
+    import os
+    ai = '/mnt/user-data/uploads/124173_test.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет 124173_test.ai')
+        return
+    from camsys.core.session import CamSession
+    from camsys.geometry.lead_inout import knife_is_auto, auto_inner_lead_for_op
+    s = CamSession()
+    s.load_ai(ai)
+    s.create_blade_operations()
+    op = s.project.operations[0]
+    assert knife_is_auto(s.project, op)
+    assert auto_inner_lead_for_op(s.project, op, 'OUTSIDE', 0.8) is not None
+    s.set_lead_mode(1)
+    assert not knife_is_auto(s.project, op)
+    assert auto_inner_lead_for_op(s.project, op, 'OUTSIDE', 0.8) is None
+    s.set_lead_mode(0, auto_angle=False, auto_length=False)
+    assert knife_is_auto(s.project, op)
+    assert auto_inner_lead_for_op(s.project, op, 'OUTSIDE', 0.8) is None
