@@ -1000,6 +1000,7 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         # в .anc: на «ложке» 124173 картинка показывала ход в карман,
         # которого в программе нет. Радиусы считает ОДНА функция на
         # вьювер и пост — расходиться им больше нечем.
+        _bridge_ends_v = []
         if polypath is not None and polypath.closed:
             try:
                 from ..geometry.path_offset import (bridge_narrow_pits,
@@ -1014,13 +1015,14 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
                     _tg_v = _m_bv.tan(_m_bv.radians(_ang_v / 2.0))
                     _abs_v = ((float(_eq_v) - _tip_v) / (2.0 * _tg_v)
                               if (_eq_v and _tg_v > 0) else 0.25)
+                # Запас радиуса моста 0, как у альфы (v1.7.76) — тот же
+                # вызов, что в посте.
                 _rm_v, _rb_v = bridge_radii_for_tool(
-                    _tip_v, _abs_v, _eq_v,
-                    margin=float(options_extras.get(
-                        'machinable_margin', 0.02)))
+                    _tip_v, _abs_v, _eq_v)
                 _pp_v, _br_v = bridge_narrow_pits(polypath, _rb_v,
                                                   r_mouth=_rm_v)
                 if _br_v:
+                    _bridge_ends_v = [(b['A'], b['B']) for b in _br_v]
                     polypath = _ssdz(_pp_v, user_offset, _min_straight_v)
             except Exception:
                 pass
@@ -1121,6 +1123,10 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
     # Пост поднимает радиус дуг, которые компенсация G41/G42 выворачивает
     # (см. mtx_anderson). Повторяем ту же правку здесь, иначе вьювер рисовал
     # бы эквидистанту НЕ той осевой, что уходит в .anc.
+    try:
+        _bridge_ends_v
+    except NameError:
+        _bridge_ends_v = []
     if geom.is_closed and not (is_3d_corner or is_2d_corner):
         try:
             from ..geometry.path_offset import ensure_machinable_arcs
@@ -1134,7 +1140,8 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
                     margin=float(options_extras.get(
                         'machinable_margin', 0.02)),
                     max_deviation_mm=float(options_extras.get(
-                        'machinable_max_deviation', 0.05)))[0]
+                        'machinable_max_deviation', 0.05)),
+                    keep_bridges=_bridge_ends_v)[0]
         except Exception:
             pass
     
@@ -1358,8 +1365,10 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         polypath_offset = offset_polypath_uniform(
             polypath_for_vis, tool_offset, inward=False
         )
-        # Удаляем самопересечения (петли в местах тугой кривизны)
-        polypath_offset = trim_self_intersections(polypath_offset)
+        # Удаляем самопересечения (петли в местах тугой кривизны и
+        # «рыбий хвост» у моста кармана — до 4 эквидистант длиной)
+        polypath_offset = trim_self_intersections(
+            polypath_offset, max_loop_len=8.0 * tool_offset)
         # Стыкуем углы — после оффсета параллельные сегменты не соединены
         polypath_offset = join_polypath_corners(polypath_offset, tol=0.01)
     elif tp.side == ContourSide.OUTSIDE:
@@ -1367,7 +1376,8 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         polypath_offset = offset_polypath_uniform(
             polypath_for_vis, tool_offset, inward=True
         )
-        polypath_offset = trim_self_intersections(polypath_offset)
+        polypath_offset = trim_self_intersections(
+            polypath_offset, max_loop_len=8.0 * tool_offset)
         polypath_offset = join_polypath_corners(polypath_offset, tol=0.01)
     else:
         polypath_offset = polypath

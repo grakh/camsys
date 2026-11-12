@@ -2591,11 +2591,48 @@ def test_neck_bridged_with_large_tip():
         normalize_for_side(g.polypath, 'OUTSIDE'), -5.0)
     got = {}
     for tip in (0.8, 1.2):
-        rm, rb = bridge_radii_for_tool(tip, 0.25, tip + 0.5, margin=0.02)
+        rm, rb = bridge_radii_for_tool(tip, 0.25, tip + 0.5, margin=0.0)
         _o, br = bridge_narrow_pits(pp, rb, r_mouth=rm)
         got[tip] = [round(b['skip'], 2) for b in br]
         for b in br:
             assert b.get('mouth_chord', 0) <= 2 * rm, b
     print(f'  мосты: {got}')
-    assert got[0.8] == [15.93], got
-    assert len(got[1.2]) == 1 and 12.0 < got[1.2][0] < 15.0, got
+    # 0.8 — мост как у альфы (v1.7.76, радиус ровно E/2: 15.86);
+    # 1.2 — шейка отсекается ЦЕЛИКОМ, от наружного устья (16.3, а не
+    # 13.4 у петли, как в v1.7.75 — тогда наружная часть шейки
+    # оставалась в проходе и рисовала петлю).
+    assert got[0.8] == [15.86], got
+    assert len(got[1.2]) == 1 and 15.5 < got[1.2][0] < 17.5, got
+
+
+def test_bridge_is_alpha_like_and_ends_at_intersection():
+    """Мост кармана как у альфы (v1.7.76): радиус РОВНО эквидистанта/2
+    (R0.65 при 1.3), устье Knife_19 в пределах 50 мкм от альфы
+    (124173_test.anc: X64.66035 Y219.46415 → X63.5475 Y219.98738).
+    С запасом 0.02 оставалась дуга R0.02, и фреза шла за пересечение
+    эквидистант стенок — «рыбий хвост»."""
+    ai = '/mnt/user-data/uploads/124173_test.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет 124173_test.ai')
+        return
+    import math as _m
+    from camsys.core.session import CamSession
+    from camsys.geometry.path_offset import (
+        bridge_narrow_pits, bridge_radii_for_tool,
+        shift_start_from_diagonal_zero)
+    from camsys.geometry.direction import normalize_for_side
+    rm, rb = bridge_radii_for_tool(0.8, 0.25, 1.3)
+    assert abs(rb - 0.65) < 1e-12 and abs(rm - 0.65) < 1e-12, (rm, rb)
+    s = CamSession()
+    s.load_ai(ai)
+    g = [x for x in s.project.get_layer_by_name('Knife').geometries
+         if x.name == 'Knife_19'][0]
+    pp = shift_start_from_diagonal_zero(
+        normalize_for_side(g.polypath, 'OUTSIDE'), -5.0)
+    _o, br = bridge_narrow_pits(pp, rb, r_mouth=rm)
+    assert len(br) == 1
+    A, B = br[0]['A'], br[0]['B']
+    alpha = [(64.66035, 219.46415), (63.5475, 219.98738)]
+    dev = max(min(_m.dist(p, q) for q in alpha) for p in (A, B))
+    print(f'  устье от альфы: {dev * 1000:.0f} мкм')
+    assert dev < 0.050, (A, B)

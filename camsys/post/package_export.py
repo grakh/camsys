@@ -846,8 +846,7 @@ class PackageExporter:
         tool_eq = tip + 2.0 * bottom * _m.tan(
             _m.radians(float(self.params.knife_angle) / 2.0))
         r_mouth, r_bridge = bridge_radii_for_tool(
-            tip, bottom, tool_eq,
-            margin=float(getattr(self.params, 'machinable_margin', 0.02)))
+            tip, bottom, tool_eq)
         # Ширина реза ТОНКОЙ фрезы — по ней режется карман на куски.
         _cut_w = (float(getattr(self.params, 'corner_tip_diameter', 0.6)
                         or 0.6)

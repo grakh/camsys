@@ -564,6 +564,7 @@ class MtxAndersonGVM(PostProcessor):
             _override_overlap = _ov.get('overlap', _override_overlap)
         
         _min_straight = 0.0
+        _bridge_ends = []
         if (not is_corner_rework and geom.is_closed and tp.entry.enabled):
             # СМЕЩЕНИЕ ВДОЛЬ ВЕРХНЕЙ ГРАНИ от верхне-правого угла контура:
             # 0 = угол, <0 = влево по верху, >0 = зажим у угла. Единая точка
@@ -616,9 +617,7 @@ class MtxAndersonGVM(PostProcessor):
                 # одна функция, общая с вьювером (v1.7.35).
                 from ..geometry.path_offset import bridge_radii_for_tool
                 _rm, _rb = bridge_radii_for_tool(
-                    _tip, _abs_d, _eq_t,
-                    margin=float(options.extras.get(
-                        'machinable_margin', 0.02)))
+                    _tip, _abs_d, _eq_t)
                 _pp2, _brs = bridge_narrow_pits(polypath, _rb, r_mouth=_rm)
                 if _brs:
                     polypath = _pp2
@@ -635,6 +634,7 @@ class MtxAndersonGVM(PostProcessor):
                     except Exception:
                         pass
                     for _b in _brs:
+                        _bridge_ends.append((_b['A'], _b['B']))
                         _mach_log(options, geom, tp,
                                   f"ОБРЕЗАН КАРМАН: выброшено "
                                   f"{_b['skip']:.2f} мм, устье "
@@ -685,6 +685,7 @@ class MtxAndersonGVM(PostProcessor):
             _marg = float(options.extras.get('machinable_margin', 0.02))
             polypath, _fixed, _unfix = ensure_machinable_arcs(
                 polypath, _t_off, _gcomp_early, margin=_marg,
+                keep_bridges=_bridge_ends,
                 max_deviation_mm=float(options.extras.get(
                     'machinable_max_deviation', 0.05)))
             # ── УЗКИЕ МЕСТА (v1.7.22, пока только журнал) ──

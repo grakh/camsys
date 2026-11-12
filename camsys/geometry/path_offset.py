@@ -2146,7 +2146,8 @@ def _truncate_segment_to_t(seg, t: float, keep_start: bool):
     return seg
 
 
-def trim_self_intersections(polypath: Polypath, max_loop_segs: int = 6) -> Polypath:
+def trim_self_intersections(polypath: Polypath, max_loop_segs: int = 6,
+                            max_loop_len: float = 0.0) -> Polypath:
     """Удаляет петли (self-intersections) на эквидистантном контуре.
     
     После offset_polypath_uniform могут возникать петли там где радиус 
@@ -2174,7 +2175,20 @@ def trim_self_intersections(polypath: Polypath, max_loop_segs: int = 6) -> Polyp
         found = None
         for i in range(n):
             s1 = segs[i]
-            for delta in range(2, min(max_loop_segs + 1, n - 1)):
+            # max_loop_len (v1.7.76): петля ищется и длиннее max_loop_segs
+            # сегментов, если по длине она не больше max_loop_len. У моста
+            # кармана эквидистанты стенок пересекаются раньше, чем фреза
+            # доходит до моста, а стенки — это десятки мелких дуг: петля
+            # «рыбий хвост» в 6 сегментов не влезала и рисовалась. Стойка
+            # по G42 режет её по пересечению — так и рисуем.
+            _cum = 0.0
+            for delta in range(2, n - 1):
+                if delta > max_loop_segs:
+                    if max_loop_len <= 0:
+                        break
+                    _cum += segs[(i + delta - 1) % n].length()
+                    if _cum > max_loop_len:
+                        break
                 j = (i + delta) % n
                 if j == i: continue
                 if (j + 1) % n == i: continue  # соседние при замыкании
@@ -2950,7 +2964,7 @@ def _subpath_forward(polypath: Polypath, s0: float, s1: float) -> List[Segment]:
 
 def bridge_radii_for_tool(tip_diameter: float, abs_depth: float,
                           tool_equidistant: float,
-                          margin: float = 0.02) -> Tuple[float, float]:
+                          margin: float = 0.0) -> Tuple[float, float]:
     """Радиусы для обрезки карманов: (устье, дуга моста) — v1.7.35.
 
     ОДНА точка расчёта для поста и вьювера: формула жила в двух местах, и
@@ -2962,7 +2976,15 @@ def bridge_radii_for_tool(tip_diameter: float, abs_depth: float,
     одна и та же на любом угле; на эталонном угле 80 это совпало с
     хордой альфы 1.2893 с точностью 0.7 мкм.
 
-    Радиус дуги — тот же, но не меньше `эквидистанта/2 + margin`: иначе
+    Радиус дуги — тот же, но не меньше `эквидистанта/2 + margin`.
+    margin по умолчанию 0 (v1.7.76), как у альфы: на угле 90 у неё R0.65
+    при эквидистанте 1.3 — дуга после компенсации вырождается в точку,
+    и фреза разворачивается на месте, на пересечении эквидистант стенок.
+    С запасом 0.02 оставалась дуга R0.02, фреза доходила до её начала
+    МИМО пересечения и рисовала петлю «рыбий хвост» — заходя за
+    эквидистанту противоположной стенки. Без запаса и устье совпало с
+    альфой: Knife_19 хорда 1.2369 против 1.2297 (было 1.2608).
+    Раньше: иначе
     компенсация G41/G42 вычитает из него всю эквидистанту, радиус
     обращается в ноль и дуга схлопывается (на угле 90 запас формулы
     альфы РОВНО нулевой, выше 90 — отрицательный).
@@ -3124,34 +3146,74 @@ def _bridge_one(polypath: Polypath, r_bridge: float,
             if math.hypot(pts[ib0][1][0] - pts[ia0][1][0],
                           pts[ib0][1][1] - pts[ia0][1][1]) > diam * 1.4:
                 continue
-            # Устье уточняем ЛОКАЛЬНО на мелком шаге: грубого хватает
-            # найти карман, но не поставить мост. Точки считаются по
-            # запросу, без огромного массива — иначе шаг 2 мкм на контуре
-            # 270 мм даёт 135 тысяч точек и минуты счёта (v1.7.33).
-            sa0, sb0 = pts[ia0][0], pts[ib0][0]
+            # Устье — САМОЕ ВНЕШНЕЕ (v1.7.76): из точек двух берегов
+            # берётся пара с хордой не больше «диаметр − запас», дающая
+            # наибольший пропуск. Раньше устье искалось от ВНУТРЕННИХ
+            # концов узких участков и останавливалось на первой подходящей
+            # хорде. У тупикового кармана это одно и то же, а у шейки,
+            # за которой петля (Knife_19), мост вставал у петли, и
+            # наружная часть шейки оставалась в проходе — эквидистанты
+            # стенок там пересекались: «рыбий хвост» у моста и большая
+            # петля при пятке 1.2.
+            lim = diam - mouth_margin_mm
+
+            def _chord(sa, sb):
+                A = _point_at_s(polypath, sa, lidx)
+                B = _point_at_s(polypath, sb, lidx)
+                return math.hypot(B[0] - A[0], B[1] - A[1]), A, B
+
+            def _skip(sa, sb):
+                f = (sb - sa) % total
+                return min(f, total - f)
+
+            xs = [pts[i][0] for i in range(runs[x][0], runs[x][1] + 1)]
+            ys = [pts[i][0] for i in range(runs[y][0], runs[y][1] + 1)]
+            best = None
+            for sa in xs:
+                pa = _point_at_s(polypath, sa, lidx)
+                for sb in ys:
+                    pb = _point_at_s(polypath, sb, lidx)
+                    if math.hypot(pb[0] - pa[0], pb[1] - pa[1]) > lim:
+                        continue
+                    sk = _skip(sa, sb)
+                    if best is None or sk > best[0]:
+                        best = (sk, sa, sb)
             found = None
-            # Окно поиска устья (v1.7.75): было жёстко 0.5 мм. Конец
-            # узкого участка — где зазор впервые меньше диаметра, а до
-            # хорды «диаметр минус запас» надо пройти тем дальше, чем
-            # положе сходятся берега и чем крупнее фреза. Knife_19 при
-            # пятке 1.2: 0.60 мм — мост не находился, эквидистанта в
-            # шейке петли пересекала сама себя. Теперь окно — до длины
-            # узкого участка (не больше 3 мм): грубо шагом 0.02, потом
-            # уточнение прежним мелким шагом.
+            if best is not None:
+                _sk, sa, sb = best
+                # уточнение: раздвигаем концы мелким шагом, пока хорда
+                # в пределе. Направление «наружу» — то, что растит пропуск.
+                for _it in range(2):
+                    for which in (0, 1):
+                        step = fine_step_mm
+                        for _sgn in (1, -1):
+                            while True:
+                                na = sa + (_sgn * step if which == 0 else 0)
+                                nb = sb + (_sgn * step if which == 1 else 0)
+                                if _skip(na, nb) <= _skip(sa, sb):
+                                    break
+                                if _chord(na, nb)[0] > lim:
+                                    break
+                                sa, sb = na, nb
+                c, _A, _B = _chord(sa, sb)
+                if c <= lim:
+                    found = (sa, sb, _A, _B)
+            # Прежний поиск — от внутренних концов узких участков (до
+            # v1.7.75): у тупиковых карманов он совпадает с альфой точнее
+            # (Knife_14 1.2562 у альфы: прежний 1.25…, внешний 1.2405).
+            # Внешнее устье берётся, только если оно отсекает заметно
+            # больше — то есть за прежним устьем остаётся узкая шейка.
+            sa0, sb0 = pts[runs[x][1]][0], pts[runs[y][0]][0]
             run_x = pts[runs[x][1]][0] - pts[runs[x][0]][0]
             run_y = pts[runs[y][1]][0] - pts[runs[y][0]][0]
             win = max(0.5, min(3.0, run_x, run_y))
             coarse = 0.02
-            def _ok(sa, sb):
-                A = _point_at_s(polypath, sa, lidx)
-                B = _point_at_s(polypath, sb, lidx)
-                if math.hypot(B[0] - A[0], B[1] - A[1]) <= diam - mouth_margin_mm:
-                    return (sa, sb, A, B)
-                return None
+            old_found = None
             tot_c = None
             for tc in range(0, int(win / coarse) + 1):
                 for da in range(0, tc + 1):
-                    if _ok(sa0 - da * coarse, sb0 + (tc - da) * coarse):
+                    if _chord(sa0 - da * coarse,
+                              sb0 + (tc - da) * coarse)[0] <= lim:
                         tot_c = tc
                         break
                 if tot_c is not None:
@@ -3161,12 +3223,18 @@ def _bridge_one(polypath: Polypath, r_bridge: float,
                 lo = max(0, (tot_c - 1) * k)
                 for tot_in in range(lo, tot_c * k + 1):
                     for da in range(0, tot_in + 1):
-                        found = _ok(sa0 - da * fine_step_mm,
-                                    sb0 + (tot_in - da) * fine_step_mm)
-                        if found:
+                        _sa = sa0 - da * fine_step_mm
+                        _sb = sb0 + (tot_in - da) * fine_step_mm
+                        c2, A2, B2 = _chord(_sa, _sb)
+                        if c2 <= lim:
+                            old_found = (_sa, _sb, A2, B2)
                             break
-                    if found:
+                    if old_found:
                         break
+            if old_found and (found is None or
+                              _skip(found[0], found[1])
+                              <= _skip(old_found[0], old_found[1]) + 0.5):
+                found = old_found
             if not found:
                 continue
             sa, sb, _A, _B = found
@@ -3491,8 +3559,8 @@ def _recenter_arc(a: Point, b: Point, radius: float, ccw: bool):
 
 
 def find_unmachinable_arcs(polypath: Polypath, tool_offset: float,
-                           gcomp: str, margin: float = 0.0
-                           ) -> List[dict]:
+                           gcomp: str, margin: float = 0.0,
+                           keep_bridges=None) -> List[dict]:
     """Находит дуги, которые компенсация выворачивает (R_факт ≤ 0).
 
     Args:
@@ -3518,6 +3586,19 @@ def find_unmachinable_arcs(polypath: Polypath, tool_offset: float,
         r = seg.radius
         if r >= need - 1e-9:
             continue
+        # Мост кармана (v1.7.76): радиус РОВНО эквидистанта/2, как у
+        # альфы, — фреза разворачивается на месте, на пересечении
+        # эквидистант стенок. Это не «непроходимая дуга», поднимать её
+        # радиус нельзя: вернётся петля за пересечением.
+        if keep_bridges and r >= tool_offset - 1e-9:
+            _hit = False
+            for (_A, _B) in keep_bridges:
+                for _p in (seg.a, seg.b):
+                    if (_m.hypot(_p[0] - _A[0], _p[1] - _A[1]) < 1e-5 or
+                            _m.hypot(_p[0] - _B[0], _p[1] - _B[1]) < 1e-5):
+                        _hit = True
+            if _hit:
+                continue
         chord = _m.hypot(seg.b[0] - seg.a[0], seg.b[1] - seg.a[1])
         out.append({
             'index': i,
@@ -3535,7 +3616,8 @@ def ensure_machinable_arcs(polypath: Polypath, tool_offset: float,
                            gcomp: str, margin: float = 0.02,
                            max_deviation_mm: float = 0.05,
                            max_sweep_deg: float = 170.0,
-                           max_affected_fraction: float = 0.30
+                           max_affected_fraction: float = 0.30,
+                           keep_bridges=None
                            ) -> Tuple[Polypath, List[dict], List[dict]]:
     """Заменяет непроходимые дуги проходимым скруглением.
 
@@ -3557,7 +3639,8 @@ def ensure_machinable_arcs(polypath: Polypath, tool_offset: float,
         Если исправлять нечего — возвращается ИСХОДНЫЙ объект (is polypath),
         что позволяет вызывающему коду дёшево проверить «ничего не менялось».
     """
-    bad = find_unmachinable_arcs(polypath, tool_offset, gcomp, margin)
+    bad = find_unmachinable_arcs(polypath, tool_offset, gcomp, margin,
+                                 keep_bridges=keep_bridges)
     if not bad:
         return polypath, [], []
 
