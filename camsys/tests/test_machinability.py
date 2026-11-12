@@ -2697,3 +2697,41 @@ def test_hairpin_bridged_and_no_corner_inside_unmachinable_pocket():
                       for q in pts) < 0.5:
             bad.append(o.name)
     assert not bad, bad
+
+
+def test_tight_fillet_replaced_tangentially():
+    """Тесные вогнутые дуги заменяются касательной дугой, без изломов
+    (v1.7.78). Knife_16, пятка 1.2: подъём R0.66 → 0.87 с закреплёнными
+    концами давал изломы 9.3° и 4.7° — «ступенька» на пути."""
+    ai = '/mnt/user-data/uploads/124173_test.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет 124173_test.ai')
+        return
+    from camsys.core.session import CamSession
+    from camsys.geometry.path_offset import ensure_machinable_arcs
+    from camsys.geometry.direction import normalize_for_side
+    s = CamSession()
+    s.load_ai(ai)
+    g = [x for x in s.project.get_layer_by_name('Knife').geometries
+         if x.name == 'Knife_16'][0]
+
+    def max_kink(pp):
+        segs, worst = pp.segments, 0.0
+        for i, sg in enumerate(segs):
+            nx = segs[(i + 1) % len(segs)]
+            assert math.hypot(sg.b[0] - nx.a[0], sg.b[1] - nx.a[1]) < 1e-6
+            t1, t2 = sg.tangent_at_end(), nx.tangent_at_start()
+            worst = max(worst, abs(math.degrees(math.atan2(
+                t1[0] * t2[1] - t1[1] * t2[0], t1[0] * t2[0] + t1[1] * t2[1]))))
+        return worst
+
+    for side in ('INSIDE', 'OUTSIDE'):
+        pp = normalize_for_side(g.polypath, side)
+        base = max_kink(pp)
+        out, fixed, unfix = ensure_machinable_arcs(pp, 0.85, 'G42',
+                                                   margin=0.02)
+        assert fixed and not unfix, (side, len(fixed), len(unfix))
+        assert any(r.get('refillet') for r in fixed)
+        k = max_kink(out)
+        print(f'  {side}: дуг {len(fixed)}, излом {base:.2f}° → {k:.2f}°')
+        assert k <= base + 0.01, (side, base, k)

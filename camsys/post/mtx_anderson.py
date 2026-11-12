@@ -564,6 +564,7 @@ class MtxAndersonGVM(PostProcessor):
             _override_overlap = _ov.get('overlap', _override_overlap)
         
         _min_straight = 0.0
+        _tight = 0.0
         _bridge_ends = []
         if (not is_corner_rework and geom.is_closed and tp.entry.enabled):
             # СМЕЩЕНИЕ ВДОЛЬ ВЕРХНЕЙ ГРАНИ от верхне-правого угла контура:
@@ -579,8 +580,11 @@ class MtxAndersonGVM(PostProcessor):
             _min_straight = (straight_entry_min_len(
                 options.extras.get('tool_equidistant', 1.3))
                 if knife_is_auto(project, op) else 0.0)
+            # Старт не в тесной вогнутости — только в «Авто» (v1.7.78)
+            _tight = (float(options.extras.get('tool_equidistant', 1.3)) / 2.0
+                      if _min_straight > 0 else 0.0)
             polypath = shift_start_from_diagonal_zero(
-                polypath, _override_offset, _min_straight)
+                polypath, _override_offset, _min_straight, _tight)
         
         # ── OVERLAP откладывается до ПОСЛЕ автоподбора ──
         # Если применить overlap здесь, polypath перестанет быть замкнутым 
@@ -630,7 +634,7 @@ class MtxAndersonGVM(PostProcessor):
                         from ..geometry.path_offset import (
                             shift_start_from_diagonal_zero as _shift2)
                         polypath = _shift2(polypath, _override_offset,
-                                           _min_straight)
+                                           _min_straight, _tight)
                     except Exception:
                         pass
                     for _b in _brs:
@@ -725,6 +729,19 @@ class MtxAndersonGVM(PostProcessor):
                           f"исправлено непроходимых дуг: {len(_fixed)} "
                           f"(мин. R {min(r['radius'] for r in _fixed):.4f} → "
                           f"{_t_off + _marg:.4f} мм)")
+                # Скругления, в которые фреза не влезает (v1.7.78): путь
+                # идёт касательной дугой, металл в скруглении остаётся.
+                _rf = [r for r in _fixed if r.get('refillet')
+                       and r.get('deviation', 0.0) > 0.010]
+                if _rf:
+                    _mach_log(options, geom, tp,
+                              f"СКРУГЛЕНИЕ МЕНЬШЕ ФРЕЗЫ: {len(_rf)} шт., "
+                              f"останется до "
+                              f"{max(r['deviation'] for r in _rf):.3f} мм "
+                              f"металла (R{min(r['radius'] for r in _rf):.3f} "
+                              f"при нужном {_t_off + _marg:.3f}); "
+                              f"доработка T3 берёт углы с радиусом меньше "
+                              f"порога в настройках")
             for _r in _unfix:
                 _mach_log(options, geom, tp,
                           f"НЕ ИСПРАВЛЕНО: дуга R={_r['radius']:.4f} мм "

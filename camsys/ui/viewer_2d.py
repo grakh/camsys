@@ -991,7 +991,10 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
             from ..geometry.lead_inout import knife_is_auto as _kia
             _min_straight_v = (_seml(options_extras.get(
                 'tool_equidistant', 1.3)) if _kia(project, op) else 0.0)
-            polypath = _ssdz(polypath, user_offset, _min_straight_v)
+            _tight_v = (float(options_extras.get('tool_equidistant', 1.3))
+                        / 2.0 if _min_straight_v > 0 else 0.0)
+            polypath = _ssdz(polypath, user_offset, _min_straight_v,
+                             _tight_v)
 
         # ── ОБРЕЗКА КАРМАНОВ (v1.7.35) ──
         # Пост выбрасывает участки, куда основная фреза не проходит, и
@@ -1023,7 +1026,8 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
                                                   r_mouth=_rm_v)
                 if _br_v:
                     _bridge_ends_v = [(b['A'], b['B']) for b in _br_v]
-                    polypath = _ssdz(_pp_v, user_offset, _min_straight_v)
+                    polypath = _ssdz(_pp_v, user_offset, _min_straight_v,
+                                     _tight_v)
             except Exception:
                 pass
 
@@ -1371,6 +1375,12 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
             polypath_offset, max_loop_len=8.0 * tool_offset)
         # Стыкуем углы — после оффсета параллельные сегменты не соединены
         polypath_offset = join_polypath_corners(polypath_offset, tol=0.01)
+        # Петли, которые хорды не видят (пересекаются сами ДУГИ — на
+        # мелких вогнутых скруглениях, Knife_16 при пятке 1.2), — по
+        # истинному пересечению, как на углах (v1.7.78). Только картинка:
+        # стойка режет такой угол по пересечению сама.
+        from ..geometry.path_offset import despike_polypath as _dsp
+        polypath_offset = _dsp(polypath_offset)
     elif tp.side == ContourSide.OUTSIDE:
         # ВНУТРЕННИЙ рез (OUTSIDE=CW + G42 → ВНУТРЬ к центру, «−»).
         polypath_offset = offset_polypath_uniform(
@@ -1379,6 +1389,12 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         polypath_offset = trim_self_intersections(
             polypath_offset, max_loop_len=8.0 * tool_offset)
         polypath_offset = join_polypath_corners(polypath_offset, tol=0.01)
+        # Петли, которые хорды не видят (пересекаются сами ДУГИ — на
+        # мелких вогнутых скруглениях, Knife_16 при пятке 1.2), — по
+        # истинному пересечению, как на углах (v1.7.78). Только картинка:
+        # стойка режет такой угол по пересечению сама.
+        from ..geometry.path_offset import despike_polypath as _dsp
+        polypath_offset = _dsp(polypath_offset)
     else:
         polypath_offset = polypath
     

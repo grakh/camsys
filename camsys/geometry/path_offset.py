@@ -593,9 +593,84 @@ def prefer_straight_entry(pp: Polypath, min_len: float,
     return pp
 
 
+def avoid_tight_concave_start(pp: Polypath, tool_offset: float,
+                              margin: float = 0.02, pad: float = 1.0
+                              ) -> Polypath:
+    """Старт не в тесной вогнутости (v1.7.78).
+
+    Если старт попал на вогнутую под фрезу дугу, радиус которой меньше
+    эквидистанты/2 + запас, или на вогнутый излом, эквидистанты соседних
+    участков там пересекаются. В середине контура это просто угол — путь
+    режется по пересечению. А на шве старт и конец прохода — отдельные
+    кадры с лидами, пересечения никто не строит: фреза начинает за ним и
+    заходит к противоположной стенке ближе эквидистанты (Knife_16 при
+    пятке 1.2: «проходит без угла»). Сдвигаем старт вперёд по ходу за
+    такую зону плюс `pad` мм. Обход — G42, фреза справа по ходу.
+    """
+    if not pp or not pp.closed or not pp.segments or tool_offset <= 0:
+        return pp
+    import math as _m
+    segs = pp.segments
+    n = len(segs)
+    lens = [sg.length() for sg in segs]
+    total = sum(lens)
+    if total <= 3 * pad:
+        return pp
+    starts = []
+    acc = 0.0
+    for L in lens:
+        starts.append(acc)
+        acc += L
+    zones = []
+    need = tool_offset + margin
+    for i, sg in enumerate(segs):
+        if arc_shrinks_under_comp(sg, 'G42') and sg.radius < need - 1e-9:
+            zones.append((starts[i] - pad, starts[i] + lens[i] + pad))
+        # вогнутый излом: поворот вправо (к фрезе)
+        nx = segs[(i + 1) % n]
+        t1 = sg.tangent_at_end()
+        t2 = nx.tangent_at_start()
+        cross = t1[0] * t2[1] - t1[1] * t2[0]
+        dot = t1[0] * t2[0] + t1[1] * t2[1]
+        turn = _m.degrees(_m.atan2(cross, dot))
+        if turn < -5.0:
+            e = starts[i] + lens[i]
+            zones.append((e - pad, e + pad))
+    if not zones:
+        return pp
+
+    def _inside(sv):
+        for a, b in zones:
+            for k in (-1, 0, 1):
+                if a + k * total <= sv <= b + k * total:
+                    return b + k * total
+        return None
+
+    sv = 0.0
+    moved = False
+    for _ in range(50):
+        end = _inside(sv)
+        if end is None:
+            break
+        sv = end + 1e-6
+        moved = True
+        if sv > total:
+            return pp
+    if not moved:
+        return pp
+    # точка на расстоянии sv по контуру
+    sv = sv % total
+    for i, L in enumerate(lens):
+        if sv <= starts[i] + L or i == n - 1:
+            t = 0.0 if L <= 0 else max(0.0, min(1.0, (sv - starts[i]) / L))
+            return shift_start_to_point(pp, segs[i].point_at(t))
+    return pp
+
+
 def shift_start_from_diagonal_zero(polypath: Polypath,
                                    offset: float,
-                                   min_straight: float = 0.0) -> Polypath:
+                                   min_straight: float = 0.0,
+                                   tight_offset: float = 0.0) -> Polypath:
     """Смещение старта по alphacam-модели: 0 = точка, где ДИАГОНАЛЬ из
     верхне-правого угла bbox к центру пересекает контур (на скруглённом
     углу — его 45°-точка, однозначная для ОБОИХ проходов). От неё:
@@ -652,7 +727,8 @@ def shift_start_from_diagonal_zero(polypath: Polypath,
     zero_pt = best[1] if best else P
     pp = shift_start_to_point(polypath, zero_pt)
     if abs(offset) < 1e-9:
-        return prefer_straight_entry(pp, min_straight)
+        return avoid_tight_concave_start(
+            prefer_straight_entry(pp, min_straight), tight_offset)
     base = pp.segments[0].a
     # off<0 → X уменьшается (влево по верху); off>0 → Y уменьшается (вниз)
     chosen = None
@@ -664,8 +740,9 @@ def shift_start_from_diagonal_zero(polypath: Polypath,
         if chosen_score is None or score > chosen_score:
             chosen_score = score
             chosen = cand
-    return prefer_straight_entry(chosen if chosen is not None else pp,
-                                 min_straight)
+    return avoid_tight_concave_start(
+        prefer_straight_entry(chosen if chosen is not None else pp,
+                              min_straight), tight_offset)
 
 
 def shift_start_to_top_x(polypath: Polypath, offset_from_rt: float,
@@ -3690,6 +3767,17 @@ def ensure_machinable_arcs(polypath: Polypath, tool_offset: float,
     segs = list(polypath.segments)
     fixed: List[dict] = []
     unfixable: List[dict] = []
+    # ── КАСАТЕЛЬНОЕ СКРУГЛЕНИЕ (v1.7.78) ──
+    # Подъём радиуса с закреплёнными концами ломает касательные: на
+    # Knife_16 при пятке 1.2 две дуги R0.66 → R0.87 дали изломы 9.3° и
+    # 4.7°, а на пути — «ступеньку», которой в геометрии нет. Сначала
+    # пробуем заменить подряд идущие тесные дуги ОДНОЙ дугой нужного
+    # радиуса, касательной к соседям, — как фреза и проходит такую
+    # вогнутость: касается стенок и не лезет в мелкое скругление.
+    bad, segs, _rf = _refillet_tight_runs(segs, bad, rec_need=(
+        bad[0]['needed'] if bad else 0.0), closed=polypath.closed,
+        max_deviation_mm=max(max_deviation_mm, 0.0))
+    fixed.extend(_rf)
     for rec in bad:
         i = rec['index']
         seg = segs[i]
@@ -3712,8 +3800,172 @@ def ensure_machinable_arcs(polypath: Polypath, tool_offset: float,
 
     if not fixed:
         return polypath, [], unfixable
+    segs = [sg for sg in segs if sg is not None]
     return (Polypath(segments=segs, closed=polypath.closed),
             fixed, unfixable)
+
+
+def _right_offset_locus(sg, r):
+    """Геометрическое место центров окружности радиуса r, касающейся
+    сегмента СПРАВА по ходу: ('line', p, d) или ('circle', c, R)."""
+    import math as _m
+    if isinstance(sg, Arc):
+        R = sg.radius
+        # центр дуги справа по ходу у CW (ccw=False)
+        RR = (R - r) if not sg.ccw else (R + r)
+        if RR <= 1e-9:
+            return None
+        return ('circle', sg.center, RR)
+    dx, dy = sg.b[0] - sg.a[0], sg.b[1] - sg.a[1]
+    L = _m.hypot(dx, dy)
+    if L < 1e-12:
+        return None
+    nx, ny = dy / L, -dx / L          # правая нормаль
+    return ('line', (sg.a[0] + nx * r, sg.a[1] + ny * r), (dx / L, dy / L))
+
+
+def _locus_intersections(A, B):
+    import math as _m
+    out = []
+    if A is None or B is None:
+        return out
+    if A[0] == 'line' and B[0] == 'line':
+        (px, py), (ux, uy) = A[1], A[2]
+        (qx, qy), (vx, vy) = B[1], B[2]
+        den = ux * vy - uy * vx
+        if abs(den) < 1e-12:
+            return out
+        t = ((qx - px) * vy - (qy - py) * vx) / den
+        return [(px + t * ux, py + t * uy)]
+    if A[0] == 'line':
+        A, B = B, A
+    if B[0] == 'line':
+        (cx, cy), R = A[1], A[2]
+        (px, py), (ux, uy) = B[1], B[2]
+        fx, fy = px - cx, py - cy
+        b = fx * ux + fy * uy
+        c = fx * fx + fy * fy - R * R
+        D = b * b - c
+        if D < 0:
+            return out
+        sD = _m.sqrt(D)
+        return [(px + (-b + k * sD) * ux, py + (-b + k * sD) * uy)
+                for k in (1, -1)]
+    (x1, y1), r1 = A[1], A[2]
+    (x2, y2), r2 = B[1], B[2]
+    d = _m.hypot(x2 - x1, y2 - y1)
+    if d < 1e-12 or d > r1 + r2 or d < abs(r1 - r2):
+        return out
+    a = (r1 * r1 - r2 * r2 + d * d) / (2 * d)
+    h = _m.sqrt(max(0.0, r1 * r1 - a * a))
+    mx, my = x1 + a * (x2 - x1) / d, y1 + a * (y2 - y1) / d
+    return [(mx + h * (y2 - y1) / d, my - h * (x2 - x1) / d),
+            (mx - h * (y2 - y1) / d, my + h * (x2 - x1) / d)]
+
+
+def _foot_on(sg, C, r):
+    """Точка касания окружности (C, r) с сегментом и параметр t∈[0,1]
+    (или None, если касание вне сегмента)."""
+    import math as _m
+    if isinstance(sg, Arc):
+        cx, cy = sg.center
+        dx, dy = C[0] - cx, C[1] - cy
+        d = _m.hypot(dx, dy)
+        if d < 1e-12:
+            return None
+        T = (cx + dx / d * sg.radius, cy + dy / d * sg.radius)
+        # внутри развёртки?
+        a0 = _m.atan2(sg.a[1] - cy, sg.a[0] - cx)
+        at = _m.atan2(T[1] - cy, T[0] - cx)
+        sw = _arc_sweep(sg)
+        dd = (at - a0) % (2 * _m.pi) if sg.ccw else (a0 - at) % (2 * _m.pi)
+        if dd > sw + 1e-9:
+            return None
+        return T, dd / sw if sw > 0 else 0.0
+    ax, ay = sg.a
+    dx, dy = sg.b[0] - ax, sg.b[1] - ay
+    L2 = dx * dx + dy * dy
+    if L2 < 1e-18:
+        return None
+    t = ((C[0] - ax) * dx + (C[1] - ay) * dy) / L2
+    if t < -1e-9 or t > 1 + 1e-9:
+        return None
+    return (ax + t * dx, ay + t * dy), t
+
+
+def _refillet_tight_runs(segs, bad, rec_need, closed, max_deviation_mm):
+    """Подряд идущие тесные (вогнутые, R < нужного) дуги → одна дуга
+    радиуса rec_need, касательная к соседям. Возвращает (оставшиеся bad,
+    сегменты, исправленные записи). Выброшенные сегменты — None."""
+    import math as _m
+    if not bad or rec_need <= 0:
+        return bad, segs, []
+    n = len(segs)
+    idx = sorted(r['index'] for r in bad)
+    byi = {r['index']: r for r in bad}
+    runs = []
+    for i in idx:
+        if runs and i == runs[-1][-1] + 1:
+            runs[-1].append(i)
+        else:
+            runs.append([i])
+    if closed and len(runs) > 1 and runs[0][0] == 0 and runs[-1][-1] == n - 1:
+        runs[0] = runs.pop() + runs[0]
+    left, done = [], []
+    for run in runs:
+        ip, inx = (run[0] - 1) % n, (run[-1] + 1) % n
+        if (not closed and (run[0] == 0 or run[-1] == n - 1)) \
+                or ip in byi or inx in byi or segs[ip] is None \
+                or segs[inx] is None:
+            left.extend(byi[i] for i in run)
+            continue
+        P, N = segs[ip], segs[inx]
+        r = rec_need
+        cands = _locus_intersections(_right_offset_locus(P, r),
+                                     _right_offset_locus(N, r))
+        # опорная точка — середина выбрасываемого участка
+        mid = segs[run[len(run) // 2]].point_at(0.5)
+        best = None
+        for C in cands:
+            fp, fn = _foot_on(P, C, r), _foot_on(N, C, r)
+            if fp is None or fn is None:
+                continue
+            dist = _m.hypot(C[0] - mid[0], C[1] - mid[1])
+            if best is None or dist < best[0]:
+                best = (dist, C, fp[0], fn[0])
+        if best is None:
+            left.extend(byi[i] for i in run)
+            continue
+        _d, C, T1, T2 = best
+        # отклонение: насколько старые дуги уходят от новой (только
+        # «внутрь» — в материал, куда фреза и так не лезет)
+        dev = 0.0
+        for i in run:
+            for k in range(11):
+                q = segs[i].point_at(k / 10)
+                dev = max(dev, abs(_m.hypot(q[0] - C[0], q[1] - C[1]) - r))
+        if dev > max(max_deviation_mm, 0.0) * 4:
+            left.extend(byi[i] for i in run)
+            continue
+        if isinstance(P, Arc):
+            P2 = Arc(a=P.a, b=T1, center=P.center, ccw=P.ccw)
+        else:
+            P2 = Line(a=P.a, b=T1)
+        if isinstance(N, Arc):
+            N2 = Arc(a=T2, b=N.b, center=N.center, ccw=N.ccw)
+        else:
+            N2 = Line(a=T2, b=N.b)
+        segs[ip] = P2
+        segs[inx] = N2
+        for k, i in enumerate(run):
+            segs[i] = (Arc(a=T1, b=T2, center=C, ccw=False)
+                       if k == 0 else None)
+        for i in run:
+            rr = dict(byi[i])
+            rr['refillet'] = True
+            rr['deviation'] = dev
+            done.append(rr)
+    return left, segs, done
 
 
 def simplify_for_visualization(polypath: Polypath,
