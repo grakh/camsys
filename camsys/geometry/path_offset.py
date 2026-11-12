@@ -3107,6 +3107,7 @@ def _bridge_one(polypath: Polypath, r_bridge: float,
         grid.setdefault((int(p[0] / cell), int(p[1] / cell)), []).append(k)
 
     gap = [float('inf')] * n
+    partner = [None] * n
     for i, (s, p) in enumerate(pts):
         gx, gy = int(p[0] / cell), int(p[1] / cell)
         for dx in (-1, 0, 1):
@@ -3120,6 +3121,7 @@ def _bridge_one(polypath: Polypath, r_bridge: float,
                     d = math.hypot(q[0] - p[0], q[1] - p[1])
                     if d < gap[i]:
                         gap[i] = d
+                        partner[i] = s2
 
     narrow = [i for i in range(n) if gap[i] < diam]
     if not narrow:
@@ -3132,6 +3134,32 @@ def _bridge_one(polypath: Polypath, r_bridge: float,
             st = i
         pv = i
     runs.append((st, pv))
+    # Оба берега кармана могут слиться в ОДИН узкий участок (v1.7.77):
+    # если дно кармана тоже уже фрезы, зазор < диаметра идёт без
+    # перерыва от устья по одному берегу, вокруг дна и обратно по другому.
+    # Knife_3 при пятке 1.2: один участок 168.3…182.5 мм, пары берегов
+    # нет — и шпилька не обрезалась, эквидистанта в ней пересекалась.
+    # Делим такой участок на дне: там, где ближайшая точка «напротив»
+    # из впереди-лежащей становится позади-лежащей.
+    split_runs = []
+    for (a, b) in runs:
+        cut = None
+        if b - a > 4:
+            for k in range(a + 1, b + 1):
+                pk, pk0 = partner[k], partner[k - 1]
+                if pk is None or pk0 is None:
+                    continue
+                s_k, s_k0 = pts[k][0], pts[k - 1][0]
+                if (pk0 - s_k0) > 0 and (pk - s_k) < 0 \
+                        and pts[a][0] <= pk <= pts[b][0]:
+                    cut = k
+                    break
+        if cut is not None and a < cut - 1 and cut < b:
+            split_runs.append((a, cut - 1))
+            split_runs.append((cut, b))
+        else:
+            split_runs.append((a, b))
+    runs = split_runs
     if len(runs) < 2:
         return polypath, []
 

@@ -2636,3 +2636,64 @@ def test_bridge_is_alpha_like_and_ends_at_intersection():
     dev = max(min(_m.dist(p, q) for q in alpha) for p in (A, B))
     print(f'  устье от альфы: {dev * 1000:.0f} мкм')
     assert dev < 0.050, (A, B)
+
+
+def test_hairpin_bridged_and_no_corner_inside_unmachinable_pocket():
+    """Knife_3 (шпилька) 124173_test, v1.7.77.
+
+    1. Пятка 1.2: оба берега щели и её дно уже фрезы — узкий участок
+       ОДИН, пары берегов не было, мост не ставился, и эквидистанта в
+       щели пересекала сама себя. Теперь участок делится на дне.
+    2. Пятка T3 0.6: карман не точится (щель 1.067 < реза 1.10), но угол
+       шпильки уходил отдельной угловой операцией, и её эквидистанты
+       перекрещивались в щели. Угол внутри нетточимого кармана больше
+       не режется — карман уже в отчёте и красным на экране.
+    """
+    ai = '/mnt/user-data/uploads/124173_test.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет 124173_test.ai')
+        return
+    from camsys.core.session import CamSession
+    from camsys.geometry.path_offset import (
+        bridge_narrow_pits, bridge_radii_for_tool,
+        shift_start_from_diagonal_zero)
+    from camsys.geometry.direction import normalize_for_side
+    import camsys.core.macros as macros_mod
+    from camsys.post.package_export import PackageExporter
+    from camsys.core.cutting_macro import CuttingMacroParams
+    s = CamSession()
+    s.load_ai(ai)
+    g = [x for x in s.project.get_layer_by_name('Knife').geometries
+         if x.name == 'Knife_3'][0]
+    pp = shift_start_from_diagonal_zero(
+        normalize_for_side(g.polypath, 'INSIDE'), -5.0)
+    for tip in (0.8, 1.2):
+        rm, rb = bridge_radii_for_tool(tip, 0.25, tip + 0.5)
+        _o, br = bridge_narrow_pits(pp, rb, r_mouth=rm)
+        print(f'  пятка {tip}: мост {[round(b["skip"], 2) for b in br]}')
+        assert len(br) == 1 and br[0]['skip'] > 11.0, (tip, br)
+    for gg in s.project.get_layer_by_name('Knife').geometries:
+        if gg.polypath and gg.polypath.closed:
+            s.project.add_blade_operation(gg.id)
+    macros_mod.sort_operations_by_grid(s.project)
+    p = CuttingMacroParams()
+    p.knife_angle, p.tip_diameter, p.bottom = 90.0, 0.8, 0.25
+    p.corner_tip_diameter = 0.6
+    ex = PackageExporter(s.project, p)
+    c2, _ = ex._build_corner_operations()
+    pockets = [u for u in s.project.unmachinable_pockets
+               if u['geom_id'] == g.id]
+    assert pockets, 'карман Knife_3 при T3 0.6 должен быть нетточимым'
+    pts = []
+    for u in pockets:
+        for sg in u['polypath'].segments:
+            pts += [sg.point_at(k / 10) for k in range(11)]
+    bad = []
+    for o in c2:
+        if g.id not in o.geometry_ids or 'corner' not in o.name:
+            continue
+        ap = o.attributes.get('corner_apex')
+        if ap and min(math.hypot(ap[0] - q[0], ap[1] - q[1])
+                      for q in pts) < 0.5:
+            bad.append(o.name)
+    assert not bad, bad

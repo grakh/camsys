@@ -955,6 +955,21 @@ class PackageExporter:
                       try:
                           _segs = _subpath_forward(pp, br['sA'], br['sB'])
                           if _segs:
+                              # Угол внутри такого кармана тоже не
+                              # точится — фреза не пролезает к нему, а
+                              # её эквидистанты стенок перекрещиваются
+                              # (Knife_3, пятка 1.2: угол шпильки
+                              # шёл отдельной операцией, v1.7.77).
+                              try:
+                                  _upts = [q for _s, q in _exact_axis_points(
+                                      Polypath(segments=_segs, closed=False),
+                                      0.05)[0]]
+                              except Exception:
+                                  _upts = []
+                              spans.setdefault(geom_id, []).append(
+                                  {'side': side_name, 's0': br['sA'],
+                                   's1': br['sB'], 'pts': _upts,
+                                   'unmachinable': True})
                               unmachinable.append({
                                   'geom_id': geom_id,
                                   'side': side_name,
