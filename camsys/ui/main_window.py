@@ -2625,6 +2625,12 @@ class MainWindow(QtWidgets.QMainWindow):
             # только по blade'ам, а на втором (после добавления corner'ов) — 
             # по всем ops. Результат разный между кликами «Обновить».
             corner_ops_2d, corner_ops_3d = [], []
+            # Разрывы у близкого соседнего лезвия (v1.7.79) — на ножевые
+            # операции, даже если доработка углов выключена.
+            try:
+                exp.apply_foreign_breaks()
+            except Exception:
+                pass
             try:
                 if macro.generate_corner or macro.generate_corner_3d:
                     corner_ops_2d, corner_ops_3d = exp._build_corner_operations()

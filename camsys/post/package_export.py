@@ -225,6 +225,13 @@ class PackageExporter:
             current_stage[0] += 1
             return result if result is not None else True
         
+        # Разрывы у соседних лезвий нужны основным программам даже без
+        # доработки углов (v1.7.79): ставятся на ножевые операции.
+        try:
+            self.apply_foreign_breaks()
+        except Exception:
+            pass
+
         # ── 1. Черновая всех элементов (_all_R.anc) ──
         if want('rough_all'):
             if not _report("Черновая всех"): return files
@@ -1071,6 +1078,216 @@ class PackageExporter:
         self.project.unmachinable_pockets = list(unmachinable)
         return ops, spans
 
+    def apply_foreign_breaks(self, blade_ops=None):
+        """Разрывы основного прохода у близкого чужого лезвия (v1.7.79).
+
+        Где лезвие СОСЕДНЕГО ножа ближе ширины реза основной фрезы, её
+        проход срезал бы соседа. Альфа такое место рвёт вручную —
+        «разрывы ставятся вручную, если близко лезвие». Делаем то же
+        автоматически:
+
+        * рвутся ОБА ножа — у каждого свой проход смотрит в эту щель
+          («если только один, то другой обязательно зарежет лезвие»);
+        * разрыв — участок касания плюс 2 мм с каждой стороны;
+        * участок отдаётся T3 с перекрытием ещё 1 мм за разрыв;
+        * где не пролезает и T3 — отчёт проходимости и красным на экране.
+
+        Ставит на ножевые операции op.attributes['foreign_breaks'] =
+        {сторона: [{'A': точка, 'B': точка}, ...]} — пост и вьювер режут
+        по ним проход на куски одной функцией split_at_breaks.
+
+        Returns:
+            (операции T3, {geom_id: [{'side', 's0', 's1', 'pts'}]})
+        """
+        from ..core.project import (
+            Operation, OperationKind, CutSettings, ToolPath, ContourSide,
+            LeadStyle, EntryExitConfig, PassType)
+        from ..geometry.path_offset import (
+            foreign_blade_index, foreign_conflict_ranges,
+            merge_ranges_circular, _length_index, _point_at_s,
+            _subpath_forward, _exact_axis_points)
+        from ..geometry.primitives import Polypath
+        from ..geometry.direction import normalize_for_side
+        import math as _m
+
+        if blade_ops is None:
+            blade_ops = [op for op in self.project.operations
+                         if op.kind == OperationKind.BLADE_FORMING]
+        tip = float(self.params.tip_diameter)
+        bottom = float(self.params.bottom)
+        tana = _m.tan(_m.radians(float(self.params.knife_angle) / 2.0))
+        E = tip + 2.0 * bottom * tana
+        W3 = (float(getattr(self.params, 'corner_tip_diameter', 0.6) or 0.6)
+              + 2.0 * bottom * tana)
+        BREAK_PAD = 2.0      # запас разрыва, мм
+        T3_OVER = 1.0        # T3 дальше разрыва, мм
+
+        _ck = (id(self.project), tip, bottom,
+               float(self.params.knife_angle), W3,
+               tuple(sorted(op.id for op in blade_ops)))
+        if getattr(self, '_gap_cache_key', None) == _ck:
+            ops, spans, unm = self._gap_cache
+            self.project.unmachinable_pockets = (
+                list(getattr(self.project, 'unmachinable_pockets', []) or [])
+                + [u for u in unm if u not in (
+                    getattr(self.project, 'unmachinable_pockets', []) or [])])
+            return ops, spans
+
+        knife = self.project.get_layer_by_name("Knife")
+        all_geoms = [g for g in (getattr(knife, 'geometries', ()) or ())
+                     if g is not None and g.polypath is not None
+                     and g.polypath.segments and g.is_closed]
+        ops, spans, unm = [], {}, []
+        _rep = getattr(self, 'machinability_report', None)
+        if _rep is None:
+            _rep = []
+            self.machinability_report = _rep
+        # bbox для отбора соседей
+        def _bb(pp):
+            from ..geometry.path_offset import polypath_bbox
+            return polypath_bbox(pp)
+        bbs = {id(g): _bb(g.polypath) for g in all_geoms}
+
+        for blade_op in blade_ops:
+            blade_op.attributes.pop('foreign_breaks', None)
+            if not blade_op.geometry_ids:
+                continue
+            geom_id = blade_op.geometry_ids[0]
+            geom = self.project.get_geometry(geom_id)
+            if geom is None or not geom.is_closed or geom.polypath is None:
+                continue
+            x0, y0, x1, y1 = _bb(geom.polypath)
+            reach = E + 1.0
+            near = [g.polypath for g in all_geoms if g is not geom
+                    and not (bbs[id(g)][0] > x1 + reach
+                             or bbs[id(g)][2] < x0 - reach
+                             or bbs[id(g)][1] > y1 + reach
+                             or bbs[id(g)][3] < y0 - reach)]
+            if not near:
+                continue
+            idx = foreign_blade_index(near)
+            for side_name in ('OUTSIDE', 'INSIDE'):
+                pp = normalize_for_side(geom.polypath, side_name)
+                conf = foreign_conflict_ranges(pp, idx, E / 2.0)
+                if not conf:
+                    continue
+                lidx = _length_index(pp)
+                total = lidx[2]
+                brk = merge_ranges_circular(conf, total, pad=BREAK_PAD)
+                if brk == [(0.0, total)]:
+                    _rep.append(f"[{blade_op.name} / {side_name}] СОСЕДНЕЕ "
+                                f"ЛЕЗВИЕ БЛИЖЕ ШИРИНЫ РЕЗА ПО ВСЕМУ КОНТУРУ "
+                                f"— проход не разорван, проверьте вручную.")
+                    continue
+                blade_op.attributes.setdefault('foreign_breaks', {})[
+                    side_name] = [
+                    {'A': _point_at_s(pp, a, lidx),
+                     'B': _point_at_s(pp, b, lidx)} for a, b in brk]
+                # T3: на 1 мм дальше разрыва, кроме мест, где не лезет и она
+                conf3 = foreign_conflict_ranges(pp, idx, W3 / 2.0)
+                bad3 = merge_ranges_circular(conf3, total, pad=0.3) \
+                    if conf3 else []
+                for k, (a, b) in enumerate(brk):
+                    a3, b3 = a - T3_OVER, b + T3_OVER
+                    # вычитаем места, где T3 не пролезает
+                    cuts = []
+                    for c0, c1 in bad3:
+                        for sh in (-total, 0.0, total):
+                            u0, u1 = c0 + sh, c1 + sh
+                            if u1 > a3 and u0 < b3:
+                                cuts.append((max(a3, u0), min(b3, u1)))
+                    cuts.sort()
+                    runs, cur = [], a3
+                    for u0, u1 in cuts:
+                        if u0 > cur:
+                            runs.append((cur, u0, cur > a3 + 1e-9, True))
+                        cur = max(cur, u1)
+                    if cur < b3:
+                        runs.append((cur, b3, bool(cuts), False))
+                    # флаги обрезанных концов
+                    fixed = []
+                    for r0, r1, _h, _t in runs:
+                        head_clip = any(abs(r0 - c1) < 1e-6 for _c0, c1 in cuts)
+                        tail_clip = any(abs(r1 - c0) < 1e-6 for c0, _c1 in cuts)
+                        if r1 - r0 >= 0.5:
+                            fixed.append((r0, r1, head_clip, tail_clip))
+                    for (u0, u1) in cuts:
+                        _segs = _subpath_forward(pp, u0 % total, u1 % total)
+                        if not _segs:
+                            continue
+                        _len = u1 - u0
+                        _txt = (f"[{blade_op.name} / {side_name}] ЛЕЗВИЕ "
+                                f"СОСЕДА БЛИЖЕ T3: {_len:.2f} мм не точится "
+                                f"— ширина реза тонкой фрезы {W3:.2f} мм, "
+                                f"сосед её срежет. Нужна пятка T3 тоньше "
+                                f"или правка раскладки.")
+                        _rep.append(_txt)
+                        unm.append({'geom_id': geom_id, 'side': side_name,
+                                    'polypath': Polypath(segments=_segs,
+                                                         closed=False),
+                                    'text': _txt})
+                    for j, (r0, r1, hc, tc) in enumerate(fixed):
+                        s0, s1 = r0 % total, r1 % total
+                        _segs = _subpath_forward(pp, s0, s1)
+                        pts = ([q for _s, q in _exact_axis_points(
+                            Polypath(segments=_segs, closed=False), 0.05)[0]]
+                            if _segs else [])
+                        spans.setdefault(geom_id, []).append(
+                            {'side': side_name, 's0': s0, 's1': s1,
+                             'pts': pts})
+                        op = Operation(
+                            name=(f"{blade_op.name} разрыв #{k + 1}"
+                                  + (f".{j + 1}" if len(fixed) > 1 else "")),
+                            kind=OperationKind.CORNER_REWORK,
+                            geometry_ids=[geom_id],
+                            settings=CutSettings(
+                                tool_number=self.params.corner_tool_number,
+                                pass_type=PassType.SINGLE, feed_cut=1500,
+                                feed_plunge=800, prog_z_depth=0.3),
+                            sequence_number=1)
+                        at = op.attributes
+                        at['parent_geom_id'] = geom_id
+                        at['corner_index'] = 1000 + 100 * k + j + (
+                            0 if side_name == 'OUTSIDE' else 50)
+                        at['pocket_side'] = side_name
+                        at['pocket_s0'] = s0
+                        at['pocket_s1'] = s1
+                        at['pocket_total'] = total
+                        at['pocket_cut_width'] = W3
+                        at['pocket_pad_mm'] = 0.0
+                        at['pocket_pad_before_max'] = 0.0 if hc else 0.5
+                        at['pocket_pad_after_max'] = 0.0 if tc else 0.5
+                        at['foreign_gap'] = True
+                        at['corner_apex'] = (pts[len(pts) // 2] if pts
+                                             else _point_at_s(pp, s0, lidx))
+                        at['corner_side'] = side_name
+                        _side = (ContourSide.INSIDE if side_name == 'INSIDE'
+                                 else ContourSide.OUTSIDE)
+                        op.toolpaths = [ToolPath(
+                            geometry_id=geom_id, side=_side,
+                            entry=EntryExitConfig(
+                                enabled=not hc,
+                                style=LeadStyle.LINE_ARC_TANGENTIAL,
+                                line_length_x_tool_rad=1.0,
+                                arc_radius_x_tool_rad=1.0,
+                                approach_angle=45.0),
+                            exit=EntryExitConfig(
+                                enabled=not tc,
+                                style=LeadStyle.LINE_ARC_TANGENTIAL,
+                                line_length_x_tool_rad=1.0,
+                                arc_radius_x_tool_rad=1.0,
+                                approach_angle=45.0))]
+                        ops.append(op)
+                _rep.append(f"[{blade_op.name} / {side_name}] РАЗРЫВ У "
+                            f"СОСЕДНЕГО ЛЕЗВИЯ: {len(brk)} шт., основной "
+                            f"проход прерван (запас {BREAK_PAD:.0f} мм), "
+                            f"участок — T3 с перекрытием {T3_OVER:.0f} мм.")
+        self._gap_cache_key = _ck
+        self._gap_cache = (ops, spans, unm)
+        cur = list(getattr(self.project, 'unmachinable_pockets', []) or [])
+        self.project.unmachinable_pockets = cur + unm
+        return ops, spans
+
     def _build_corner_operations(self) -> Tuple[List[Operation], List[Operation]]:
         """Находит углы по геометрии (дуги с малым радиусом скругления) и
         создаёт операции CORNER_REWORK для каждого ножа.
@@ -1155,6 +1372,14 @@ class PackageExporter:
         # едва на десятую часть.
         pocket_ops, pocket_spans = self._build_pocket_operations(blade_ops)
         ops_2d.extend(pocket_ops)
+        # Разрывы там, где лезвие соседнего ножа ближе ширины реза
+        # (v1.7.79): участок отдаётся T3, углы в нём отдельно не режутся.
+        gap_ops, gap_spans = self.apply_foreign_breaks(blade_ops)
+        ops_2d.extend(gap_ops)
+        if gap_spans:
+            pocket_spans = {k: list(v) for k, v in pocket_spans.items()}
+            for k, v in gap_spans.items():
+                pocket_spans.setdefault(k, []).extend(v)
 
         for blade_op in blade_ops:
             if not blade_op.geometry_ids:

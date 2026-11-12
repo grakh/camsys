@@ -5818,6 +5818,9 @@ def rework_fragment(geom, op, pass_side_name: str,
         # Выходим за перемычку на полный диаметр реза: там основная
         # фреза уже прошла, щель шире, и проточка перекрывает стык.
         _pocket_pad = max(0.5, float(at.get('pocket_cut_width', 0.0) or 0.0))
+        if 'pocket_pad_mm' in at:
+            # Разрыв у соседнего лезвия (v1.7.79): перекрытие уже в s0/s1.
+            _pocket_pad = float(at['pocket_pad_mm'])
         segs = pocket_fragment_with_gentle_ends(
             par, float(at['pocket_s0']), float(at['pocket_s1']),
             pad_mm=_pocket_pad,
@@ -5910,3 +5913,142 @@ def rework_fragment(geom, op, pass_side_name: str,
         return orient_corner_fragment(frag, parent, side)
 
     return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ЛЕЗВИЯ СОСЕДНИХ НОЖЕЙ БЛИЖЕ ШИРИНЫ РЕЗА (v1.7.79)
+# ═══════════════════════════════════════════════════════════════════
+# В альфе такое место рвут вручную: «эти разрывы ставятся вручную, если
+# близко лезвие». Рвутся ОБА ножа — «если только один, то другой
+# обязательно зарежет лезвие»; запас 2 мм; тонкая T3 идёт ещё на 1 мм
+# дальше разрыва, чтобы точно перекрыть.
+
+def foreign_blade_index(polypaths, step: float = 0.05, cell: float = 0.5):
+    """Сетка точек чужих лезвий: {(ix, iy): [(x, y), ...]}, cell."""
+    grid = {}
+    for pp in polypaths:
+        if pp is None or not pp.segments:
+            continue
+        for _s, q in _exact_axis_points(pp, step)[0]:
+            grid.setdefault((int(math.floor(q[0] / cell)),
+                             int(math.floor(q[1] / cell))), []).append(q)
+    return grid, cell
+
+
+def _index_min_dist(index, p, reach):
+    grid, cell = index
+    r = int(math.ceil(reach / cell))
+    ix, iy = int(math.floor(p[0] / cell)), int(math.floor(p[1] / cell))
+    best = float('inf')
+    for dx in range(-r, r + 1):
+        for dy in range(-r, r + 1):
+            for q in grid.get((ix + dx, iy + dy), ()):
+                d = math.hypot(q[0] - p[0], q[1] - p[1])
+                if d < best:
+                    best = d
+    return best
+
+
+def foreign_conflict_ranges(pp: Polypath, index, half_width: float,
+                            margin: float = 0.005, step: float = 0.05,
+                            join_gap: float = 0.3):
+    """Участки (s0, s1) контура `pp` (уже развёрнутого под проход, фреза
+    СПРАВА по ходу — G42), где круг реза фрезы с полушириной
+    `half_width` задевает чужое лезвие из `index`.
+
+    Центр реза — в `half_width` справа от осевой: ширина реза равна
+    эквидистанте, и фреза в этом месте режет полосу от своего лезвия
+    наружу. Если чужое лезвие ближе `half_width` к центру — она его
+    срежет.
+    """
+    if pp is None or not pp.segments or half_width <= 0:
+        return []
+    pts, total = _exact_axis_points(pp, step)
+    lidx = _length_index(pp)
+    bad = []
+    for s, p in pts:
+        q = _point_at_s(pp, s + 0.01, lidx)
+        tx, ty = q[0] - p[0], q[1] - p[1]
+        L = math.hypot(tx, ty)
+        if L < 1e-12:
+            continue
+        nx, ny = ty / L, -tx / L
+        c = (p[0] + nx * half_width, p[1] + ny * half_width)
+        if _index_min_dist(index, c, half_width + margin) < half_width + margin:
+            bad.append(s)
+    if not bad:
+        return []
+    runs = []
+    a = b = bad[0]
+    for s in bad[1:]:
+        if s - b > join_gap:
+            runs.append((a, b))
+            a = s
+        b = s
+    runs.append((a, b))
+    # склейка через ноль
+    if len(runs) > 1 and runs[0][0] < join_gap and total - runs[-1][1] < join_gap:
+        runs[0] = (runs[-1][0], runs[0][1] + total)
+        runs.pop()
+    return [(r0, r1) for r0, r1 in runs]
+
+
+def merge_ranges_circular(ranges, total: float, pad: float = 0.0):
+    """Расширить участки на pad с обеих сторон и слить пересекающиеся
+    (по кругу длины total). Если покрыто всё — [(0, total)]."""
+    if not ranges:
+        return []
+    rs = sorted(((r0 - pad), (r1 + pad)) for r0, r1 in ranges)
+    # развернём в линию [0, total) с учётом заворота
+    lin = []
+    for a, b in rs:
+        if b - a >= total:
+            return [(0.0, total)]
+        a2 = a % total
+        lin.append((a2, a2 + (b - a)))
+    lin.sort()
+    out = [list(lin[0])]
+    for a, b in lin[1:]:
+        if a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    # склейка последнего с первым через total
+    if len(out) > 1 and out[-1][1] >= out[0][0] + total:
+        out[0][0] = out[-1][0]
+        out[0][1] = max(out[0][1] + total, out[-1][1])
+        out.pop()
+    if any(b - a >= total for a, b in out):
+        return [(0.0, total)]
+    return [(a, b) for a, b in out]
+
+
+def split_at_breaks(pp: Polypath, breaks, min_len: float = 1.0):
+    """Замкнутый контур → куски МЕЖДУ разрывами.
+
+    breaks — список {'A': точка начала разрыва, 'B': точка конца} по ходу
+    обхода. Точки ищутся на `pp` проекцией — поэтому разрывы, посчитанные
+    на исходном контуре, переносятся на контур после мостов и сдвига
+    старта. Возвращает список открытых Polypath по ходу обхода.
+    """
+    if pp is None or not pp.segments or not breaks:
+        return [pp]
+    total = sum(x.length() for x in pp.segments)
+    marks = []
+    for br in breaks:
+        sa = distance_along_polypath(pp, tuple(br['A']))
+        sb = distance_along_polypath(pp, tuple(br['B']))
+        marks.append((sa, sb))
+    marks.sort()
+    pieces = []
+    n = len(marks)
+    for i in range(n):
+        s_from = marks[i][1]
+        s_to = marks[(i + 1) % n][0]
+        span = (s_to - s_from) % total
+        if span < min_len:
+            continue
+        segs = _subpath_forward(pp, s_from, s_to)
+        if segs:
+            pieces.append(Polypath(segments=segs, closed=False))
+    return pieces

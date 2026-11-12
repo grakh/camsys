@@ -837,7 +837,8 @@ class ToolpathItem(QtWidgets.QGraphicsPathItem):
         painter.restore()
 
 
-def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=None):
+def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=None,
+                             piece_index=None):
     """Прогоняет ту же логику что эмиттер для одного toolpath, и возвращает
     геометрию для визуализации: dict с ключами 'contour', 'lead_in', 'lead_out'.
     
@@ -1156,6 +1157,19 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
     if not (is_3d_corner or is_2d_corner):
         from ..geometry.path_offset import merge_collinear_lines
         polypath_for_vis = merge_collinear_lines(polypath_for_vis, angle_tol_deg=1.0)
+
+    # ── РАЗРЫВ У СОСЕДНЕГО ЛЕЗВИЯ (v1.7.79) — как в посте ──
+    is_break_piece = False
+    if piece_index is not None:
+        from ..geometry.path_offset import split_at_breaks
+        _brs_v = (op.attributes.get('foreign_breaks', {})
+                  .get(tp.side.name) or [])
+        _pcs_v = split_at_breaks(polypath_for_vis, _brs_v)
+        if piece_index >= len(_pcs_v):
+            return None
+        polypath_for_vis = _pcs_v[piece_index]
+        polypath = polypath_for_vis
+        is_break_piece = True
     
     # ════════════════════════════════════════════════════════════════
     # ПЛАНИРОВАНИЕ ЛИДОВ — ТЕМ ЖЕ КОДОМ, ЧТО И ПОСТ (v1.7.58)
@@ -1179,6 +1193,7 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
     # сдвиг старта тащил бы перебег вместе с собой.
     pending_overlap = 0.0
     if (cutting_params is not None and not is_corner_view
+            and not is_break_piece
             and tp.side in (ContourSide.OUTSIDE, ContourSide.INSIDE)
             and src is not None and getattr(src, 'overlap', 0.0) > 1e-9):
         pending_overlap = src.overlap
@@ -1220,7 +1235,7 @@ def _build_toolpath_geometry(project, op, tp, options_extras, cutting_params=Non
         _cl_cache, _cb_cache = _cl_full, _cb_full
         _vp = PassLeadParams(
             pass_side=tp.side.name,
-            is_corner_rework=is_corner_view,
+            is_corner_rework=(is_corner_view or is_break_piece),
             # ── ЗАЗОР, КОТОРЫЙ ТРЕБУЕТ ПРОВЕРКА ──
             # Здесь ОСНОВНАЯ фреза, а не T3, — потому что так считает
             # пост, и картинка обязана показывать его результат. Сам по
@@ -1580,10 +1595,17 @@ def add_toolpaths_to_scene(scene: 'CamScene', project, options_extras: dict = No
         
         op_idx = _color_index(op)
         
+        _tp_jobs = []
         for tp in op.toolpaths:
+            _brs = (op.attributes.get('foreign_breaks', {}).get(tp.side.name)
+                    if op.kind == OperationKind.BLADE_FORMING else None)
+            for _pi in (range(len(_brs)) if _brs else (None,)):
+                _tp_jobs.append((tp, _pi))
+        for tp, _pi in _tp_jobs:
             try:
                 geo = _build_toolpath_geometry(
-                    project, op, tp, options_extras, cutting_params
+                    project, op, tp, options_extras, cutting_params,
+                    piece_index=_pi
                 )
             except Exception:
                 continue

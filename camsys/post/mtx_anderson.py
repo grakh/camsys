@@ -369,7 +369,6 @@ class MtxAndersonGVM(PostProcessor):
                 for tp in op.toolpaths:
                     if not tp.visible:
                         continue
-                    part_num += 1
                     if _on_part is not None:
                         try:
                             _on_part(_parts_done[0], _parts_total,
@@ -377,11 +376,22 @@ class MtxAndersonGVM(PostProcessor):
                         except Exception:
                             pass
                         _parts_done[0] += 1
-                    line_no = self._emit_toolpath(
-                        out, project, op, tp,
-                        shape_num=shape_num, part_num=part_num,
-                        line_no=line_no, options=options,
-                    )
+                    # Разрыв у соседнего лезвия (v1.7.79): проход — куски
+                    _brs = (op.attributes.get('foreign_breaks', {})
+                            .get(tp.side.name)
+                            if op.kind == OperationKind.BLADE_FORMING
+                            else None)
+                    for _pi in (range(len(_brs)) if _brs else (None,)):
+                        part_num += 1
+                        _ln0 = line_no
+                        line_no = self._emit_toolpath(
+                            out, project, op, tp,
+                            shape_num=shape_num, part_num=part_num,
+                            line_no=line_no, options=options,
+                            piece_index=_pi,
+                        )
+                        if line_no == _ln0:
+                            part_num -= 1
         
         # ── 6. Концовка ──
         w(f"N{line_no} ;")
@@ -466,7 +476,8 @@ class MtxAndersonGVM(PostProcessor):
     
     def _emit_toolpath(self, out, project, op, tp,
                        shape_num: int, part_num: int,
-                       line_no: int, options: PostOptions) -> int:
+                       line_no: int, options: PostOptions,
+                       piece_index=None) -> int:
         """Выводит один ToolPath как PART в текущий SHAPE.
         
         Включает Lead-In и Lead-Out дугами G2/G3, если они включены 
@@ -761,7 +772,26 @@ class MtxAndersonGVM(PostProcessor):
         # увеличение ED-параметра в NC-заголовке или использование HSC.
         from ..geometry.path_offset import merge_collinear_lines
         polypath = merge_collinear_lines(polypath, angle_tol_deg=1.0)
-        
+
+        # ── РАЗРЫВ У СОСЕДНЕГО ЛЕЗВИЯ (v1.7.79) ──
+        # Проход режется на куски между разрывами; этот вызов выводит
+        # кусок № piece_index как отдельный PART: заход в начале куска,
+        # выход в конце, без перебега.
+        is_break_piece = False
+        if piece_index is not None:
+            from ..geometry.path_offset import split_at_breaks
+            _brs = (op.attributes.get('foreign_breaks', {})
+                    .get(tp.side.name) or [])
+            _pcs = split_at_breaks(polypath, _brs)
+            if piece_index >= len(_pcs):
+                return line_no
+            polypath = _pcs[piece_index]
+            is_break_piece = True
+            if piece_index == 0:
+                _mach_log(options, geom, tp,
+                          f"РАЗРЫВ У СОСЕДНЕГО ЛЕЗВИЯ: проход разбит на "
+                          f"{len(_pcs)} кусок(ка), участки у соседа — T3")
+
         segments = polypath.segments
         # Применяем срез по start_t / end_t (для CORNER_REWORK)
         if tp.start_t > 0.0 or tp.end_t < 1.0:
@@ -857,7 +887,7 @@ class MtxAndersonGVM(PostProcessor):
 
         _lead_params = PassLeadParams(
             pass_side=tp.side.name,
-            is_corner_rework=bool(is_corner_rework),
+            is_corner_rework=bool(is_corner_rework or is_break_piece),
             tool_offset=tool_offset,
             lead_scale=lead_scale,
             # Своих множителей у доработки больше нет (v1.7.61): угол
@@ -884,7 +914,7 @@ class MtxAndersonGVM(PostProcessor):
                                     tp.exit.line_length_x_tool_rad),
             exit_radius=_ov_out.get('length',
                                     tp.exit.arc_radius_x_tool_rad),
-            overlap=pending_overlap,
+            overlap=(0.0 if is_break_piece else pending_overlap),
             no_avoid=bool(_lead_ov) or (_proj_lead_mode == 1),
             # Точка захода из превью. Пост ставит старт контура туда,
             # но подбор не выключает: он начинает с этой позиции, и
@@ -902,7 +932,7 @@ class MtxAndersonGVM(PostProcessor):
 
         # Соседние ножи нужны аварийному подбору лида доработки.
         _nb = []
-        if is_corner_rework:
+        if is_corner_rework or is_break_piece:
             try:
                 _klay = project.get_layer_by_name("Knife")
                 for _go in (getattr(_klay, 'geometries', ()) if _klay
