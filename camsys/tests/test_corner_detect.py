@@ -701,3 +701,41 @@ def test_corner_fragment_follows_its_pass():
     print(f'  углов {total}, против основного прохода {against}')
     assert total >= 20, f'углов нашлось всего {total}'
     assert against == 0, f'{against} углов идут против своего прохода'
+
+
+def test_fillet_tool_follows_is_not_a_corner():
+    """v1.7.82: скругление чуть уже полуэквидистанты фрезы (R 0.649 при
+    0.65) оставляет меньше 2 мкм — это не угол; заметно уже (R 0.55) —
+    угол. 127821 на пятке 0.8 из-за таких был «ёжиком из T3»."""
+    import math
+    from camsys.geometry.primitives import Line, Arc, Polypath
+    from camsys.core.project import Project, Geometry
+    from camsys.core.cutting_macro import CuttingMacroParams
+    from camsys.post.package_export import PackageExporter
+    import camsys.post.mtx_anderson  # noqa
+
+    def notch(r):
+        # квадрат 30×30 с вогнутым прямым углом-выемкой, скруглённым R=r
+        pts = [(0, 0), (30, 0), (30, 30), (15, 30), (15, 15), (0, 15)]
+        # выемка: угол в (15,15) вогнутый; заменим вершину дугой r
+        a = (15, 15 + r)
+        b = (15 - r, 15)
+        segs = [Line(a=(0, 0), b=(30, 0)), Line(a=(30, 0), b=(30, 30)),
+                Line(a=(30, 30), b=(15, 30)), Line(a=(15, 30), b=a),
+                Arc(a=a, b=b, center=(15 - r, 15 + r), ccw=False),
+                Line(a=b, b=(0, 15)), Line(a=(0, 15), b=(0, 0))]
+        return Polypath(segments=segs, closed=True)
+
+    def n_corners(r):
+        prj = Project(name="N")
+        lay = prj.add_layer("Knife")
+        g = Geometry(name="Knife_1", polypath=notch(r), source_layer="Knife")
+        lay.geometries.append(g)
+        prj.add_blade_operation(g.id)
+        p = CuttingMacroParams()
+        p.knife_angle, p.tip_diameter, p.bottom = 90.0, 0.8, 0.25
+        p.corner_radius_threshold_mm = 0.65
+        c2, _ = PackageExporter(prj, p)._build_corner_operations()
+        return len([o for o in c2 if 'corner_first_idx' in o.attributes])
+    assert n_corners(0.649) == 0
+    assert n_corners(0.55) >= 1

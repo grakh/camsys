@@ -920,3 +920,31 @@ def test_fast_penetration_equals_reference():
         assert g.penetration((cx, cy), r, A, B) == ref, (cx, cy, r)
         fast = g.penetration((cx, cy), r, A, B, stop_above=0.0005)
         assert (fast > 0.0005) == (ref > 0.0005)
+
+
+def test_distance_along_arc_is_arc_length():
+    """v1.7.82: позиция точки на дуге — по ДУГЕ, а не по хорде (точка
+    разрыва у соседа на дуге 90° уезжала на миллиметр)."""
+    import math
+    from camsys.geometry.primitives import Arc, Line, Polypath
+    from camsys.geometry.path_offset import distance_along_polypath
+    arc = Arc(a=(10, 0), b=(0, 10), center=(0, 0), ccw=True)
+    pp = Polypath(segments=[Line(a=(0, -5), b=(10, 0)), arc], closed=False)
+    L0 = math.hypot(10, 5)
+    for ang in (0, 30, 60, 90):
+        t = math.radians(ang)
+        s = distance_along_polypath(pp, (10 * math.cos(t), 10 * math.sin(t)))
+        assert abs(s - L0 - 10 * t) < 1e-6, (ang, s - L0)
+
+
+def test_short_pocket_that_tool_fits_is_kept():
+    """v1.7.82: карман короче ширины реза T3, но целиком проходимый, не
+    выбрасывается как «короче диаметра» (127821, Knife_10, пятка 1.2)."""
+    from camsys.geometry.primitives import Line, Polypath
+    from camsys.geometry.path_offset import pocket_runs_where_tool_fits
+    V = [(0, 0), (40, 0), (40, 40), (0, 40)]
+    pp = Polypath(segments=[Line(a=V[i], b=V[(i + 1) % 4])
+                            for i in range(4)], closed=True)
+    runs = pocket_runs_where_tool_fits(pp, 10.0, 11.0, 1.10,
+                                       min_clearance_mm=0.0, min_run_mm=1.10)
+    assert len(runs) == 1, runs

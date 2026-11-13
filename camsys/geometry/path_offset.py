@@ -409,7 +409,22 @@ def distance_along_polypath(polypath: Polypath, point: Point) -> float:
             best_dist = d
             slen = seg.length()
             if slen > EPS:
-                local_d = math.hypot(pt[0] - seg.a[0], pt[1] - seg.a[1])
+                if isinstance(seg, Arc):
+                    # По ДУГЕ, а не по хорде (v1.7.82): на дуге 90° хорда
+                    # короче дуги на десятую часть, и точка разрыва у
+                    # соседнего лезвия уезжала на миллиметр.
+                    _cx, _cy = seg.center
+                    _a0 = math.atan2(seg.a[1] - _cy, seg.a[0] - _cx)
+                    _a1 = math.atan2(pt[1] - _cy, pt[0] - _cx)
+                    _sw = (_a1 - _a0) if seg.ccw else (_a0 - _a1)
+                    _sw %= 2 * math.pi
+                    if _sw * seg.radius > slen + 1e-6:
+                        # точка у начала дуги «с другой стороны» — 0
+                        _sw = 0.0 if (2 * math.pi - _sw) * seg.radius < 1e-6 \
+                            else _sw
+                    local_d = min(slen, _sw * seg.radius)
+                else:
+                    local_d = math.hypot(pt[0] - seg.a[0], pt[1] - seg.a[1])
                 best_acc = accumulated + local_d
             else:
                 best_acc = accumulated
@@ -2864,7 +2879,16 @@ def pocket_runs_where_tool_fits(parent: Polypath, s0: float, s1: float,
     if cur_from is not None:
         runs.append((cur_from, prev_s))
 
-    return [(a, b) for (a, b) in runs if ((b - a) % total) >= min_run_mm]
+    # Короткий кусок отбрасывается, только если его обрезала теснота. Если
+    # T3 проходит ВЕСЬ карман, он точится при любой длине (v1.7.82): на
+    # 127821, Knife_10, пятка 1.2 карман 1.12 мм при щели 2.0 и резе
+    # 1.10 выпадал как «короче диаметра», ямку не снимал никто, а на
+    # экране висел красный пунктир «не точится».
+    def _whole(a, b):
+        return (((a - s0) % total) <= step_mm + 1e-9
+                and ((s1 - b) % total) <= step_mm + 1e-9)
+    return [(a, b) for (a, b) in runs
+            if ((b - a) % total) >= min_run_mm or _whole(a, b)]
 
 
 def find_tool_clearance_issues(polypath: Polypath, cut_width: float,
@@ -6123,7 +6147,8 @@ def split_at_breaks(pp: Polypath, breaks, min_len: float = 1.0):
 
 def widen_breaks_for_leads(pp: Polypath, breaks, index, tool_eq: float,
                            step: float = 0.5, max_extra: float = 6.0,
-                           angle_deg: float = 45.0, length_mult: float = 1.0):
+                           angle_deg: float = 45.0, length_mult: float = 1.0,
+                           lead_check=None):
     """Раздвинуть разрывы, пока заходы на их краях не перестанут задевать
     соседнее лезвие (v1.7.79: «1 или 2 мм — не ограничение, можно больше,
     если не влезают лиды»).
@@ -6146,6 +6171,21 @@ def widen_breaks_for_leads(pp: Polypath, breaks, index, tool_eq: float,
 
     def _lead_ok(s_edge, is_entry):
         span = min(10.0, total * 0.25)
+        if lead_check is not None:
+            # Проверка тем же лидом и той же функцией коллизий, что в
+            # программе (v1.7.82): своя упрощённая (45°, только сосед)
+            # пропускала лиды, которые пост потом браковал и заменял
+            # аварийными — до 4 мм поперёк соседнего лезвия.
+            if is_entry:
+                segs = _subpath_forward(pp, s_edge % total,
+                                        (s_edge + span) % total)
+            else:
+                segs = _subpath_forward(pp, (s_edge - span) % total,
+                                        s_edge % total)
+            if not segs:
+                return True
+            return lead_check(Polypath(segments=segs, closed=False),
+                              is_entry)
         if is_entry:
             segs = _subpath_forward(pp, s_edge % total, (s_edge + span) % total)
         else:

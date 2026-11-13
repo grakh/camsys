@@ -957,7 +957,7 @@ class MtxAndersonGVM(PostProcessor):
         # Осевую перечитываем ТОЛЬКО если планировался заход: подбор мог
         # сдвинуть старт, а перебег — разомкнуть контур. Без захода
         # остаётся срез по start_t/end_t, сделанный выше.
-        if _lead_params.entry_enabled:
+        if _lead_params.entry_enabled or _plan.axis_extended:
             polypath = _plan.axis
             segments = polypath.segments
             if not segments:

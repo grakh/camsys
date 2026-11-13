@@ -1461,11 +1461,12 @@ def test_rework_lead_cutter_never_crosses_geometry():
                         n += 1
         return n
 
-    full_bad = fit_bad = 0
+    full_bad = fit_bad = calls = 0
     orig = LI.fit_rework_lead
 
     def spy(point, tangent, contour, w, ll, ar, ang, **k):
-        nonlocal full_bad, fit_bad
+        nonlocal full_bad, fit_bad, calls
+        calls += 1
         nb = k.get('neighbours') or []
         is_exit = k.get('is_exit', False)
         style = k.get('style', 'line_arc')
@@ -1511,8 +1512,11 @@ def test_rework_lead_cutter_never_crosses_geometry():
         LI.fit_rework_lead = orig
 
     print(f'  путь фрезы пересекал геометрию: на полной длине {full_bad}, '
-          f'после подбора {fit_bad}')
-    assert full_bad >= 1, 'проверка ничего не ловит — критерий сломан'
+          f'после подбора {fit_bad}; аварийных подборов {calls}')
+    # С v1.7.82 доработка сначала ПРОДЛЕВАЕТСЯ вдоль контура, и на 124173
+    # аварийный подбор не нужен ни разу — тогда и ловить нечего.
+    assert calls == 0 or full_bad >= 1, \
+        'проверка ничего не ловит — критерий сломан'
     assert fit_bad == 0, (
         f'{fit_bad} лидов режут лезвие даже после подбора')
 

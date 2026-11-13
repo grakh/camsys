@@ -281,7 +281,8 @@ def _dist_point_to_segment_exact(px: float, py: float, seg: Segment) -> float:
 
 
 def own_contour_clearance(cut_points, own_polypath, entry_point,
-                          join_skip: float, step: float = 0.15) -> float:
+                          join_skip: float, step: float = 0.15,
+                          cap: Optional[float] = None) -> float:
     """Минимальное расстояние от ПУТИ ФРЕЗЫ до собственного контура.
 
     `cut_points` — ЛОМАНАЯ пути фрезы. Считать только по её вершинам
@@ -311,7 +312,18 @@ def own_contour_clearance(cut_points, own_polypath, entry_point,
             continue
         boxes.append((sg, min(xs), min(ys), max(xs), max(ys)))
 
-    best = float('inf')
+    # cap (v1.7.82): вызывающему нужно только «меньше порога или нет».
+    # Сегменты дальше cap от рамки пути фрезы ответ не меняют — их не
+    # перебираем на каждой точке; результат тогда не больше cap.
+    if cap is not None and cut_points:
+        _xs = [q[0] for q in cut_points]
+        _ys = [q[1] for q in cut_points]
+        _lx0, _lx1 = min(_xs) - cap, max(_xs) + cap
+        _ly0, _ly1 = min(_ys) - cap, max(_ys) + cap
+        boxes = [b for b in boxes
+                 if not (b[3] < _lx0 or b[1] > _lx1
+                         or b[4] < _ly0 or b[2] > _ly1)]
+    best = float('inf') if cap is None else cap
     ex, ey = entry_point
     st = max(0.02, step)
     for i in range(len(cut_points)):
@@ -541,7 +553,8 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
         _own_clr = own_contour_clearance(
             [la for (la, _lb) in cut_lines] + ([cut_lines[-1][1]]
                                                if cut_lines else []),
-            own_exact, entry_point, max(0.05, tool_offset * 0.5))
+            own_exact, entry_point, max(0.05, tool_offset * 0.5),
+            cap=tool_offset + 0.5)
         if _own_clr < tool_offset - 0.005:
             return True
         # Осевая лида не должна переходить через осевую своего ножа
@@ -1516,6 +1529,9 @@ class PassLeadResult:
     lead_out_side: str = 'right'
     clr_in: float = 0.0                 # оставлено для диагностики
     clr_out: float = 0.0
+    # Фрагмент доработки продлён вдоль контура под чистый лид (v1.7.82):
+    # пост обязан взять res.axis, даже если захода нет.
+    axis_extended: bool = False
 
 
 def _lead_line_length(user_factor: float, angle_deg: float,
@@ -1774,6 +1790,36 @@ def plan_pass_leads(axis: Polypath,
                 own_geom.id, _tool_off, safety_factor=1.2,
                 own_strict=p.is_corner_rework, own_exact=own_pp)
 
+    # ── ПРОДЛИТЬ ДОРАБОТКУ ВМЕСТО АВАРИЙНОГО ЛИДА (v1.7.82) ──
+    # Пользователь: «чего просто не продлить было?» и «гладкая
+    # поверхность, но T3 и выход в лезвие, хотя место есть». Конец
+    # фрагмента доработки часто стоит там, где щель тесная, а через
+    # миллиметр-другой по контуру — свободно: основная фреза там уже
+    # прошла. Аварийный подбор вместо этого крутил лид на месте и
+    # удлинял его — до 4 мм поперёк соседнего лезвия.
+    #
+    # Теперь сначала конец фрагмента продлевается ВДОЛЬ контура шагом
+    # 0.5 мм (до 6 мм), пока ОБЫЧНЫЙ лид не перестанет задевать металл.
+    # Продление принимается, только если T3 по нему проходит сама: её
+    # путь не ближе полуширины реза к чужому металлу.
+    if (p.is_corner_rework and not axis.closed and own_pp is not None
+            and own_pp.closed and (res.lead_in_collision
+                                   or res.lead_out_collision)):
+        try:
+            _ext = _extend_rework_for_leads(
+                axis, own_pp, own_geom.id, res, want_in, want_out,
+                req_in, req_out, contours_lines, contours_bboxes,
+                _tool_off)
+        except Exception:
+            _ext = None
+        if _ext is not None:
+            axis, _done = _ext
+            res.axis_extended = True
+            if log is not None:
+                for _w, _d in _done:
+                    log(f"ДОРАБОТКА ПРОДЛЕНА: {_w} на {_d:.1f} мм вдоль "
+                        f"контура — там обычный лид не задевает металл")
+
     # ── АВАРИЙНЫЙ ЛИД ТАМ, ГДЕ ОБЫЧНЫЙ РЕЖЕТ ЛЕЗВИЕ ──
     # Доработка идёт теми же лидами, что основной проход (v1.7.61), и в
     # подавляющем большинстве мест этого достаточно. Но карман — это
@@ -1845,3 +1891,145 @@ def plan_pass_leads(axis: Polypath,
 
     res.axis = axis
     return res
+
+
+def _extend_rework_for_leads(axis, own_pp, own_id, res, want_in, want_out,
+                             req_in, req_out, contours_lines,
+                             contours_bboxes, tool_off,
+                             step: float = 0.5, max_ext: float = 6.0):
+    """Продлевает открытый фрагмент доработки вдоль родительского
+    контура, пока обычный лид на продлённом конце не станет чистым.
+
+    Returns:
+        (новая осевая, [(что, на сколько мм)]) или None, если ничего не
+        продлено. В res подставляются новые лиды.
+    """
+    from .path_offset import (distance_along_polypath, _subpath_forward,
+                              offset_right_of_travel, _length_index)
+    from .direction import normalize_for_side
+    segs = list(axis.segments)
+    if not segs:
+        return None
+    # Ориентация родителя — как у фрагмента: точка фрагмента чуть
+    # дальше старта должна лежать на родителе чуть дальше по ходу.
+    par = None
+    _L0 = sum(x.length() for x in segs)
+    _probe = min(0.3, _L0 * 0.3)
+    _pq = None
+    _acc = 0.0
+    for _sg in segs:
+        _l = _sg.length()
+        if _acc + _l >= _probe and _l > 1e-12:
+            _pq = _sg.point_at((_probe - _acc) / _l)
+            break
+        _acc += _l
+    if _pq is None:
+        return None
+    for _sd in ('INSIDE', 'OUTSIDE'):
+        _c = normalize_for_side(own_pp, _sd)
+        _tot = _length_index(_c)[2]
+        _sa = distance_along_polypath(_c, segs[0].a)
+        _sq = distance_along_polypath(_c, _pq)
+        _fw = (_sq - _sa) % _tot
+        if abs(_fw - _probe) < 0.05:
+            par = _c
+            break
+    if par is None:
+        return None
+    total = _length_index(par)[2]
+    s_start = distance_along_polypath(par, segs[0].a)
+    s_end = distance_along_polypath(par, segs[-1].b)
+    frag_len = sum(x.length() for x in segs)
+
+    # Чужой металл — ломаные кеша без своего контура.
+    foreign = [ln for cid, lines in contours_lines if cid != own_id
+               for ln in lines]
+
+    def _t3_fits(ext_segs):
+        """Путь T3 по продлению не ближе tool_off к чужому металлу и
+        к своему контуру (тесная вогнутость)."""
+        try:
+            cut = offset_right_of_travel(
+                Polypath(segments=ext_segs, closed=False), tool_off)
+        except Exception:
+            return False
+        pts = []
+        for sg in cut.segments:
+            n = max(2, int(math.ceil(sg.length() / 0.05)))
+            pts.extend(sg.point_at(k / n) for k in range(n + 1))
+        if not pts:
+            return False
+        xs = [q[0] for q in pts]
+        ys = [q[1] for q in pts]
+        bx0, bx1 = min(xs) - tool_off, max(xs) + tool_off
+        by0, by1 = min(ys) - tool_off, max(ys) + tool_off
+        near = [(a, b) for a, b in foreign
+                if not ((a[0] < bx0 and b[0] < bx0) or (a[0] > bx1 and b[0] > bx1)
+                        or (a[1] < by0 and b[1] < by0)
+                        or (a[1] > by1 and b[1] > by1))]
+        for q in pts:
+            for a, b in near:
+                if _point_to_segment_distance(q, a, b) < tool_off:
+                    return False
+        if own_contour_clearance(pts, own_pp, pts[0], 0.0,
+                                 cap=tool_off + 0.5) < tool_off - 0.01:
+            return False
+        return True
+
+    def _lead_clean(ax, is_entry):
+        req = req_in if is_entry else req_out
+        lead = build_lead_for_polypath(ax, req)
+        if not lead or not lead.segments:
+            return None
+        jp = lead.segments[-1].b if is_entry else lead.segments[0].a
+        coll = lead_crosses_contours(
+            lead, contours_lines, own_id, jp, tool_offset=tool_off,
+            safety_factor=1.2, contours_bboxes=contours_bboxes,
+            own_strict=True, own_exact=own_pp)
+        if coll:
+            coll = lead_crosses_contours(
+                lead, contours_lines, own_id, jp, tool_offset=tool_off,
+                safety_factor=1.0, contours_bboxes=contours_bboxes,
+                own_strict=True, own_exact=own_pp)
+        return None if coll else lead
+
+    done = []
+    head, tail = [], []
+    room = max(0.0, total - frag_len - 1.0)
+    if want_in and res.lead_in_collision:
+        d = step
+        while d <= min(max_ext, room) + 1e-9:
+            ext = _subpath_forward(par, (s_start - d) % total, s_start)
+            if not ext or not _t3_fits(ext):
+                break       # дальше — тесно для самой T3
+            lead = _lead_clean(Polypath(segments=ext + segs, closed=False),
+                               True)
+            if lead is not None:
+                head = ext
+                res.lead_in, res.lead_in_collision = lead, False
+                res.lead_in_geom = _polypath_to_lead_geometry(lead, True)
+                done.append(('заход', d))
+                break
+            d += step
+    if want_out and res.lead_out_collision:
+        d = step
+        room2 = max(0.0, room - sum(x.length() for x in head))
+        while d <= min(max_ext, room2) + 1e-9:
+            ext = _subpath_forward(par, s_end, (s_end + d) % total)
+            if not ext or not _t3_fits(ext):
+                break
+            lead = _lead_clean(Polypath(segments=head + segs + ext,
+                                        closed=False), False)
+            if lead is not None:
+                tail = ext
+                res.lead_out, res.lead_out_collision = lead, False
+                res.lead_out_geom = _polypath_to_lead_geometry(lead, False)
+                done.append(('выход', d))
+                break
+            d += step
+    if not done:
+        return None
+    new_axis = Polypath(segments=head + segs + tail, closed=False)
+    # Заход строился на осевой с продлённой головой; если продлили и
+    # хвост — голова та же, заход остаётся верным.
+    return new_axis, done

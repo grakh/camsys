@@ -944,7 +944,19 @@ class PackageExporter:
                       if _rep is None:
                           _rep = []
                           self.machinability_report = _rep
-                      if _gap < float('inf'):
+                      if _gap >= _cut_w and _gap < float('inf'):
+                          # Щель шире реза — не пятка виновата: куски
+                          # кармана упираются концами в тесноту, и лид к
+                          # ним не поставить (v1.7.82: раньше тут писалось
+                          # «нужна пятка 1.50 или тоньше» при T3 0.60).
+                          _txt = (
+                              f"[{blade_op.name} / {side_name}] КАРМАН НЕ "
+                              f"ТОЧИТСЯ: {_span:.2f} мм — T3 по ширине "
+                              f"проходит (щель {_gap:.3f} при резе "
+                              f"{_cut_w:.2f}), но куски упираются концами "
+                              f"в тесноту, лид не поставить. Нужна ручная "
+                              f"правка.")
+                      elif _gap < float('inf'):
                           _need = _m.floor((_gap - _add) / 0.05) * 0.05
                           _txt = (
                               f"[{blade_op.name} / {side_name}] КАРМАН НЕ "
@@ -1078,6 +1090,74 @@ class PackageExporter:
         self.project.unmachinable_pockets = list(unmachinable)
         return ops, spans
 
+    def _break_lead_checker(self, blade_op, geom, side_name, E):
+        """Проверка лида на краю разрыва — теми же параметрами лида и той
+        же функцией коллизий, что пост применит к куску прохода
+        (v1.7.82). Угол/длина: ручная правка ножа → «Авто» внутреннего
+        реза → поля тулпаса (как в mtx_anderson._emit_toolpath)."""
+        from ..geometry.lead_collision import (
+            LeadGeometryRequest, build_lead_for_polypath,
+            lead_crosses_contours, build_contours_cache, LEAD_MIN_COMP_RADIUS)
+        from ..geometry.lead_inout import auto_inner_lead_for_op
+        import math as _m
+        ent = getattr(self, '_brk_contours', None)
+        if ent is None or ent[0] is not self.project:
+            knife = self.project.get_layer_by_name("Knife")
+            gs = [g for g in (getattr(knife, 'geometries', ()) or ())
+                  if g is not None and g.is_closed]
+            ent = (self.project, build_contours_cache(gs))
+            self._brk_contours = ent
+        cl, cb = ent[1]
+        tp = next((t for t in blade_op.toolpaths
+                   if getattr(t.side, 'name', '') == side_name), None)
+        ov = (blade_op.attributes.get('lead_override') or {})
+        ov = ov.get('lead_inside' if side_name == 'OUTSIDE'
+                    else 'lead_outside', {}) if ov else {}
+        if not ov:
+            try:
+                tipd = float(self.params.tip_diameter)
+                ov = auto_inner_lead_for_op(self.project, blade_op,
+                                            side_name, tipd, E) or {}
+            except Exception:
+                ov = {}
+        d = E / 2.0
+        r_min = d + LEAD_MIN_COMP_RADIUS
+
+        def _p(cfg, key, attr, dflt):
+            if key in ov:
+                return float(ov[key])
+            return float(getattr(cfg, attr, dflt)) if cfg is not None \
+                else dflt
+
+        def check(frag, is_entry):
+            cfg = (tp.entry if is_entry else tp.exit) if tp else None
+            if cfg is not None and not cfg.enabled:
+                return True
+            ang = _p(cfg, 'angle', 'approach_angle', 45.0)
+            ln = _p(cfg, 'length', 'line_length_x_tool_rad', 1.0)
+            rr = _p(cfg, 'length', 'arc_radius_x_tool_rad', 1.0)
+            sa = max(0.05, _m.sin(_m.radians(max(5.0, min(175.0, ang)))))
+            req = LeadGeometryRequest(
+                is_entry=is_entry, pass_side=side_name, angle_deg=ang,
+                line_length=ln * E / sa, arc_radius=max(rr * E, r_min),
+                style='line_arc', side_ref=geom.polypath,
+                min_arc_radius=r_min)
+            try:
+                lead = build_lead_for_polypath(frag, req)
+            except Exception:
+                return True
+            if lead is None or not lead.segments:
+                return True
+            jp = lead.segments[-1].b if is_entry else lead.segments[0].a
+            for sf in (1.2, 1.0):
+                if not lead_crosses_contours(
+                        lead, cl, geom.id, jp, tool_offset=d,
+                        safety_factor=sf, contours_bboxes=cb,
+                        own_strict=True, own_exact=geom.polypath):
+                    return True
+            return False
+        return check
+
     def apply_foreign_breaks(self, blade_ops=None):
         """Разрывы основного прохода у близкого чужого лезвия (v1.7.79).
 
@@ -1178,7 +1258,10 @@ class PackageExporter:
                 # соседа, разрыв раздвигается (v1.7.79)
                 if brk != [(0.0, total)]:
                     from ..geometry.path_offset import widen_breaks_for_leads
-                    brk = widen_breaks_for_leads(pp, brk, idx, E)
+                    brk = widen_breaks_for_leads(
+                        pp, brk, idx, E,
+                        lead_check=self._break_lead_checker(
+                            blade_op, geom, side_name, E))
                 if brk == [(0.0, total)]:
                     _rep.append(f"[{blade_op.name} / {side_name}] СОСЕДНЕЕ "
                                 f"ЛЕЗВИЕ БЛИЖЕ ШИРИНЫ РЕЗА ПО ВСЕМУ КОНТУРУ "
@@ -1350,6 +1433,19 @@ class PackageExporter:
         # Места, куда основная фреза не дошла по ДРУГОЙ причине — ямы,
         # где путь упирается сам в себя, — обнаруживаются отдельно
         # (find_narrow_gaps) и на радиус дуги не завязаны.
+        import math as _m_c
+        from ..geometry.primitives import Arc
+
+        def _arc_sweep_deg(a):
+            cx, cy = a.center
+            a0 = _m_c.atan2(a.a[1] - cy, a.a[0] - cx)
+            a1 = _m_c.atan2(a.b[1] - cy, a.b[0] - cx)
+            sw = (a1 - a0) if a.ccw else (a0 - a1)
+            sw %= 2 * _m_c.pi
+            if sw < 1e-9 and a.length() > 1e-6:
+                sw = 2 * _m_c.pi
+            return _m_c.degrees(sw)
+
         radius_threshold_2d = max(
             float(getattr(self.params, 'corner_radius_threshold_mm', 0.7)),
             tool_offset
@@ -1422,6 +1518,55 @@ class PackageExporter:
                     _kept.append(grp)
                 groups = _kept
 
+            # ── УГОЛ, КОТОРЫЙ ОСНОВНАЯ ФРЕЗА ПРОХОДИТ, — НЕ УГОЛ (v1.7.82) ──
+            # Пользователь на 127821, пятка 0.8: «заказ выглядит как ёжик
+            # из T3 — все остальное должно пройти 0.8 пяткой, так было
+            # задумано». Там 254 «угла» — скругления R 0.62…0.67 при
+            # полуэквидистанте фрезы 0.65: конструктор рисовал их ПОД эту
+            # фрезу. Порог радиуса 0.70 объявлял углом каждое.
+            #
+            # Теперь мерим, сколько металла фреза радиуса R оставит в
+            # вогнутом скруглении радиуса r с поворотом θ: по биссектрисе
+            # (R − r)·(1/cos(θ/2) − 1). Если не больше допуска (2 мкм —
+            # как «гуляние высоты больше ±2 мкм — брак»), T3 там нечего
+            # снимать. При r ≥ R остаток ноль: такой угол основная фреза
+            # проходит всегда, сколько ни поднимай порог.
+            _tol_c = float(getattr(self.params, 'corner_residual_tol_mm',
+                                   0.002) or 0.0)
+            _segs_g = geom.polypath.segments
+            _nseg = len(_segs_g)
+            _kept2 = []
+            for grp in groups:
+                _sw, _rmin = 0.0, float('inf')
+                _k = grp.first_idx
+                for _guard in range(_nseg + 1):
+                    _sg = _segs_g[_k % _nseg]
+                    # Металл оставляют только дуги ТЕСНЕЕ фрезы и
+                    # загнутые в ту же сторону, что угол; дуги шире фрезы
+                    # и выпуклые она проходит точно.
+                    if isinstance(_sg, Arc) and bool(_sg.ccw) == bool(grp.ccw):
+                        _rmin = min(_rmin, _sg.radius)
+                        if _sg.radius < tool_offset:
+                            _sw += abs(_arc_sweep_deg(_sg))
+                    if _k % _nseg == grp.last_idx % _nseg:
+                        break
+                    _k += 1
+                if _rmin == float('inf'):
+                    _kept2.append(grp)
+                    continue
+                if _rmin >= tool_offset:
+                    # Шире фрезы, но уже ПОРОГА из настроек: угол по
+                    # решению пользователя (наплыв при травлении, 124173).
+                    _kept2.append(grp)
+                    continue
+                _th = _m_c.radians(min(_sw, 179.0))
+                _res = max(0.0, tool_offset - _rmin) * (
+                    1.0 / _m_c.cos(_th / 2.0) - 1.0)
+                if _res > _tol_c:
+                    grp._residual_mm = _res
+                    _kept2.append(grp)
+            groups = _kept2
+
             for grp_idx, grp in enumerate(groups):
                 # Параметры резания для тонкой фрезы
                 settings = CutSettings(
@@ -1447,6 +1592,8 @@ class PackageExporter:
                 op.attributes['corner_radius'] = grp.radius
                 op.attributes['corner_apex'] = grp.apex
                 op.attributes['corner_ccw'] = grp.ccw
+                if getattr(grp, '_residual_mm', None) is not None:
+                    op.attributes['corner_residual_mm'] = grp._residual_mm
                 
                 # Сторона доработки (v1.7.1): раньше здесь было
                 # захардкожено OUTSIDE для ВСЕХ углов, из-за чего примерно
