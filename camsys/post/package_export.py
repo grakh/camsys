@@ -1332,6 +1332,7 @@ class PackageExporter:
                                 f"или правка раскладки.")
                         _rep.append(_txt)
                         unm.append({'geom_id': geom_id, 'side': side_name,
+                                    'foreign_gap': True,
                                     'polypath': Polypath(segments=_segs,
                                                          closed=False),
                                     'text': _txt})

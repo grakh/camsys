@@ -1590,7 +1590,11 @@ def add_toolpaths_to_scene(scene: 'CamScene', project, options_extras: dict = No
             is_3d = op.attributes.get('corner_is_3d', False)
             if is_3d and not show_corner_3d:
                 continue
-            if not is_3d and not show_corner_2d:
+            # T3 разрыва у соседнего лезвия рисуется всегда (v1.7.85):
+            # проход у соседа разорван и без галки «Острые углы 2D», и
+            # без T3 на экране было пустое место — «T3 нет вообще».
+            if (not is_3d and not show_corner_2d
+                    and not op.attributes.get('foreign_gap')):
                 continue
         
         op_idx = _color_index(op)
@@ -1731,7 +1735,9 @@ def add_toolpaths_to_scene(scene: 'CamScene', project, options_extras: dict = No
     # («а рисовать вообще не будем?»). Рисуем сам карман красным
     # пунктиром поверх ножа; подсказка при наведении — что не так и какая
     # пятка T3 его возьмёт.
-    if show_corner_2d:
+    # Красный пунктир «не точится» — и для разрывов у соседа, где не
+    # пролезает T3: их показываем всегда.
+    if True:
         try:
             _excl = set()
             for _op in project.operations:
@@ -1744,6 +1750,8 @@ def add_toolpaths_to_scene(scene: 'CamScene', project, options_extras: dict = No
             _pen_um.setStyle(QtCore.Qt.DashLine)
             for _um in getattr(project, 'unmachinable_pockets', None) or []:
                 if _um.get('geom_id') in _excl:
+                    continue
+                if not show_corner_2d and not _um.get('foreign_gap'):
                     continue
                 _pp = _um.get('polypath')
                 if _pp is None or not _pp.segments:

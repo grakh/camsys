@@ -152,3 +152,35 @@ def test_break_t3_written_without_corner_checkbox():
     # без разрывов (щель широкая) и без галки — _corner не пишется
     files2 = PackageExporter(_two_rects(5.0), p).generate()
     assert not [n for n in files2 if n.endswith('_corner.anc')]
+
+
+def test_break_t3_drawn_without_corner_checkbox():
+    """v1.7.85: «сделал с пяткой 1_0 и T3 нет вообще» — экран прятал все
+    CORNER_REWORK при снятой галке «Острые углы 2D», в том числе T3
+    разрывов, хотя проход у соседа уже разорван. T3 разрыва рисуется
+    всегда, обычные углы — только с галкой."""
+    import os
+    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+    try:
+        from PySide6 import QtWidgets
+    except Exception:
+        print('  SKIP — нет PySide6')
+        return
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    import camsys.post.mtx_anderson  # noqa: F401
+    from camsys.post.package_export import PackageExporter
+    from camsys.ui.viewer_2d import CamScene, add_toolpaths_to_scene
+    prj = _two_rects(1.2)
+    p = _params()
+    ex = PackageExporter(prj, p)
+    ex.apply_foreign_breaks()
+    c2, _ = ex._build_corner_operations()
+    gaps = [o for o in c2 if o.attributes.get('foreign_gap')]
+    assert gaps
+    prj.operations.extend(gaps)
+    sc = CamScene()
+    items = add_toolpaths_to_scene(
+        sc, prj, {'tool_radius': 0.4, 'tool_equidistant': 1.3}, p,
+        show_filter={'blade': True, 'corner_2d': False, 'corner_3d': False})
+    ids = {getattr(i, 'op_id', None) for i in items}
+    assert any(o.id in ids for o in gaps), 'T3 разрыва не нарисована'
