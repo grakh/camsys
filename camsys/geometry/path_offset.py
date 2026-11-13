@@ -6052,3 +6052,73 @@ def split_at_breaks(pp: Polypath, breaks, min_len: float = 1.0):
         if segs:
             pieces.append(Polypath(segments=segs, closed=False))
     return pieces
+
+
+def widen_breaks_for_leads(pp: Polypath, breaks, index, tool_eq: float,
+                           step: float = 0.5, max_extra: float = 6.0,
+                           angle_deg: float = 45.0, length_mult: float = 1.0):
+    """Раздвинуть разрывы, пока заходы на их краях не перестанут задевать
+    соседнее лезвие (v1.7.79: «1 или 2 мм — не ограничение, можно больше,
+    если не влезают лиды»).
+
+    Конец разрыва b — начало куска основного прохода (там заход), начало
+    разрыва a — конец предыдущего куска (там выход). Лид строится той же
+    функцией и по тем же правилам, что у прохода (длина/угол по
+    умолчанию), его путь фрезы — сдвигом вправо на E/2, и проверяется,
+    что он не ближе E/2 к чужому лезвию. Край сдвигается шагом `step`,
+    не дальше `max_extra`.
+    """
+    from .lead_collision import (LeadGeometryRequest, build_lead_for_polypath,
+                                 LEAD_MIN_COMP_RADIUS)
+    if not breaks:
+        return breaks
+    lidx = _length_index(pp)
+    total = lidx[2]
+    d = tool_eq / 2.0
+    sin_a = max(0.05, math.sin(math.radians(angle_deg)))
+
+    def _lead_ok(s_edge, is_entry):
+        span = min(10.0, total * 0.25)
+        if is_entry:
+            segs = _subpath_forward(pp, s_edge % total, (s_edge + span) % total)
+        else:
+            segs = _subpath_forward(pp, (s_edge - span) % total, s_edge % total)
+        if not segs:
+            return True
+        frag = Polypath(segments=segs, closed=False)
+        req = LeadGeometryRequest(
+            is_entry=is_entry, pass_side="OUTSIDE",
+            angle_deg=angle_deg,
+            line_length=length_mult * tool_eq / sin_a,
+            arc_radius=length_mult * tool_eq, style="line_arc",
+            side_ref=pp, min_arc_radius=d + LEAD_MIN_COMP_RADIUS)
+        try:
+            lead = build_lead_for_polypath(frag, req)
+        except Exception:
+            return True
+        if lead is None or not lead.segments:
+            return True
+        try:
+            cut = offset_right_of_travel(lead, d)
+        except Exception:
+            return True
+        for sg in cut.segments:
+            n = max(2, int(math.ceil(sg.length() / 0.05)))
+            for k in range(n + 1):
+                q = sg.point_at(k / n)
+                if _index_min_dist(index, q, d + 0.01) < d:
+                    return False
+        return True
+
+    out = []
+    for a, b in breaks:
+        extra = 0.0
+        while extra < max_extra - 1e-9 and not _lead_ok(b, True):
+            b += step
+            extra += step
+        extra = 0.0
+        while extra < max_extra - 1e-9 and not _lead_ok(a, False):
+            a -= step
+            extra += step
+        out.append((a, b))
+    return merge_ranges_circular(out, total, pad=0.0)

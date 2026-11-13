@@ -1174,6 +1174,11 @@ class PackageExporter:
                 lidx = _length_index(pp)
                 total = lidx[2]
                 brk = merge_ranges_circular(conf, total, pad=BREAK_PAD)
+                # 2 мм — минимум: если заход/выход на краю задевает
+                # соседа, разрыв раздвигается (v1.7.79)
+                if brk != [(0.0, total)]:
+                    from ..geometry.path_offset import widen_breaks_for_leads
+                    brk = widen_breaks_for_leads(pp, brk, idx, E)
                 if brk == [(0.0, total)]:
                     _rep.append(f"[{blade_op.name} / {side_name}] СОСЕДНЕЕ "
                                 f"ЛЕЗВИЕ БЛИЖЕ ШИРИНЫ РЕЗА ПО ВСЕМУ КОНТУРУ "

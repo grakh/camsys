@@ -106,3 +106,28 @@ def test_main_pass_is_open_in_program():
             if 1.0 < y < 9.0 and (abs(x - 20.0) < 1e-3 or abs(x - 21.2) < 1e-3):
                 worst = max(worst, 1.0)
     assert worst == 0.0, 'основной проход идёт по стороне у соседа'
+
+
+def test_break_widened_when_lead_hits_neighbour():
+    """v1.7.80: «1 или 2 мм — не ограничение, можно больше, если не
+    влезают лиды». Чужое лезвие рядом с краем разрыва — заход у края его
+    задевает, разрыв раздвигается шагом 0.5 мм, пока заход не влезет.
+    Без соседа разрыв не меняется."""
+    from camsys.geometry.primitives import Line, Polypath
+    from camsys.geometry.path_offset import (widen_breaks_for_leads,
+                                             foreign_blade_index)
+    V = [(0, 0), (20, 0), (20, 10), (0, 10)]          # CCW: фреза снаружи
+    pp = Polypath(segments=[Line(a=V[i], b=V[(i + 1) % 4])
+                            for i in range(4)], closed=True)
+    brk = [(34.0, 38.0)]                               # верх, x 16..12
+    same = widen_breaks_for_leads(pp, brk, foreign_blade_index([]), 1.3)
+    assert same == brk, same
+    near = Polypath(segments=[Line(a=(9.5, 11.2), b=(12.5, 11.2))],
+                    closed=False)
+    out = widen_breaks_for_leads(pp, brk, foreign_blade_index([near]), 1.3)
+    print(f'  разрыв {brk} → {out}')
+    assert len(out) == 1
+    a, b = out[0]
+    assert a == 34.0                    # выход у начала не мешает
+    assert 38.0 < b <= 38.0 + 6.0       # заход отодвинут, не дальше 6 мм
+    assert abs((b - 38.0) / 0.5 - round((b - 38.0) / 0.5)) < 1e-9
