@@ -931,6 +931,8 @@ def test_pocket_gets_full_t3_groove():
         project.add_blade_operation(geom.id)
     macros_mod.sort_operations_by_grid(project)
     params = CuttingMacroParams()
+    # порог 0.70 — как до v1.7.82: тесты сняты на углах 124173
+    params.corner_radius_threshold_mm = 0.70
     params.knife_angle, params.tip_diameter, params.bottom = 90.0, 0.8, 0.25
     ops, _ = PackageExporter(project, params)._build_corner_operations()
     pits = [o for o in ops if 'pocket_s0' in o.attributes]
@@ -999,6 +1001,8 @@ def test_rework_path_never_crosses_itself_far_from_the_tip():
         project.add_blade_operation(geom.id)
     macros_mod.sort_operations_by_grid(project)
     params = CuttingMacroParams()
+    # порог 0.70 — как до v1.7.82: тесты сняты на углах 124173
+    params.corner_radius_threshold_mm = 0.70
     params.knife_angle, params.tip_diameter, params.bottom = 90.0, 0.8, 0.25
     main_half = (params.tip_diameter
                  + 2.0 * params.bottom * math.tan(math.radians(45.0))) / 2.0
@@ -1200,6 +1204,8 @@ def test_pocket_groove_lead_enters_from_cut_side():
         project.add_blade_operation(geom.id)
     macros_mod.sort_operations_by_grid(project)
     params = CuttingMacroParams()
+    # порог 0.70 — как до v1.7.82: тесты сняты на углах 124173
+    params.corner_radius_threshold_mm = 0.70
     params.knife_angle, params.tip_diameter, params.bottom = 90.0, 0.8, 0.25
     ex = PackageExporter(project, params)
     ops, _ = ex._build_corner_operations()
@@ -1344,6 +1350,8 @@ def test_rework_lead_never_cuts_another_wall():
             project.add_blade_operation(geom.id)
         macros_mod.sort_operations_by_grid(project)
         params = CuttingMacroParams()
+        # порог 0.70 — как до v1.7.82: тесты сняты на углах 124173
+        params.corner_radius_threshold_mm = 0.70
         params.knife_angle, params.tip_diameter, params.bottom = 90.0, 0.8, 0.25
         ex = PackageExporter(project, params)
         ops, _ = ex._build_corner_operations()
@@ -1395,6 +1403,8 @@ def test_rework_lead_has_extra_length():
     """
     from camsys.core.cutting_macro import CuttingMacroParams
     p = CuttingMacroParams()
+    # порог 0.70 — как до v1.7.82: тесты сняты на углах 124173
+    p.corner_radius_threshold_mm = 0.70
     assert abs(p.corner_lead_extra_diam - 1.0) < 1e-9, 'умолчание запаса'
     assert abs(p.corner_tip_diameter - 0.6) < 1e-9
 
@@ -1502,6 +1512,8 @@ def test_rework_lead_cutter_never_crosses_geometry():
             project.add_blade_operation(geom.id)
         macros_mod.sort_operations_by_grid(project)
         params = CuttingMacroParams()
+        # порог 0.70 — как до v1.7.82: тесты сняты на углах 124173
+        params.corner_radius_threshold_mm = 0.70
         params.knife_angle, params.tip_diameter, params.bottom = 90.0, 0.8, 0.25
         ex = PackageExporter(project, params)
         ops, _ = ex._build_corner_operations()
@@ -2447,6 +2459,8 @@ def test_rework_leads_keep_clearance_from_the_blade():
             prj.add_blade_operation(g.id)
     macros_mod.sort_operations_by_grid(prj)
     p = CuttingMacroParams()
+    # порог 0.70 — как до v1.7.82: тесты сняты на углах 124173
+    p.corner_radius_threshold_mm = 0.70
     p.knife_angle, p.tip_diameter, p.bottom = 90.0, 0.8, 0.25
     p.generate_corner = True
     files = PackageExporter(prj, p).generate(only_stages=('corner',))
@@ -2681,6 +2695,8 @@ def test_hairpin_bridged_and_no_corner_inside_unmachinable_pocket():
             s.project.add_blade_operation(gg.id)
     macros_mod.sort_operations_by_grid(s.project)
     p = CuttingMacroParams()
+    # порог 0.70 — как до v1.7.82: тесты сняты на углах 124173
+    p.corner_radius_threshold_mm = 0.70
     p.knife_angle, p.tip_diameter, p.bottom = 90.0, 0.8, 0.25
     p.corner_tip_diameter = 0.6
     ex = PackageExporter(s.project, p)

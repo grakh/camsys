@@ -709,16 +709,20 @@ class CuttingParamsPanel(QtWidgets.QWidget):
         _thr_lbl = QtWidgets.QLabel("Порог радиуса угла:")
         _thr_row.addWidget(_thr_lbl)
         self.corner_radius_threshold = QtWidgets.QDoubleSpinBox()
-        self.corner_radius_threshold.setRange(0.1, 5.0)
+        self.corner_radius_threshold.setRange(0.0, 5.0)
         self.corner_radius_threshold.setDecimals(2)
         self.corner_radius_threshold.setSingleStep(0.05)
-        self.corner_radius_threshold.setValue(0.70)
+        # 0 — «по фрезе» (v1.7.82): углом считается только то, что
+        # основная фреза не проходит.
+        self.corner_radius_threshold.setSpecialValueText("по фрезе")
+        self.corner_radius_threshold.setValue(0.0)
         self.corner_radius_threshold.setSuffix(" мм")
         self.corner_radius_threshold.setToolTip(
             "Скругление с радиусом МЕНЬШЕ этого порога считается острым "
             "углом и дорабатывается тонкой фрезой T3 в _corner.anc.\n\n"
-            "Порог не опускается ниже эквидистанты основной фрезы: то, что "
-            "она физически не проходит, углом считается всегда.\n"
+            "«по фрезе» (0) — углом считается только скругление уже "
+            "полуэквидистанты основной фрезы, где она оставит больше 2 мкм "
+            "металла.\n"
             "Поднимайте, если нужны углы на местах, куда фреза формально "
             "входит, но впритык (напр. шпилька R0.64 при эквидистанте "
             "0.53).\n\n"
@@ -1852,7 +1856,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Нижняя граница — эквидистанта, как в package_export
         # (v1.7.26, откат привязки из v1.7.21).
         _thr_2d = max(
-            float(getattr(cp, 'corner_radius_threshold_mm', 0.7) or 0.7),
+            float(getattr(cp, 'corner_radius_threshold_mm', 0.0) or 0.0),
             tool_radius)
 
         knife = prj.get_layer_by_name("Knife")
@@ -2608,8 +2612,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 bottom=params.get('bottom', 0.2),
                 generate_corner=params.get('generate_corner', False),
                 generate_corner_3d=params.get('generate_corner_3d', False),
-                corner_radius_threshold_mm=params.get(
-                    'corner_radius_threshold_mm', 0.7),
+                corner_radius_threshold_mm=(
+                    0.0 if abs(float(params.get(
+                        'corner_radius_threshold_mm', 0.0) or 0.0) - 0.70)
+                    < 1e-9 else float(params.get(
+                        'corner_radius_threshold_mm', 0.0) or 0.0)),
             )
             exp = PackageExporter(self.session.project, macro)
             preferred = exp._analyze_layout_lead_side()
@@ -2936,6 +2943,15 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    def _corner_thr_default(self) -> float:
+        """Порог радиуса угла по умолчанию: 0 = «по фрезе» (v1.7.82).
+        Старое заводское 0.70 из сохранённых настроек читается как 0."""
+        try:
+            v = float(self._get_default("corner_radius_threshold", 0.0))
+        except Exception:
+            v = 0.0
+        return 0.0 if abs(v - 0.70) < 1e-9 else v
+
     def _get_default(self, key, fallback):
         """Читает дефолтное значение параметра из JSON-настроек.
         Пусто/ошибка → fallback (заводское значение)."""
@@ -3003,13 +3019,13 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow("Пятка T3:", w_corner_tip)
 
         # Порог радиуса угла — относится к «Острым углам 2D».
-        w_corner_thr = _spin((0.1, 5.0), 2, 0.05,
-                             self._get_default("corner_radius_threshold", 0.70))
+        w_corner_thr = _spin((0.0, 5.0), 2, 0.05, self._corner_thr_default())
+        w_corner_thr.setSpecialValueText("по фрезе")
         w_corner_thr.setSuffix(" мм")
         w_corner_thr.setToolTip(
             "Скругление с радиусом МЕНЬШЕ порога считается острым углом и "
             "уходит в _corner.anc на тонкую фрезу T3.\n"
-            "Ниже эквидистанты основной фрезы порог не опускается.")
+            "«по фрезе» (0) — только то, что основная фреза не проходит.")
         form.addRow("Порог радиуса угла:", w_corner_thr)
 
         w_top = _spin((0.0, 5.0), 3, 0.001, self._get_default("top", 0.440))
@@ -3139,7 +3155,7 @@ class MainWindow(QtWidgets.QMainWindow):
             _set(lambda: p.bottom.setValue(self._get_default("abs_low", 0.19)))
         _set(lambda: p.max_geom_len.setValue(self._get_default("limit", 3000.0)))
         _set(lambda: p.corner_radius_threshold.setValue(
-            self._get_default("corner_radius_threshold", 0.70)))
+            self._corner_thr_default()))
         _set(lambda: p.corner_tip.setValue(
             float(self._get_default("corner_tip_diameter", 0.60))))
         _set(lambda: p.lead_in_angle.setValue(self._get_default("lead_in_angle", 45.0)))

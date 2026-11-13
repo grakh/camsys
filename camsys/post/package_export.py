@@ -1447,7 +1447,7 @@ class PackageExporter:
             return _m_c.degrees(sw)
 
         radius_threshold_2d = max(
-            float(getattr(self.params, 'corner_radius_threshold_mm', 0.7)),
+            float(getattr(self.params, 'corner_radius_threshold_mm', 0.0) or 0.0),
             tool_offset
         )
         

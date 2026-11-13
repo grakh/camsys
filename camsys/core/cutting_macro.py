@@ -170,7 +170,7 @@ class CuttingMacroParams:
     
     # ── Параметры детекции углов (для corner и corner3D) ──
     sharp_angle_threshold: float = 90.0      # (для 3D) угол меньше N° = острый
-    corner_radius_threshold_mm: float = 0.7  # для 2D: если радиус скругления
+    corner_radius_threshold_mm: float = 0.0  # 0 = по фрезе (v1.7.82). Для 2D: если радиус скругления
                                               # МЕНЬШЕ — нужна тонкая фреза.
                                               # Задаётся в UI («Порог радиуса
                                               # угла»). Эквидистанта основной

@@ -407,6 +407,18 @@ class CamSession:
             elif key in ('lead_inside', 'lead_outside') and isinstance(value, dict):
                 lead = LeadInOutParams(**value)
                 setattr(self.cutting_params, key, lead)
+            elif key == 'corner_radius_threshold_mm':
+                # v1.7.82: порог по умолчанию — «по фрезе» (0). Старое
+                # заводское 0.70, сохранённое в настройках заказов,
+                # читается как «по фрезе»: пользователь решил, что
+                # скругления под фрезу углами не считаются.
+                try:
+                    v = float(value)
+                except (TypeError, ValueError):
+                    v = 0.0
+                if abs(v - 0.70) < 1e-9:
+                    v = 0.0
+                self.cutting_params.corner_radius_threshold_mm = v
             elif hasattr(self.cutting_params, key):
                 setattr(self.cutting_params, key, value)
     

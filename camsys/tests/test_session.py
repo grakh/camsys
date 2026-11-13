@@ -418,3 +418,17 @@ def test_api_lead_mode_matches_window():
     s.set_lead_mode(0, auto_angle=False, auto_length=False)
     assert knife_is_auto(s.project, op)
     assert auto_inner_lead_for_op(s.project, op, 'OUTSIDE', 0.8) is None
+
+
+def test_corner_threshold_default_is_tool():
+    """v1.7.82: порог радиуса угла по умолчанию — «по фрезе» (0); старое
+    заводское 0.70 из сохранённых настроек читается как 0, другое
+    значение — как есть."""
+    from camsys.core.session import CamSession
+    from camsys.core.cutting_macro import CuttingMacroParams
+    assert CuttingMacroParams().corner_radius_threshold_mm == 0.0
+    s = CamSession()
+    s.set_cutting_params_from_dict({'corner_radius_threshold_mm': 0.70})
+    assert s.cutting_params.corner_radius_threshold_mm == 0.0
+    s.set_cutting_params_from_dict({'corner_radius_threshold_mm': 0.75})
+    assert s.cutting_params.corner_radius_threshold_mm == 0.75
