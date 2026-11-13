@@ -3503,6 +3503,68 @@ def arc_penetration_mm(center, r_bridge: float, A, B, samples) -> float:
     return worst
 
 
+class _SegGrid:
+    """Ускоренный arc_penetration_mm для одной выборки (v1.7.81).
+
+    Выборка вокруг устья — с шагом 0.2 мкм, десятки тысяч отрезков, и на
+    каждый из ~300 сдвигов устья перебиралась целиком. Теперь отрезки
+    собраны в пачки по CHUNK подряд с рамкой: пачка, чья рамка не ближе
+    r_bridge к центру моста (или не может дать больше уже найденного),
+    пропускается. Внутри пачек счёт тот же, что в arc_penetration_mm.
+
+    `stop_above`: как только заход превысил порог, ответ «больше порога»
+    уже известен — вызывающему нужно только сравнение с допуском.
+    """
+    CHUNK = 64
+
+    def __init__(self, samples):
+        self.samples = samples
+        self.chunks = []
+        n = len(samples) - 1
+        for i0 in range(0, max(0, n), self.CHUNK):
+            i1 = min(n, i0 + self.CHUNK)
+            xs = [samples[k][1][0] for k in range(i0, i1 + 1)]
+            ys = [samples[k][1][1] for k in range(i0, i1 + 1)]
+            self.chunks.append((i0, i1, min(xs), min(ys), max(xs), max(ys)))
+
+    def penetration(self, center, r_bridge, A, B, stop_above=None):
+        cx, cy = center
+        a0 = math.atan2(A[1] - cy, A[0] - cx)
+        a1 = math.atan2(B[1] - cy, B[0] - cx)
+        sweep = (a0 - a1) % (2 * math.pi)
+        smp = self.samples
+        cand = []
+        for (i0, i1, x0, y0, x1, y1) in self.chunks:
+            dx = x0 - cx if cx < x0 else (cx - x1 if cx > x1 else 0.0)
+            dy = y0 - cy if cy < y0 else (cy - y1 if cy > y1 else 0.0)
+            lb = math.hypot(dx, dy)
+            if lb < r_bridge:
+                cand.append((lb, i0, i1))
+        cand.sort()
+        worst = 0.0
+        for lb, i0, i1 in cand:
+            if r_bridge - lb <= worst:
+                break
+            for i in range(i0, i1):
+                p, q = smp[i][1], smp[i + 1][1]
+                ex, ey = q[0] - p[0], q[1] - p[1]
+                L2 = ex * ex + ey * ey
+                if L2 < 1e-18:
+                    continue
+                t = ((cx - p[0]) * ex + (cy - p[1]) * ey) / L2
+                t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+                nx, ny = p[0] + ex * t, p[1] + ey * t
+                d = math.hypot(nx - cx, ny - cy)
+                if d >= r_bridge:
+                    continue
+                ang = (a0 - math.atan2(ny - cy, nx - cx)) % (2 * math.pi)
+                if 1e-12 < ang < sweep - 1e-12 and (r_bridge - d) > worst:
+                    worst = r_bridge - d
+            if stop_above is not None and worst > stop_above:
+                return worst
+        return worst
+
+
 def _fit_mouth_to_arc(polypath: Polypath, br: dict, r_bridge: float,
                       total: float, fine_step_mm: float = 0.002,
                       max_shrink_mm: float = 0.60,
@@ -3575,6 +3637,7 @@ def _fit_mouth_to_arc(polypath: Polypath, br: dict, r_bridge: float,
             pieces.append([((_s0 + a + s) % total, p) for (s, p) in _loc])
     if not pieces:
         return None
+    _grids = [_SegGrid(pc) for pc in pieces]
     step = max(fine_step_mm, 0.002)
     n_steps = int(max_shrink_mm / step)
     for k in range(n_steps + 1):
@@ -3590,8 +3653,12 @@ def _fit_mouth_to_arc(polypath: Polypath, br: dict, r_bridge: float,
         if res is None:
             continue
         _sw, cx, cy = res
-        pen = max(arc_penetration_mm((cx, cy), r_bridge, A, B, pc)
-                  for pc in pieces)
+        pen = 0.0
+        for g in _grids:
+            pen = max(pen, g.penetration((cx, cy), r_bridge, A, B,
+                                         stop_above=tol_mm))
+            if pen > tol_mm:
+                break
         if pen <= tol_mm:
             out = dict(br)
             out['sA'], out['sB'] = sa, sb

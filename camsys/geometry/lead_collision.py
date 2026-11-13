@@ -154,6 +154,10 @@ def _segments_intersect_2d(a1: Point, a2: Point,
     return False
 
 
+_OWN_DENSE_CACHE = {}
+_OWN_CELL = 0.25
+
+
 def _lead_crosses_own_axis(lead_poly, own_pp, entry_point, lead_bb,
                            step: float = 0.03, join_skip: float = 0.35):
     """Пересекает ли осевая лида осевую своего ножа дальше `join_skip`
@@ -166,17 +170,34 @@ def _lead_crosses_own_axis(lead_poly, own_pp, entry_point, lead_bb,
         n = max(2, int(math.ceil(sg.length() / step)))
         return [sg.point_at(k / n) for k in range(n + 1)]
 
-    own_lines = []
-    for sg in own_pp.segments:
-        q = dense(sg)
-        for i in range(len(q) - 1):
-            a, b = q[i], q[i + 1]
-            if (max(a[0], b[0]) < x0 or min(a[0], b[0]) > x1 or
-                    max(a[1], b[1]) < y0 or min(a[1], b[1]) > y1):
-                continue
-            own_lines.append((a, b))
-    if not own_lines:
-        return False
+    # Плотная ломаная своего контура строилась заново на каждый вариант
+    # лида — кешируется (v1.7.81, скорость).
+    _ck = (id(own_pp), step)
+    _segs = own_pp.segments
+    _sig = (id(_segs), len(_segs),
+            tuple(_segs[0].a) if _segs else None,
+            tuple(_segs[-1].b) if _segs else None)
+    _hit = _OWN_DENSE_CACHE.get(_ck)
+    if _hit is None or _hit[0] is not own_pp or _hit[2] != _sig:
+        _all = []
+        for sg in own_pp.segments:
+            q = dense(sg)
+            for i in range(len(q) - 1):
+                _all.append((q[i], q[i + 1]))
+        # Сетка по отрезкам: пересекающиеся отрезки делят общую точку,
+        # значит и ячейку — перебор только по ячейкам рамки отрезка лида.
+        _g = {}
+        for c, d in _all:
+            for gx in range(int(math.floor(min(c[0], d[0]) / _OWN_CELL)),
+                            int(math.floor(max(c[0], d[0]) / _OWN_CELL)) + 1):
+                for gy in range(int(math.floor(min(c[1], d[1]) / _OWN_CELL)),
+                                int(math.floor(max(c[1], d[1]) / _OWN_CELL)) + 1):
+                    _g.setdefault((gx, gy), []).append((c, d))
+        if len(_OWN_DENSE_CACHE) > 256:
+            _OWN_DENSE_CACHE.clear()
+        _hit = (own_pp, _g, _sig)
+        _OWN_DENSE_CACHE[_ck] = _hit
+    _g = _hit[1]
     for sg in lead_poly.segments:
         q = dense(sg)
         for i in range(len(q) - 1):
@@ -184,9 +205,13 @@ def _lead_crosses_own_axis(lead_poly, own_pp, entry_point, lead_bb,
             mx, my = (a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5
             if math.hypot(mx - entry_point[0], my - entry_point[1]) < join_skip:
                 continue
-            for (c, d) in own_lines:
-                if _segments_intersect_2d(a, b, c, d):
-                    return True
+            for gx in range(int(math.floor(min(a[0], b[0]) / _OWN_CELL)),
+                            int(math.floor(max(a[0], b[0]) / _OWN_CELL)) + 1):
+                for gy in range(int(math.floor(min(a[1], b[1]) / _OWN_CELL)),
+                                int(math.floor(max(a[1], b[1]) / _OWN_CELL)) + 1):
+                    for (c, d) in _g.get((gx, gy), ()):
+                        if _segments_intersect_2d(a, b, c, d):
+                            return True
     return False
 
 
@@ -528,7 +553,9 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
             return True
 
     bbox_dict = dict(contours_bboxes)
-    
+    # Запас рамки для отсева отрезков — больше любого порога ниже.
+    _seg_pad = max(cut_clear, safe_offset, tool_offset) + 0.01
+
     for cid, c_lines in contours_lines:
         # Пре-фильтр: пропускаем далёкие ножи (lead bbox + safe_offset 
         # не пересекается с контур bbox + safe_offset).
@@ -584,7 +611,21 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
                 if _ds < own_skip_radius:
                     _skip_idx.add(_i)
 
+        _it_lines = (cut_lines if (own_strict or not is_own)
+                     else lead_lines)
+        _ibx0 = min(min(a[0], b[0]) for a, b in _it_lines) - _seg_pad
+        _iby0 = min(min(a[1], b[1]) for a, b in _it_lines) - _seg_pad
+        _ibx1 = max(max(a[0], b[0]) for a, b in _it_lines) + _seg_pad
+        _iby1 = max(max(a[1], b[1]) for a, b in _it_lines) + _seg_pad
         for _ci, (ca, cb) in enumerate(c_lines):
+            # Отрезок дальше любого порога от рамки лида не может ни
+            # пересечь его, ни подойти ближе порога (v1.7.81: на сшивке
+            # перебор всех отрезков на каждый вариант лида шёл минутами).
+            if ((ca[0] < _ibx0 and cb[0] < _ibx0)
+                    or (ca[0] > _ibx1 and cb[0] > _ibx1)
+                    or (ca[1] < _iby0 and cb[1] < _iby0)
+                    or (ca[1] > _iby1 and cb[1] > _iby1)):
+                continue
             # В «зоне тангенциального касания» пропускаем только
             # distance-чек: дуга лида там прижата к контуру по построению.
             # Явное ПЕРЕСЕЧЕНИЕ остаётся ошибкой и в этой зоне (v1.7.18) —
@@ -785,7 +826,16 @@ def _lead_violation_score(lead: Optional[Polypath],
         if c_bb is not None and not _bboxes_overlap(lead_bb, c_bb, margin=safe_offset):
             continue
         is_own = (cid == own_geom_id)
+        _vx0, _vy0 = lead_bb[0] - safe_offset, lead_bb[1] - safe_offset
+        _vx1, _vy1 = lead_bb[2] + safe_offset, lead_bb[3] + safe_offset
         for (ca, cb) in c_lines:
+            # Дальше safe_offset от рамки лида — ни пересечения, ни
+            # нарушения зазора (v1.7.81, скорость).
+            if ((ca[0] < _vx0 and cb[0] < _vx0)
+                    or (ca[0] > _vx1 and cb[0] > _vx1)
+                    or (ca[1] < _vy0 and cb[1] < _vy0)
+                    or (ca[1] > _vy1 and cb[1] > _vy1)):
+                continue
             if is_own:
                 d_min_to_entry = _point_to_segment_distance(entry_pt, ca, cb)
                 if d_min_to_entry < 0.1:  # skip near join point

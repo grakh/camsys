@@ -695,6 +695,31 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
                             best = d
         return best
 
+    # Сетка по ОТРЕЗКАМ стенок (v1.7.81). Проверка пересечения шла по
+    # всем отрезкам всех стенок на каждый из ~150 вариантов лида: свой
+    # контур в шаге 0.02 мм — десятки тысяч отрезков. На сшивке 127821
+    # с разрывами у соседей сборка шла минутами. Отрезок стенки заносится
+    # во все ячейки, которые задевает его рамка; у отрезка лида смотрятся
+    # только ячейки его рамки. Пересекающиеся отрезки имеют общую точку,
+    # она лежит в общей ячейке — результат тот же, перебор в сотни раз
+    # короче.
+    _wcell = 0.25
+    _wgrid = {}
+    _wlong = []     # редкие длинные отрезки — проверяются всегда
+    for wl in walls:
+        for k in range(len(wl) - 1):
+            c, d = wl[k], wl[k + 1]
+            x0 = int(math.floor(min(c[0], d[0]) / _wcell))
+            x1 = int(math.floor(max(c[0], d[0]) / _wcell))
+            y0 = int(math.floor(min(c[1], d[1]) / _wcell))
+            y1 = int(math.floor(max(c[1], d[1]) / _wcell))
+            if (x1 - x0 + 1) * (y1 - y0 + 1) > 400:
+                _wlong.append((c, d))
+                continue
+            for gx in range(x0, x1 + 1):
+                for gy in range(y0, y1 + 1):
+                    _wgrid.setdefault((gx, gy), []).append((c, d))
+
     def evaluate(lpts):
         """Замер варианта лида.
 
@@ -727,16 +752,28 @@ def fit_rework_lead(point: Point, tangent: Point, contour,
             if (math.hypot(a[0] - point[0], a[1] - point[1]) < eps
                     or math.hypot(b[0] - point[0], b[1] - point[1]) < eps):
                 continue
-            for wl in walls:
-                for k in range(len(wl) - 1):
-                    c, d = wl[k], wl[k + 1]
-                    if abs(c[0] - a[0]) > reach or abs(c[1] - a[1]) > reach:
-                        continue
-                    if _seg_cross(a, b, c, d):
-                        crosses = True
-                        break
+            for c, d in _wlong:
+                if (abs(c[0] - a[0]) <= reach and abs(c[1] - a[1]) <= reach
+                        and _seg_cross(a, b, c, d)):
+                    crosses = True
+                    break
+            qx0 = int(math.floor(min(a[0], b[0]) / _wcell))
+            qx1 = int(math.floor(max(a[0], b[0]) / _wcell))
+            qy0 = int(math.floor(min(a[1], b[1]) / _wcell))
+            qy1 = int(math.floor(max(a[1], b[1]) / _wcell))
+            for gx in range(qx0, qx1 + 1):
                 if crosses:
                     break
+                for gy in range(qy0, qy1 + 1):
+                    for c, d in _wgrid.get((gx, gy), ()):
+                        if (abs(c[0] - a[0]) > reach
+                                or abs(c[1] - a[1]) > reach):
+                            continue
+                        if _seg_cross(a, b, c, d):
+                            crosses = True
+                            break
+                    if crosses:
+                        break
         # 2. КОНЧИК (точка врезания) — не ближе полуширины реза к любому
         #    металлу, без исключений (v1.7.47). Это и есть то, что видно
         #    на картинке: «расстояние от кончика до лезвия». Укорочение

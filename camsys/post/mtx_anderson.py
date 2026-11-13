@@ -714,7 +714,10 @@ class MtxAndersonGVM(PostProcessor):
                     # разных участков контура (v1.7.32). Свойство ножа, а
                     # не прохода, поэтому пишется один раз — на проход
                     # INSIDE, чтобы не дублировать.
-                    if tp.side.name == 'INSIDE':
+                    # У прохода с разрывами (v1.7.79) эта функция зовётся
+                    # на каждый кусок — пишем один раз, на первом (v1.7.81:
+                    # повтор и дублировал журнал, и съедал четверть сборки).
+                    if tp.side.name == 'INSIDE' and not piece_index:
                         from ..geometry.path_offset import (
                             find_tool_clearance_issues)
                         _mc = float(options.extras.get(

@@ -900,3 +900,23 @@ def test_entry_moves_to_nearest_straight_ccw():
            closed=True)
     assert (shift_start_from_diagonal_zero(c, -5.0, need).segments[0].a ==
             shift_start_from_diagonal_zero(c, -5.0).segments[0].a)
+
+
+def test_fast_penetration_equals_reference():
+    """v1.7.81: ускоренный замер захода моста за контур даёт ровно то же
+    число, что эталонный arc_penetration_mm (перебор всех отрезков)."""
+    import math
+    from camsys.geometry.path_offset import arc_penetration_mm, _SegGrid
+    samples = []
+    for k in range(4001):
+        x = -2.0 + k * 0.001
+        samples.append((k * 0.001, (x, 0.3 * math.sin(3 * x) - 0.2)))
+    g = _SegGrid(samples)
+    for cx, cy, r in ((0.0, 0.3, 0.65), (0.4, 0.1, 0.65), (-1.0, 0.5, 0.9),
+                      (1.5, -0.1, 0.4), (0.0, 3.0, 0.65)):
+        A = (cx - r, cy)
+        B = (cx + r, cy)
+        ref = arc_penetration_mm((cx, cy), r, A, B, samples)
+        assert g.penetration((cx, cy), r, A, B) == ref, (cx, cy, r)
+        fast = g.penetration((cx, cy), r, A, B, stop_above=0.0005)
+        assert (fast > 0.0005) == (ref > 0.0005)
