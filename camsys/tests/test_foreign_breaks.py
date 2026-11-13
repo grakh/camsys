@@ -131,3 +131,24 @@ def test_break_widened_when_lead_hits_neighbour():
     assert a == 34.0                    # выход у начала не мешает
     assert 38.0 < b <= 38.0 + 6.0       # заход отодвинут, не дальше 6 мм
     assert abs((b - 38.0) / 0.5 - round((b - 38.0) / 0.5)) < 1e-9
+
+
+def test_break_t3_written_without_corner_checkbox():
+    """v1.7.84: галка «Острые углы 2D» снята, а разрыв у соседа есть —
+    _corner.anc всё равно пишется, и в нём только T3 разрывов. Раньше
+    проход рвался, а участок разрыва не резал никто."""
+    import camsys.post.mtx_anderson  # noqa: F401
+    from camsys.post.package_export import PackageExporter
+    prj = _two_rects(1.2)
+    p = _params()
+    p.generate_corner = False
+    p.generate_corner_3d = False
+    ex = PackageExporter(prj, p)
+    files = ex.generate()
+    corner = [n for n in files if n.endswith('_corner.anc')]
+    assert corner, list(files)
+    txt = files[corner[0]]
+    assert txt.count('PART') >= 2, 'нет T3 разрыва в _corner'
+    # без разрывов (щель широкая) и без галки — _corner не пишется
+    files2 = PackageExporter(_two_rects(5.0), p).generate()
+    assert not [n for n in files2 if n.endswith('_corner.anc')]

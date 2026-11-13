@@ -2639,10 +2639,20 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
             try:
-                if macro.generate_corner or macro.generate_corner_3d:
+                _brk = exp.has_foreign_breaks()
+            except Exception:
+                _brk = False
+            try:
+                if macro.generate_corner or macro.generate_corner_3d or _brk:
                     corner_ops_2d, corner_ops_3d = exp._build_corner_operations()
             except Exception:
                 pass
+            if not macro.generate_corner:
+                # Без галки «Острые углы 2D» остаются только T3 разрывов
+                # у соседнего лезвия (v1.7.84): без них участок разрыва
+                # не режет никто.
+                corner_ops_2d = [op for op in corner_ops_2d
+                                 if op.attributes.get('foreign_gap')]
 
             # Добавляем corner-операции в проект ОДИН РАЗ (постоянно).
             # При повторном вызове action_toggle_paths не дублируем.
@@ -2671,8 +2681,7 @@ class MainWindow(QtWidgets.QMainWindow):
             existing_corner_ids = seen_corner_keys
             
             extra_ops = []
-            if macro.generate_corner:
-                extra_ops.extend(corner_ops_2d)
+            extra_ops.extend(corner_ops_2d)     # без галки — только разрывы
             if macro.generate_corner_3d:
                 extra_ops.extend(corner_ops_3d)
             

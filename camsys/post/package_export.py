@@ -197,6 +197,14 @@ class PackageExporter:
             if op.kind == OperationKind.BLADE_FORMING:
                 op.attributes['preferred_lead_side'] = preferred_side
         
+        # Разрывы у соседних лезвий нужны основным программам даже без
+        # доработки углов (v1.7.79): ставятся на ножевые операции.
+        try:
+            self.apply_foreign_breaks()
+        except Exception:
+            pass
+        _breaks = self.has_foreign_breaks()
+
         # ── Прогресс: считаем этапы ──
         p = self.params
 
@@ -207,7 +215,11 @@ class PackageExporter:
                 'rough_revers': p.generate_reverse,
                 'finish_group': p.generate_finish_per_op,
                 'sv': p.generate_sv,
-                'corner': p.generate_corner,
+                # Разрыв у соседа без T3 — недорезанный участок: _corner
+                # пишется всегда, когда разрывы есть (v1.7.84), даже если
+                # галка «Острые углы 2D» снята — тогда в нём только T3
+                # разрывов.
+                'corner': p.generate_corner or _breaks,
                 'corner3d': p.generate_corner_3d,
             }[stage]
             if not on:
@@ -225,13 +237,6 @@ class PackageExporter:
             current_stage[0] += 1
             return result if result is not None else True
         
-        # Разрывы у соседних лезвий нужны основным программам даже без
-        # доработки углов (v1.7.79): ставятся на ножевые операции.
-        try:
-            self.apply_foreign_breaks()
-        except Exception:
-            pass
-
         # ── 1. Черновая всех элементов (_all_R.anc) ──
         if want('rough_all'):
             if not _report("Черновая всех"): return files
@@ -332,6 +337,9 @@ class PackageExporter:
                 return key not in self._corner_excluded
             
             corner_ops_2d = [op for op in corner_ops_2d if _corner_not_excluded(op)]
+            if not p.generate_corner:
+                corner_ops_2d = [op for op in corner_ops_2d
+                                 if op.attributes.get('foreign_gap')]
             corner_ops_3d = [op for op in corner_ops_3d if _corner_not_excluded(op)]
             
             if want('corner'):
@@ -1089,6 +1097,19 @@ class PackageExporter:
         self._unmachinable_cache = unmachinable
         self.project.unmachinable_pockets = list(unmachinable)
         return ops, spans
+
+    def has_foreign_breaks(self) -> bool:
+        """Есть ли на листе разрывы у соседнего лезвия (их режет T3)."""
+        from ..core.project import OperationKind
+        for op in self.project.operations:
+            if op.kind != OperationKind.BLADE_FORMING:
+                continue
+            if op.attributes.get('stitch_filtered_out', False):
+                continue
+            fb = op.attributes.get('foreign_breaks') or {}
+            if any(fb.values()):
+                return True
+        return False
 
     def _break_lead_checker(self, blade_op, geom, side_name, E):
         """Проверка лида на краю разрыва — теми же параметрами лида и той
