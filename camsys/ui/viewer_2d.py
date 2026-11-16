@@ -1761,6 +1761,7 @@ def add_toolpaths_to_scene(scene: 'CamScene', project, options_extras: dict = No
                 _it.setZValue(9)
                 _it.setToolTip(_um.get('text', 'Карман не точится тонкой фрезой'))
                 _it.setData(0, 'unmachinable_pocket')
+                _it.setData(1, bool(_um.get('foreign_gap')))
                 scene.addItem(_it)
                 items.append(_it)
         except Exception:

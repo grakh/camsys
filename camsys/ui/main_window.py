@@ -363,6 +363,9 @@ class CuttingParamsPanel(QtWidgets.QWidget):
     
     paramsChanged = QtCore.Signal()
     rapidsVisibilityChanged = QtCore.Signal(bool)  # показ перебегов
+    # Галки углов 2D/3D — только показ на экране и вывод в программы
+    # (v1.7.86): сами углы считаются всегда.
+    cornerVisibilityChanged = QtCore.Signal()
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -777,8 +780,13 @@ class CuttingParamsPanel(QtWidgets.QWidget):
             w.valueChanged.connect(self._on_changed)
         for w in [self.dir_horiz, self.dir_vert,
                   self.gen_rough, self.gen_reverse, self.gen_finish,
-                  self.gen_sv, self.gen_corner, self.gen_corner_3d]:
+                  self.gen_sv]:
             w.toggled.connect(self._on_changed)
+        # Углы 2D/3D: пользователь — «углы должны быть всегда, только эти
+        # галки должны показывать/скрывать их и соответственно быть или не
+        # быть на выводе». Без пересчёта путей.
+        for w in (self.gen_corner, self.gen_corner_3d):
+            w.toggled.connect(lambda _=None: self.cornerVisibilityChanged.emit())
         # Перебеги — ТОЛЬКО видимость, без пересчёта путей
         self.show_rapids.toggled.connect(self.rapidsVisibilityChanged)
     
@@ -1079,6 +1087,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.params_panel.btn_show_paths.clicked.connect(self.action_toggle_paths)
         self.params_panel.rapidsVisibilityChanged.connect(
             self._on_rapids_visibility)
+        self.params_panel.cornerVisibilityChanged.connect(
+            self._apply_corner_visibility)
 
         # «Направление» пересортировывает обход сразу (v1.7.6). Раньше
         # переключатель только эмитил paramsChanged, а этот сигнал НИКУДА
@@ -1673,6 +1683,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 _rap_on = (self.params_panel.show_rapids.isChecked()
                            if hasattr(self.params_panel, 'show_rapids')
                            else False)
+                _flt = self._item_type_filter()
                 for item in items:
                     # Перебеги подчиняются своей галке, иначе всплывали при
                     # показе заказа даже с выключенной галкой.
@@ -1682,7 +1693,7 @@ class MainWindow(QtWidgets.QMainWindow):
                             continue
                     except Exception:
                         pass
-                    item.setVisible(visible)
+                    item.setVisible(visible and _flt(item))
             current_items = self._order_toolpath_items.get(current, [])
             if current_items:
                 self.params_panel.btn_show_paths.setText(
@@ -2302,6 +2313,59 @@ class MainWindow(QtWidgets.QMainWindow):
         # Кнопка остаётся checked, сигнал не дёргаем.
         self.action_toggle_paths(True)
     
+    def _item_type_filter(self):
+        """Функция «показывать ли элемент по галкам углов» (v1.7.86).
+
+        T3 разрыва у соседнего лезвия видна всегда; углы 2D/3D и красный
+        пунктир карманов — по своим галкам; остальное не трогаем.
+        """
+        from ..core.project import OperationKind
+        show2d = self.params_panel.gen_corner.isChecked()
+        show3d = self.params_panel.gen_corner_3d.isChecked()
+        ops = {o.id: o for o in self.session.project.operations
+               if o.kind == OperationKind.CORNER_REWORK}
+
+        def ok(it):
+            try:
+                d0 = it.data(0)
+            except Exception:
+                d0 = None
+            if d0 == 'unmachinable_pocket':
+                try:
+                    return bool(it.data(1)) or show2d
+                except Exception:
+                    return show2d
+            op = ops.get(getattr(it, 'op_id', None))
+            if op is None:
+                return True
+            if op.attributes.get('foreign_gap'):
+                return True
+            return show3d if op.attributes.get('corner_is_3d') else show2d
+        return ok
+
+    def _apply_corner_visibility(self):
+        """Галки «Острые углы 2D/3D» — показ без пересчёта путей."""
+        try:
+            current = getattr(self, '_current_stitch_order', None) or "_default"
+            extra = getattr(self, '_extra_shown_orders', set())
+            flt = self._item_type_filter()
+            for key, items in getattr(self, '_order_toolpath_items',
+                                      {}).items():
+                vis = (key == current) or (key in extra)
+                for it in items:
+                    try:
+                        if it.data(0) == 'rapid':
+                            continue
+                        it.setVisible(vis and flt(it))
+                    except Exception:
+                        continue
+            # перебеги — к видимым концам
+            self._on_rapids_visibility(
+                self.params_panel.show_rapids.isChecked()
+                if hasattr(self.params_panel, 'show_rapids') else False)
+        except Exception:
+            pass
+
     def _on_rapids_visibility(self, visible: bool):
         """Показ/скрытие перебегов станка БЕЗ пересчёта путей.
 
@@ -2642,17 +2706,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 _brk = exp.has_foreign_breaks()
             except Exception:
                 _brk = False
+            # Углы 2D/3D строятся ВСЕГДА (v1.7.86), галки решают только
+            # показ и вывод — см. _apply_corner_visibility.
             try:
-                if macro.generate_corner or macro.generate_corner_3d or _brk:
-                    corner_ops_2d, corner_ops_3d = exp._build_corner_operations()
+                corner_ops_2d, corner_ops_3d = exp._build_corner_operations()
             except Exception:
                 pass
-            if not macro.generate_corner:
-                # Без галки «Острые углы 2D» остаются только T3 разрывов
-                # у соседнего лезвия (v1.7.84): без них участок разрыва
-                # не режет никто.
-                corner_ops_2d = [op for op in corner_ops_2d
-                                 if op.attributes.get('foreign_gap')]
 
             # Добавляем corner-операции в проект ОДИН РАЗ (постоянно).
             # При повторном вызове action_toggle_paths не дублируем.
@@ -2680,10 +2739,7 @@ class MainWindow(QtWidgets.QMainWindow):
             
             existing_corner_ids = seen_corner_keys
             
-            extra_ops = []
-            extra_ops.extend(corner_ops_2d)     # без галки — только разрывы
-            if macro.generate_corner_3d:
-                extra_ops.extend(corner_ops_3d)
+            extra_ops = list(corner_ops_2d) + list(corner_ops_3d)
             
             new_corners_added = 0
             for op in extra_ops:
@@ -2742,8 +2798,9 @@ class MainWindow(QtWidgets.QMainWindow):
             show_filter_legacy = {
                 'blade': self.params_panel.gen_rough.isChecked() or
                          self.params_panel.gen_finish.isChecked(),
-                'corner_2d': self.params_panel.gen_corner.isChecked(),
-                'corner_3d': self.params_panel.gen_corner_3d.isChecked(),
+                # Строим все углы, видимость — по галкам ниже (v1.7.86).
+                'corner_2d': True,
+                'corner_3d': True,
                 'rapids': (self.params_panel.show_rapids.isChecked()
                            if hasattr(self.params_panel, 'show_rapids')
                            else False),
@@ -2783,6 +2840,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             # Кэшируем построенные items под ключом текущего заказа
             self._order_toolpath_items[current_order] = list(self._toolpath_items)
+            self._apply_corner_visibility()
             # Подписи обновляем — у текущего заказа теперь стоит ✓ (has_paths)
             self._refresh_stitch_labels()
             progress.setValue(100)
@@ -3922,6 +3980,7 @@ class MainWindow(QtWidgets.QMainWindow):
             visible = (key == current) or (key in self._extra_shown_orders)
             _rap_on = (self.params_panel.show_rapids.isChecked()
                        if hasattr(self.params_panel, 'show_rapids') else False)
+            _flt = self._item_type_filter()
             for it in items:
                 try:
                     if it.data(0) == 'rapid':
@@ -3929,7 +3988,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         continue
                 except Exception:
                     pass
-                it.setVisible(visible)
+                it.setVisible(visible and _flt(it))
         # Перерисуем подписи чтобы отразить новое состояние
         self._refresh_stitch_labels()
 
