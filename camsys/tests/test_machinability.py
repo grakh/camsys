@@ -2755,3 +2755,45 @@ def test_tight_fillet_replaced_tangentially():
         k = max_kink(out)
         print(f'  {side}: дуг {len(fixed)}, излом {base:.2f}° → {k:.2f}°')
         assert k <= base + 0.01, (side, base, k)
+
+
+def test_extended_rework_axis_is_what_screen_draws():
+    """v1.7.87: доработка, продлённая вдоль контура под чистый лид
+    (v1.7.82), на экране рисовалась НЕ продлённой — экран берёт
+    axis_rerooted, а продление меняло только axis. Лиды «отрывались» от
+    T3 (124173, Knife_10 и Knife_1). Теперь у продлённой доработки
+    axis_rerooted — та же продлённая осевая."""
+    ai = '/mnt/user-data/uploads/124173_test.ai'
+    if not os.path.exists(ai):
+        print('  SKIP — нет 124173_test.ai')
+        return
+    import camsys.geometry.lead_collision as LC
+    import camsys.post.mtx_anderson  # noqa: F401
+    from camsys.core.session import CamSession
+    seen = []
+    orig = LC.plan_pass_leads
+
+    def spy(*a, **k):
+        r = orig(*a, **k)
+        if r.axis_extended:
+            seen.append(r)
+        return r
+    LC.plan_pass_leads = spy        # пост импортирует его из модуля
+    try:
+        s = CamSession()
+        s.load_ai(ai)
+        s.set_cutting_params_from_dict({
+            'knife_angle': 90.0, 'tip_diameter': 0.8, 'bottom': 0.25,
+            'corner_tip_diameter': 0.6, 'generate_corner': True})
+        s.create_blade_operations()
+        from camsys.post.package_export import PackageExporter
+        PackageExporter(s.project, s.cutting_params).generate()
+    finally:
+        LC.plan_pass_leads = orig
+    print(f'  продлённых доработок: {len(seen)}')
+    assert seen, 'на 124173 продление не сработало — тест ничего не ловит'
+    for r in seen:
+        a, b = r.axis_rerooted, r.axis
+        assert a is not None
+        assert a.segments[0].a == b.segments[0].a
+        assert a.segments[-1].b == b.segments[-1].b

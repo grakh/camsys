@@ -1815,6 +1815,11 @@ def plan_pass_leads(axis: Polypath,
         if _ext is not None:
             axis, _done = _ext
             res.axis_extended = True
+            # Экран считает эквидистанту по axis_rerooted — без этого он
+            # рисовал старый, НЕ продлённый фрагмент, и лиды «отрывались»
+            # от T3 (124173, Knife_10; v1.7.87). У открытого фрагмента
+            # перебега нет, rerooted = сама осевая.
+            res.axis_rerooted = axis
             if log is not None:
                 for _w, _d in _done:
                     log(f"ДОРАБОТКА ПРОДЛЕНА: {_w} на {_d:.1f} мм вдоль "
