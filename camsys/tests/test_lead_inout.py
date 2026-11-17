@@ -463,9 +463,9 @@ def test_auto_inner_lead_is_per_knife():
     a = auto_inner_lead_for_op(prj, circ_op, 'OUTSIDE', 0.8)
     b = auto_inner_lead_for_op(prj, rect_op, 'OUTSIDE', 0.8)
     print(f'  кружок {a}, прямоугольник {b}')
-    # Ø3: 90° и длина 0.8 — наибольшая, при которой заход влезает
-    # (1.0 уходит в противоположную стенку, v1.7.71)
-    assert a == {'angle': 90.0, 'length': 0.8}, a
+    # Ø3: 90° и длина 1.0 — с v1.7.88 прямая лида вдвое короче, и
+    # полная длина влезает (до v1.7.88 влезало только 0.8)
+    assert a == {'angle': 90.0, 'length': 1.0}, a
     assert b == {'angle': 45.0, 'length': 1.0}
     # Внешний рез автоподбор не трогает
     assert auto_inner_lead_for_op(prj, circ_op, 'INSIDE', 0.8) is None
@@ -504,7 +504,7 @@ def test_auto_lead_small_knife_does_not_touch_big_one():
     circ_auto = prog(_two_knife_project(flags=True, only='Knife_1'))
     circ_plain = prog(_two_knife_project(flags=False, only='Knife_1'))
     circ_90 = prog(_two_knife_project(flags=False, only='Knife_1'),
-                   angle=90.0, length=0.8)
+                   angle=90.0, length=1.0)
     assert circ_auto != circ_plain, 'кружку автоподбор не дал своего лида'
     assert circ_auto == circ_90, 'кружок получил не то, что даёт поле 90°'
 
@@ -548,7 +548,7 @@ def test_auto_lead_viewer_matches_post_rule():
 
     auto = boxes(_two_knife_project(flags=True))
     plain = boxes(_two_knife_project(flags=False))
-    at90 = boxes(_two_knife_project(flags=False), angle=90.0, length=0.8)
+    at90 = boxes(_two_knife_project(flags=False), angle=90.0, length=1.0)
     assert auto['Knife_2'] == plain['Knife_2'], 'прямоугольник изменился'
     assert auto['Knife_1'] != plain['Knife_1'], 'кружок без своего лида'
     assert auto['Knife_1'] == at90['Knife_1'], 'кружок не как с полем 90°'
@@ -570,8 +570,9 @@ def test_auto_inner_lead_fits_the_hole():
             closed=True)
     got = {D: auto_inner_lead(circ(D), 0.8, 1.3) for D in (2, 3, 4, 8)}
     print(f'  {got}')
-    assert got[2] == (90.0, 0.4)
-    assert got[3] == (90.0, 0.8)
+    # v1.7.88: прямая лида вдвое короче — длины выросли (было 0.4 / 0.8)
+    assert got[2] == (90.0, 0.6)
+    assert got[3] == (90.0, 1.0)
     assert got[4] == (60.0, 1.0)
     assert got[8] == (45.0, 1.0)
     # Ø4 в разных местах листа (шум габарита) — один угол
@@ -590,7 +591,10 @@ def test_lead_check_measures_cutter_like_the_control():
     from camsys.geometry.lead_inout import _inner_lead_fits
     for m in (1.0, 0.8, 0.6, 0.4, 0.2, 0.1):
         assert _inner_lead_fits(4.0, 45.0, m, 1.3), m
-    assert not _inner_lead_fits(1.5, 90.0, 1.0, 1.3)
+    # v1.7.88: прямая вдвое короче — в r 1.2 полная длина уже не влезает,
+    # 0.8 влезает (было: r 1.5 не влезало)
+    assert not _inner_lead_fits(1.2, 90.0, 1.0, 1.3)
+    assert _inner_lead_fits(1.2, 90.0, 0.8, 1.3)
 
 
 def test_rules_only_in_auto_mode():

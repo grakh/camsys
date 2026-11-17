@@ -6161,7 +6161,7 @@ def widen_breaks_for_leads(pp: Polypath, breaks, index, tool_eq: float,
     не дальше `max_extra`.
     """
     from .lead_collision import (LeadGeometryRequest, build_lead_for_polypath,
-                                 LEAD_MIN_COMP_RADIUS)
+                                 LEAD_MIN_COMP_RADIUS, lead_line_mm)
     if not breaks:
         return breaks
     lidx = _length_index(pp)
@@ -6196,7 +6196,7 @@ def widen_breaks_for_leads(pp: Polypath, breaks, index, tool_eq: float,
         req = LeadGeometryRequest(
             is_entry=is_entry, pass_side="OUTSIDE",
             angle_deg=angle_deg,
-            line_length=length_mult * tool_eq / sin_a,
+            line_length=lead_line_mm(length_mult, tool_eq, angle_deg),
             arc_radius=length_mult * tool_eq, style="line_arc",
             side_ref=pp, min_arc_radius=d + LEAD_MIN_COMP_RADIUS)
         try:

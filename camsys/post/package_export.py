@@ -1118,7 +1118,8 @@ class PackageExporter:
         реза → поля тулпаса (как в mtx_anderson._emit_toolpath)."""
         from ..geometry.lead_collision import (
             LeadGeometryRequest, build_lead_for_polypath,
-            lead_crosses_contours, build_contours_cache, LEAD_MIN_COMP_RADIUS)
+            lead_crosses_contours, build_contours_cache, LEAD_MIN_COMP_RADIUS,
+            lead_line_mm)
         from ..geometry.lead_inout import auto_inner_lead_for_op
         import math as _m
         ent = getattr(self, '_brk_contours', None)
@@ -1160,7 +1161,8 @@ class PackageExporter:
             sa = max(0.05, _m.sin(_m.radians(max(5.0, min(175.0, ang)))))
             req = LeadGeometryRequest(
                 is_entry=is_entry, pass_side=side_name, angle_deg=ang,
-                line_length=ln * E / sa, arc_radius=max(rr * E, r_min),
+                line_length=lead_line_mm(ln, E, ang),
+                arc_radius=max(rr * E, r_min),
                 style='line_arc', side_ref=geom.polypath,
                 min_arc_radius=r_min)
             try:

@@ -878,7 +878,7 @@ def _inner_lead_fits(r_hole: float, angle: float, mult: float,
     from .primitives import Arc, Polypath
     from .lead_collision import (
         LeadGeometryRequest, build_lead_for_polypath, own_contour_clearance,
-        _exact_cut_lines, LEAD_MIN_COMP_RADIUS)
+        _exact_cut_lines, LEAD_MIN_COMP_RADIUS, lead_line_mm)
     if r_hole <= 0:
         return False
     d = equidistant / 2.0
@@ -891,7 +891,7 @@ def _inner_lead_fits(r_hole: float, angle: float, mult: float,
     sin_a = max(0.05, math.sin(math.radians(max(5.0, min(175.0, angle)))))
     req = LeadGeometryRequest(
         is_entry=True, pass_side="OUTSIDE", angle_deg=angle,
-        line_length=mult * equidistant / sin_a,
+        line_length=lead_line_mm(mult, equidistant, angle),
         arc_radius=mult * equidistant, style="line_arc",
         side_ref=circ, min_arc_radius=d + LEAD_MIN_COMP_RADIUS)
     try:

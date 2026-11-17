@@ -1534,6 +1534,23 @@ class PassLeadResult:
     axis_extended: bool = False
 
 
+# Прямая часть лида — в долях ЭКВИДИСТАНТЫ × этот коэффициент (v1.7.88).
+# Пользователь, на реальном ноже: «прямая часть лидов уж слишком длинная,
+# в 2 раза». До v1.7.88 было 1.0 (сличение с альфой на 124536, v1.7.11).
+# Дуга лида не меняется. Одна константа для поста, экрана, автоподбора
+# и проверки разрывов — иначе они разойдутся.
+LEAD_LINE_SCALE = 0.5
+
+
+def lead_line_mm(mult: float, equidistant: float, angle_deg: float) -> float:
+    """Длина прямой части лида, мм: mult × эквидистанта × LEAD_LINE_SCALE
+    / sin(угла)."""
+    sin_a = math.sin(math.radians(max(5.0, min(175.0, angle_deg))))
+    if sin_a < 0.05:
+        sin_a = 0.05
+    return mult * equidistant * LEAD_LINE_SCALE / sin_a
+
+
 def _lead_line_length(user_factor: float, angle_deg: float,
                       p: PassLeadParams) -> float:
     """Длина прямой части лида по формуле альфы.
@@ -1548,7 +1565,8 @@ def _lead_line_length(user_factor: float, angle_deg: float,
     sin_a = math.sin(ang_rad)
     if sin_a < 0.05:
         sin_a = 0.05            # защита от углов около 0 и 180
-    return (user_factor * p.length_mult * p.lead_scale + p.extra_mm) / sin_a
+    return (user_factor * p.length_mult * p.lead_scale * LEAD_LINE_SCALE
+            + p.extra_mm) / sin_a
 
 
 def plan_pass_leads(axis: Polypath,
