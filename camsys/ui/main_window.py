@@ -1089,10 +1089,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._on_rapids_visibility)
         self.params_panel.cornerVisibilityChanged.connect(
             self._apply_corner_visibility)
-        self.params_panel.gen_corner.toggled.connect(
-            lambda on: self._on_corner_box_toggled('2d', on))
-        self.params_panel.gen_corner_3d.toggled.connect(
-            lambda on: self._on_corner_box_toggled('3d', on))
 
         # «Направление» пересортировывает обход сразу (v1.7.6). Раньше
         # переключатель только эмитил paramsChanged, а этот сигнал НИКУДА
@@ -1216,7 +1212,6 @@ class MainWindow(QtWidgets.QMainWindow):
             # Сбрасываем все параметры панели к умолчаниям — каждый новый файл
             # начинается со стандартных значений, не наследует предыдущие
             self.params_panel.set_defaults()
-            self._reset_corner_user_choice()     # новый файл — заново
             
             self.session.load_ai(path)
             self.session._last_ai_path = path  # для поиска XML вокруг файла
@@ -2320,32 +2315,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.action_toggle_paths(True)
     
     def _auto_check_corners(self, has_2d: bool, has_3d: bool):
-        """Ставит галки «Острые углы 2D/3D», если углы есть (v1.7.89).
+        """Ставит галки «Острые углы 2D/3D», если углы есть.
 
-        Никогда не снимает: выключение — решение оператора. И если оператор
-        сам снял галку в этом файле, программа её больше не ставит.
+        Никогда не снимает: выключение — решение оператора. При каждом
+        открытии и пересчёте путей галка ставится заново, если углы есть
+        (v1.8.0: «при пересчёте пусть всегда ставится, если есть»), — между
+        пересчётами оператор переключает её как хочет.
         """
         p = self.params_panel
         self._corner_auto_busy = True
         try:
-            if (has_2d and not p.gen_corner.isChecked()
-                    and not getattr(self, '_corner_user_off_2d', False)):
+            if has_2d and not p.gen_corner.isChecked():
                 p.gen_corner.setChecked(True)
-            if (has_3d and not p.gen_corner_3d.isChecked()
-                    and not getattr(self, '_corner_user_off_3d', False)):
+            if has_3d and not p.gen_corner_3d.isChecked():
                 p.gen_corner_3d.setChecked(True)
         finally:
             self._corner_auto_busy = False
-
-    def _on_corner_box_toggled(self, which: str, on: bool):
-        """Запоминает, что оператор сам снял галку (не программа)."""
-        if getattr(self, '_corner_auto_busy', False):
-            return
-        setattr(self, f'_corner_user_off_{which}', not on)
-
-    def _reset_corner_user_choice(self):
-        self._corner_user_off_2d = False
-        self._corner_user_off_3d = False
 
     def _item_type_filter(self):
         """Функция «показывать ли элемент по галкам углов» (v1.7.86).
