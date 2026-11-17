@@ -2933,6 +2933,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Станок — из настроек (v1.7.89); ставится перед каждой записью.
         try:
             self.session.cutting_params.machine = self._machine()
+            self.session.cutting_params.ncfix_enabled = bool(
+                self._get_default("ncfix_enabled", True))
+            self.session.cutting_params.ncfix_rmin = float(
+                self._get_default("ncfix_rmin", 0.5))
         except Exception:
             pass
         return self._action_export_impl()
@@ -3135,6 +3139,20 @@ class MainWindow(QtWidgets.QMainWindow):
             "формат поста DCM_Engraving_V1_23.")
         form.insertRow(0, "Станок:", w_machine)
 
+        # Fix G-code как в Anctor (v1.8.3)
+        w_fix = QtWidgets.QCheckBox("Fix G-code после сборки (как в Anctor)")
+        w_fix.setChecked(bool(self._get_default("ncfix_enabled", True)))
+        w_fix.setToolTip(
+            "Микро-кадры < 10 мкм, шумные прямые, микро-изломы, малые дуги\n"
+            "обратного прохода, общая геометрия прямого и обратного\n"
+            "проходов — тем же кодом, что кнопка «⚒ Fix G-code» в Anctor.")
+        form.insertRow(1, "", w_fix)
+        w_fix_r = _spin((0.0, 5.0), 3, 0.05,
+                        float(self._get_default("ncfix_rmin", 0.5)))
+        w_fix_r.setToolTip("Мин. радиус макета для Fix (как в Anctor), мм.\n"
+                           "0 — радиусы не трогать.")
+        form.insertRow(2, "Fix: мин. радиус макета, мм:", w_fix_r)
+
         # Пятка тонкой фрезы T3 — сохраняется между запусками (v1.7.68).
         # Без этого поле в панели сбрасывалось на 0.6 при каждом старте.
         w_corner_tip = _spin((0.1, 2.0), 2, 0.05,
@@ -3208,6 +3226,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._set_defaults({
             "machine": w_machine.currentData(),
+            "ncfix_enabled": bool(w_fix.isChecked()),
+            "ncfix_rmin": float(w_fix_r.value()),
             "angle": w_angle.currentText(),
             "tip": w_tip.currentText(),
             "corner_tip_diameter": w_corner_tip.value(),

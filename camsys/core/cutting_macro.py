@@ -184,6 +184,10 @@ class CuttingMacroParams:
     # Станок, под который пишутся программы (v1.7.89): 'AEC_GVM' (.anc)
     # или 'DCM_920' (.npg, перевод из .anc — camsys/post/dcm920.py).
     machine: str = 'AEC_GVM'
+    # Fix G-code как в Anctor после сборки программ (v1.8.3) и его R_min —
+    # «мин. радиус макета», как настройка Anctor fix_rmin_all.
+    ncfix_enabled: bool = True
+    ncfix_rmin: float = 0.5
     corner_tip_diameter: float = 0.6         # пятка тонкой фрезы T3, мм
 
     # ── Лиды угловых проходов (v1.7.30) ──

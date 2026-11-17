@@ -374,6 +374,25 @@ class PackageExporter:
             content = self._generate_with_operations(
                 active_blades, program_name=f"{prefix}_{angle}_dop")
             files[name] = content
+
+        # ── 8. Fix G-code как в Anctor (v1.8.3) ──
+        # Микро-кадры < 10 мкм, шумные прямые, микро-изломы, малые дуги,
+        # внутренние для обратного прохода, общая геометрия прямого и
+        # обратного проходов — тем же кодом, что кнопка «⚒ Fix G-code».
+        if getattr(self.params, 'ncfix_enabled', True):
+            try:
+                from .ncfix import fix_package
+                files, _fix_log = fix_package(
+                    files, rmin=float(getattr(self.params, 'ncfix_rmin', 0.5)))
+                rep = getattr(self, 'machinability_report', None)
+                if rep is not None and _fix_log:
+                    rep.append("FIX G-CODE (как Anctor): " + "; ".join(
+                        l.strip() for l in _fix_log if l.strip())[:4000])
+            except Exception as _e:
+                rep = getattr(self, 'machinability_report', None)
+                if rep is not None:
+                    rep.append(f"FIX G-CODE: не выполнен ({_e}) — программы "
+                               f"как есть, прогоните Fix в Anctor")
         
         return files
     
