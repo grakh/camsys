@@ -6205,14 +6205,18 @@ def widen_breaks_for_leads(pp: Polypath, breaks, index, tool_eq: float,
             return True
         if lead is None or not lead.segments:
             return True
-        try:
-            cut = offset_right_of_travel(lead, d)
-        except Exception:
+        # Путь фрезы — как у стойки: на прямой G42/G40 компенсация
+        # включается/снимается постепенно, врезание — без смещения (v1.8.1).
+        from .lead_collision import _exact_cut_lines
+        jp = frag.segments[0].a if is_entry else frag.segments[-1].b
+        cut = _exact_cut_lines(lead, d, jp)
+        if not cut:
             return True
-        for sg in cut.segments:
-            n = max(2, int(math.ceil(sg.length() / 0.05)))
+        for a, b in cut:
+            L = math.hypot(b[0] - a[0], b[1] - a[1])
+            n = max(1, int(math.ceil(L / 0.05)))
             for k in range(n + 1):
-                q = sg.point_at(k / n)
+                q = (a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n)
                 if _index_min_dist(index, q, d + 0.01) < d:
                     return False
         return True

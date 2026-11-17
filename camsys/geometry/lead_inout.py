@@ -900,7 +900,7 @@ def _inner_lead_fits(r_hole: float, angle: float, mult: float,
         return False
     if lead is None or not lead.segments:
         return False
-    cut = _exact_cut_lines(lead, d)
+    cut = _exact_cut_lines(lead, d, lead.segments[-1].b)   # врезание — без смещения
     if not cut:
         return False
     pts = [la for (la, _lb) in cut] + [cut[-1][1]]
@@ -939,13 +939,18 @@ def auto_inner_lead(polypath, tip_diameter: float,
         angle = 45.0
     r_in = round(min(x1 - x0, y1 - y0) / 2.0, 3)
     eq = float(equidistant) if equidistant and equidistant > 0 else 1.3
-    length = 0.1
-    for k in range(10, 0, -1):
-        m = k / 10.0
-        if _inner_lead_fits(round(r_in, 4), angle, m, round(eq, 4)):
-            length = m
-            break
-    return angle, length
+    # Сначала угол по габариту; если на нём не влезает ни одна длина —
+    # угол круче (v1.8.1). С честной моделью врезания (компенсация
+    # включается на прямой, точка врезания — без смещения) пологий заход
+    # в мелком отверстии ставит точку врезания у самой стенки: на Ø8 при
+    # 45° — 0.642 мм от неё при радиусе фрезы 0.65. Укорачивать лид тут
+    # бесполезно (короче — ещё ближе к стенке), помогает крутой угол.
+    for a in [angle] + [x for x in (60.0, 90.0) if x > angle]:
+        for k in range(10, 0, -1):
+            m = k / 10.0
+            if _inner_lead_fits(round(r_in, 4), a, m, round(eq, 4)):
+                return a, m
+    return 90.0, 0.1
 
 
 def auto_inner_lead_for_op(project, op, side_name: str, tip_diameter: float,

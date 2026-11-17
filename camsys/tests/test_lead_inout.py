@@ -463,9 +463,9 @@ def test_auto_inner_lead_is_per_knife():
     a = auto_inner_lead_for_op(prj, circ_op, 'OUTSIDE', 0.8)
     b = auto_inner_lead_for_op(prj, rect_op, 'OUTSIDE', 0.8)
     print(f'  кружок {a}, прямоугольник {b}')
-    # Ø3: 90° и длина 1.0 — с v1.7.88 прямая лида вдвое короче, и
-    # полная длина влезает (до v1.7.88 влезало только 0.8)
-    assert a == {'angle': 90.0, 'length': 1.0}, a
+    # Ø3: 90° и длина 0.6 — v1.8.1: точка врезания идёт БЕЗ смещения
+    # (компенсация включается на прямой), длинный лид ставит её к стенке
+    assert a == {'angle': 90.0, 'length': 0.6}, a
     assert b == {'angle': 45.0, 'length': 1.0}
     # Внешний рез автоподбор не трогает
     assert auto_inner_lead_for_op(prj, circ_op, 'INSIDE', 0.8) is None
@@ -504,7 +504,7 @@ def test_auto_lead_small_knife_does_not_touch_big_one():
     circ_auto = prog(_two_knife_project(flags=True, only='Knife_1'))
     circ_plain = prog(_two_knife_project(flags=False, only='Knife_1'))
     circ_90 = prog(_two_knife_project(flags=False, only='Knife_1'),
-                   angle=90.0, length=1.0)
+                   angle=90.0, length=0.6)
     assert circ_auto != circ_plain, 'кружку автоподбор не дал своего лида'
     assert circ_auto == circ_90, 'кружок получил не то, что даёт поле 90°'
 
@@ -548,7 +548,7 @@ def test_auto_lead_viewer_matches_post_rule():
 
     auto = boxes(_two_knife_project(flags=True))
     plain = boxes(_two_knife_project(flags=False))
-    at90 = boxes(_two_knife_project(flags=False), angle=90.0, length=1.0)
+    at90 = boxes(_two_knife_project(flags=False), angle=90.0, length=0.6)
     assert auto['Knife_2'] == plain['Knife_2'], 'прямоугольник изменился'
     assert auto['Knife_1'] != plain['Knife_1'], 'кружок без своего лида'
     assert auto['Knife_1'] == at90['Knife_1'], 'кружок не как с полем 90°'
@@ -570,11 +570,13 @@ def test_auto_inner_lead_fits_the_hole():
             closed=True)
     got = {D: auto_inner_lead(circ(D), 0.8, 1.3) for D in (2, 3, 4, 8)}
     print(f'  {got}')
-    # v1.7.88: прямая лида вдвое короче — длины выросли (было 0.4 / 0.8)
-    assert got[2] == (90.0, 0.6)
-    assert got[3] == (90.0, 1.0)
-    assert got[4] == (60.0, 1.0)
-    assert got[8] == (45.0, 1.0)
+    # v1.8.1: врезание без смещения. Ø2 не влезает ничем (запасное 0.1),
+    # Ø3 — 0.6; на Ø4 и Ø8 угол по габариту не влезает ни с какой длиной,
+    # и подбор поднимает его (60° → 90°), а не укорачивает лид
+    assert got[2] == (90.0, 0.1)
+    assert got[3] == (90.0, 0.6)
+    assert got[4] == (90.0, 1.0)
+    assert got[8] == (60.0, 1.0)
     # Ø4 в разных местах листа (шум габарита) — один угол
     angles = {auto_inner_lead(circ(4.0, x, y), 0.8, 1.3)[0]
               for x, y in ((636.117, 84.0), (603.1, 51.0), (64.0, 479.0),
@@ -583,18 +585,21 @@ def test_auto_inner_lead_fits_the_hole():
 
 
 def test_lead_check_measures_cutter_like_the_control():
-    """Путь фрезы по лиду — дуга концентрическая, как у стойки: короткий
-    заход в кружок Ø8 больше не «коллизия» (0.636 вместо 0.650 было
-    ошибкой замера хордами, v1.7.71)."""
+    """Путь фрезы по лиду — как у стойки: дуга концентрическая (v1.7.71),
+    а на прямой G42 компенсация включается постепенно — точка врезания
+    без смещения (v1.8.1, как в Anctor). В кружке Ø8 при 45° она стоит в
+    0.642 мм от стенки при радиусе 0.65 — 8 мкм врезания, а при 90° —
+    чисто."""
     import math as _m
     from camsys.geometry.primitives import Arc as _A, Polypath as _P
     from camsys.geometry.lead_inout import _inner_lead_fits
-    for m in (1.0, 0.8, 0.6, 0.4, 0.2, 0.1):
-        assert _inner_lead_fits(4.0, 45.0, m, 1.3), m
-    # v1.7.88: прямая вдвое короче — в r 1.2 полная длина уже не влезает,
-    # 0.8 влезает (было: r 1.5 не влезало)
-    assert not _inner_lead_fits(1.2, 90.0, 1.0, 1.3)
-    assert _inner_lead_fits(1.2, 90.0, 0.8, 1.3)
+    assert not _inner_lead_fits(4.0, 45.0, 1.0, 1.3)
+    for m in (1.0, 0.8, 0.6, 0.4, 0.2):
+        assert _inner_lead_fits(4.0, 90.0, m, 1.3), m
+    # r 1.5: полная длина не влезает, 0.6 — да; r 1.2 — ничем
+    assert not _inner_lead_fits(1.5, 90.0, 1.0, 1.3)
+    assert _inner_lead_fits(1.5, 90.0, 0.6, 1.3)
+    assert not _inner_lead_fits(1.2, 90.0, 0.6, 1.3)
 
 
 def test_rules_only_in_auto_mode():
@@ -652,3 +657,90 @@ def test_straight_entry_not_applied_in_manual_mode():
         assert abs(y - 40.0) < 1e-3 and abs(x - 25.0) < 1e-3, (x, y)
     for x, y in manual:
         assert not (abs(y - 40.0) < 1e-3 and abs(x - 25.0) < 1e-3), (x, y)
+
+
+def test_plunge_point_is_a_tool_radius_from_every_blade():
+    """v1.8.1: фреза опускается (`G1 Z0`) в начале лида БЕЗ компенсации —
+    G42 включается на следующей строке. Значит, точка врезания должна
+    стоять не ближе радиуса фрезы к любому лезвию, своему и чужому. На
+    127821 Anctor нашёл 63 захода, где она стояла ближе (до 0.44 мм
+    врезания), а CAMSYS их не видел: считал точку врезания сдвинутой
+    на радиус."""
+    import math as _m
+    import re as _re
+    import os as _os
+    import camsys.post.mtx_anderson  # noqa: F401
+    from camsys.core.session import CamSession
+    ai = '/mnt/user-data/uploads/124173_test.ai'
+    if not _os.path.exists(ai):
+        print('  SKIP — нет 124173_test.ai')
+        return
+    s = CamSession()
+    s.load_ai(ai)
+    s.set_cutting_params_from_dict({'knife_angle': 90.0, 'tip_diameter': 0.8,
+                                    'bottom': 0.25})
+    s.create_blade_operations()
+    from camsys.post.package_export import PackageExporter
+    files = PackageExporter(s.project, s.cutting_params).generate()
+    anc = next(t for n, t in files.items() if n.endswith('_all_R.anc'))
+    r = 0.65
+    num = r'-?\d+(?:\.\d+)?'
+    # программные контуры: отрезки и дуги строк ;50,21 / ;60,21 / ;40,21
+    els, plunges = [], []
+    x = y = None
+    last_g0 = None
+    g = None
+    for ln in anc.splitlines():
+        c = ln.split(';')[0]
+        gg = _re.findall(r'\bG([0-3])\b', c)
+        if gg:
+            g = gg[-1]
+        mx = _re.search(r'X(' + num + ')', c)
+        my = _re.search(r'Y(' + num + ')', c)
+        mr = _re.search(r'\bR(' + num + ')', c)
+        if g == '0' and mx and my:
+            last_g0 = (float(mx.group(1)), float(my.group(1)))
+            x, y = last_g0
+            continue
+        if _re.search(r'G1 Z0 ', c) and last_g0:
+            plunges.append(last_g0)
+            continue
+        if mx and my:
+            nx, ny = float(mx.group(1)), float(my.group(1))
+            if (';50,21' in ln or ';60,21' in ln or ';40,21' in ln) \
+                    and x is not None:
+                els.append(((x, y), (nx, ny),
+                            float(mr.group(1)) if mr else None, g))
+            x, y = nx, ny
+    assert plunges and els
+
+    def seg_d(p, a, b):
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        L2 = dx * dx + dy * dy
+        t = 0.0 if L2 < 1e-18 else max(0.0, min(1.0, (
+            (p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / L2))
+        return _m.hypot(p[0] - a[0] - dx * t, p[1] - a[1] - dy * t)
+
+    def dist(p, e):
+        a, b, R, gg = e
+        if R is None or gg not in ('2', '3'):
+            return seg_d(p, a, b)
+        # центр дуги (≤ 180°) по концам, радиусу и направлению
+        mx_, my_ = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        c2 = dx * dx + dy * dy
+        h = _m.sqrt(max(0.0, R * R - c2 / 4)) / _m.sqrt(c2) if c2 else 0
+        sgn = 1 if gg == '3' else -1
+        cx, cy = mx_ - sgn * dy * h, my_ + sgn * dx * h
+        a0 = _m.atan2(a[1] - cy, a[0] - cx)
+        a1 = _m.atan2(b[1] - cy, b[0] - cx)
+        ap = _m.atan2(p[1] - cy, p[0] - cx)
+        sw = (a1 - a0) % (2 * _m.pi) if gg == '3' else (a0 - a1) % (2 * _m.pi)
+        t = (ap - a0) % (2 * _m.pi) if gg == '3' else (a0 - ap) % (2 * _m.pi)
+        if t <= sw:
+            return abs(_m.hypot(p[0] - cx, p[1] - cy) - R)
+        return min(_m.hypot(p[0] - a[0], p[1] - a[1]),
+                   _m.hypot(p[0] - b[0], p[1] - b[1]))
+    worst = min(min(dist(p, e) for e in els) for p in plunges)
+    print(f'  врезаний {len(plunges)}, ближайшее к лезвию {worst:.3f} мм')
+    assert worst >= r - 0.01, worst       # допуск — как у Anctor

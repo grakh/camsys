@@ -2783,7 +2783,9 @@ def test_extended_rework_axis_is_what_screen_draws():
         s = CamSession()
         s.load_ai(ai)
         s.set_cutting_params_from_dict({
-            'knife_angle': 90.0, 'tip_diameter': 0.8, 'bottom': 0.25,
+            # пятка 1.2: с v1.8.1 (врезание без смещения) на 0.8 продлевать
+            # уже нечего, на 1.2 — три доработки
+            'knife_angle': 90.0, 'tip_diameter': 1.2, 'bottom': 0.25,
             'corner_tip_diameter': 0.6, 'generate_corner': True})
         s.create_blade_operations()
         from camsys.post.package_export import PackageExporter

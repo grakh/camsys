@@ -350,34 +350,97 @@ def own_contour_clearance(cut_points, own_polypath, entry_point,
     return best
 
 
-def _exact_cut_lines(lead_poly, tool_offset: float):
+def _exact_cut_lines(lead_poly, tool_offset: float, join_point=None):
     """Путь фрезы по лиду — как у стойки по G42: прямая в параллельную,
     дуга в КОНЦЕНТРИЧЕСКУЮ (v1.7.71), затем в ломаную.
 
-    Раньше путь фрезы строился сдвигом ХОРД ломаной по их нормалям. На
-    малой дуге лида (радиус 0.75, хорда 0.3) концы хорд сдвигались не по
-    радиусу, и замер занижал зазор до своего лезвия на 15…70 мкм. Внутри
-    кружков это давало красный лид там, где фреза идёт ровно на 0.65 от
-    лезвия: на Ø8 заход длиной 1.0 был чистым, а КОРОЧЕ — «коллизия».
-    Пусто — если точный сдвиг не построился (вызывающий откатится на
-    старый способ).
+    КОМПЕНСАЦИЯ ВКЛЮЧАЕТСЯ НА ПРЯМОЙ ЛИДА, А НЕ ДО НЕЁ (v1.8.1). В
+    программе `G1 Z0` (врезание) идёт без компенсации, следующая строка —
+    `G42 X.. Y..` на конец прямой. Значит, центр фрезы при врезании стоит
+    ровно в начале лида, и по прямой съезжает от него к точке, сдвинутой
+    на радиус. На выходе — наоборот: `G1 G40 X.. Y..` возвращает центр с
+    эквидистанты в конец лида. Так считает и Anctor (lead_tool_center).
+
+    Раньше вся прямая сдвигалась на радиус — вместе с точкой врезания. На
+    127821 (пятка 0.8) начало захода PART11 стояло в 0.31 мм от лезвия:
+    фреза при врезании заходила в него на 0.34 мм, а проверка видела её
+    на радиус дальше и молчала. Anctor нашёл таких 20 на проход.
+
+    `join_point` — точка стыка лида с контуром: по ней понятно, заход это
+    (стык в конце) или выход (стык в начале). Без неё — старый сдвиг
+    целиком. Пусто — если точный сдвиг не построился (вызывающий
+    откатится на старый способ).
     """
     try:
         from .path_offset import offset_right_of_travel
-        cut = offset_right_of_travel(lead_poly, tool_offset)
     except Exception:
         return []
-    if not cut or not cut.segments:
+    segs = list(getattr(lead_poly, 'segments', None) or [])
+    if not segs:
         return []
-    pts = []
-    for sg in cut.segments:
-        q = _segment_to_polyline(sg, max_chord=0.1)
-        if pts and q and math.hypot(pts[-1][0] - q[0][0],
-                                    pts[-1][1] - q[0][1]) < 1e-9:
-            pts.extend(q[1:])
-        else:
-            pts.extend(q)
-    return [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+    ramp = None                     # (точка без смещения, 'in' | 'out')
+    body = segs
+    if join_point is not None and len(segs) >= 1:
+        d_first = math.hypot(segs[0].a[0] - join_point[0],
+                             segs[0].a[1] - join_point[1])
+        d_last = math.hypot(segs[-1].b[0] - join_point[0],
+                            segs[-1].b[1] - join_point[1])
+        if d_last <= d_first and isinstance(segs[0], Line):
+            ramp, body = 'in', segs[1:]
+        elif d_first < d_last and isinstance(segs[-1], Line):
+            ramp, body = 'out', segs[:-1]
+
+    def _poly_pts(sgs):
+        try:
+            cut = offset_right_of_travel(
+                Polypath(segments=list(sgs), closed=False), tool_offset)
+        except Exception:
+            return None
+        if not cut or not cut.segments:
+            return None
+        pts = []
+        for sg in cut.segments:
+            q = _segment_to_polyline(sg, max_chord=0.1)
+            if pts and q and math.hypot(pts[-1][0] - q[0][0],
+                                        pts[-1][1] - q[0][1]) < 1e-9:
+                pts.extend(q[1:])
+            else:
+                pts.extend(q)
+        return pts
+
+    def _shift(pt, a, b):
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        L = math.hypot(dx, dy)
+        if L < 1e-12:
+            return pt
+        return (pt[0] + dy / L * tool_offset, pt[1] - dx / L * tool_offset)
+
+    if ramp is None:
+        pts = _poly_pts(segs)
+        if not pts:
+            return []
+    elif ramp == 'in':
+        ln = segs[0]
+        rest = _poly_pts(body) if body else None
+        end = rest[0] if rest else _shift(ln.b, ln.a, ln.b)
+        pts = [ln.a] + _ramp_pts(ln.a, end) + (rest[1:] if rest else [])
+    else:
+        ln = segs[-1]
+        rest = _poly_pts(body) if body else None
+        start = rest[-1] if rest else _shift(ln.a, ln.a, ln.b)
+        pts = (rest[:-1] if rest else []) + [start] + \
+            _ramp_pts(start, ln.b)
+    return [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)
+            if math.hypot(pts[i + 1][0] - pts[i][0],
+                          pts[i + 1][1] - pts[i][1]) > 1e-12]
+
+
+def _ramp_pts(a, b, step: float = 0.1):
+    """Точки прямой a→b после a (включая b), шаг ≤ step."""
+    L = math.hypot(b[0] - a[0], b[1] - a[1])
+    n = max(1, int(math.ceil(L / step)))
+    return [(a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n)
+            for k in range(1, n + 1)]
 
 
 def lead_crosses_contours(lead_poly: Optional[Polypath],
@@ -474,7 +537,7 @@ def lead_crosses_contours(lead_poly: Optional[Polypath],
     if path_is_cutter:
         cut_lines = lead_lines
     else:
-        cut_lines = _exact_cut_lines(lead_poly, tool_offset)
+        cut_lines = _exact_cut_lines(lead_poly, tool_offset, entry_point)
     if not path_is_cutter and not cut_lines:
         cut_lines = []
         for _i in range(len(lead_pts) - 1):
