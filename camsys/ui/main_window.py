@@ -1089,6 +1089,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._on_rapids_visibility)
         self.params_panel.cornerVisibilityChanged.connect(
             self._apply_corner_visibility)
+        self.params_panel.gen_corner.toggled.connect(
+            lambda on: self._on_corner_box_toggled('2d', on))
+        self.params_panel.gen_corner_3d.toggled.connect(
+            lambda on: self._on_corner_box_toggled('3d', on))
 
         # «Направление» пересортировывает обход сразу (v1.7.6). Раньше
         # переключатель только эмитил paramsChanged, а этот сигнал НИКУДА
@@ -1212,6 +1216,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Сбрасываем все параметры панели к умолчаниям — каждый новый файл
             # начинается со стандартных значений, не наследует предыдущие
             self.params_panel.set_defaults()
+            self._reset_corner_user_choice()     # новый файл — заново
             
             self.session.load_ai(path)
             self.session._last_ai_path = path  # для поиска XML вокруг файла
@@ -1911,9 +1916,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if any_2d and any_3d:
                 break
 
+        # Только ВКЛЮЧАЕМ (v1.7.89): «если есть углы — включались они для
+        # вывода, а выключение оставь за оператором».
         if hasattr(self, 'params_panel'):
-            self.params_panel.gen_corner.setChecked(any_2d)
-            self.params_panel.gen_corner_3d.setChecked(any_3d)
+            self._auto_check_corners(any_2d, any_3d)
 
         msg_parts = []
         if any_2d:
@@ -2313,6 +2319,34 @@ class MainWindow(QtWidgets.QMainWindow):
         # Кнопка остаётся checked, сигнал не дёргаем.
         self.action_toggle_paths(True)
     
+    def _auto_check_corners(self, has_2d: bool, has_3d: bool):
+        """Ставит галки «Острые углы 2D/3D», если углы есть (v1.7.89).
+
+        Никогда не снимает: выключение — решение оператора. И если оператор
+        сам снял галку в этом файле, программа её больше не ставит.
+        """
+        p = self.params_panel
+        self._corner_auto_busy = True
+        try:
+            if (has_2d and not p.gen_corner.isChecked()
+                    and not getattr(self, '_corner_user_off_2d', False)):
+                p.gen_corner.setChecked(True)
+            if (has_3d and not p.gen_corner_3d.isChecked()
+                    and not getattr(self, '_corner_user_off_3d', False)):
+                p.gen_corner_3d.setChecked(True)
+        finally:
+            self._corner_auto_busy = False
+
+    def _on_corner_box_toggled(self, which: str, on: bool):
+        """Запоминает, что оператор сам снял галку (не программа)."""
+        if getattr(self, '_corner_auto_busy', False):
+            return
+        setattr(self, f'_corner_user_off_{which}', not on)
+
+    def _reset_corner_user_choice(self):
+        self._corner_user_off_2d = False
+        self._corner_user_off_3d = False
+
     def _item_type_filter(self):
         """Функция «показывать ли элемент по галкам углов» (v1.7.86).
 
@@ -2840,6 +2874,17 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             # Кэшируем построенные items под ключом текущего заказа
             self._order_toolpath_items[current_order] = list(self._toolpath_items)
+            # Углы найдены — галки включаются для вывода (v1.7.89).
+            try:
+                _cr = [o for o in self.session.project.operations
+                       if o.kind == OperationKind.CORNER_REWORK
+                       and not o.attributes.get('foreign_gap')
+                       and not o.attributes.get('stitch_filtered_out')]
+                self._auto_check_corners(
+                    any(not o.attributes.get('corner_is_3d') for o in _cr),
+                    any(o.attributes.get('corner_is_3d') for o in _cr))
+            except Exception:
+                pass
             self._apply_corner_visibility()
             # Подписи обновляем — у текущего заказа теперь стоит ✓ (has_paths)
             self._refresh_stitch_labels()
@@ -2900,6 +2945,14 @@ class MainWindow(QtWidgets.QMainWindow):
             8000)
 
     def action_export(self):
+        # Станок — из настроек (v1.7.89); ставится перед каждой записью.
+        try:
+            self.session.cutting_params.machine = self._machine()
+        except Exception:
+            pass
+        return self._action_export_impl()
+
+    def _action_export_impl(self):
         # Снимаем подсветку автоподбора с полей лидов (юзер начал экспорт)
         try:
             self.params_panel.clear_auto_lead_highlight()
@@ -3010,6 +3063,12 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    def _machine(self) -> str:
+        """Станок из настроек: 'AEC_GVM' (по умолчанию) или 'DCM_920'."""
+        from ..post.dcm920 import MACHINES
+        v = str(self._get_default("machine", "AEC_GVM"))
+        return v if v in dict(MACHINES) else "AEC_GVM"
+
     def _corner_thr_default(self) -> float:
         """Порог радиуса угла по умолчанию: 0 = «по фрезе» (v1.7.82).
         Старое заводское 0.70 из сохранённых настроек читается как 0."""
@@ -3075,6 +3134,21 @@ class MainWindow(QtWidgets.QMainWindow):
         w_tip.addItems(["0_6", "0_8", "1_0", "1_2", "1_5"])
         w_tip.setCurrentText(self._get_default("tip", "0_8"))
         form.addRow("Пятка:", w_tip)
+
+        # Станок (v1.7.89): AEC GVM — .anc, DCM 920 — .npg по посту
+        # DCM_Engraving_V1_23 (перевод тех же программ).
+        from ..post.dcm920 import MACHINES
+        w_machine = QtWidgets.QComboBox()
+        for _code, _label in MACHINES:
+            w_machine.addItem(_label, _code)
+        _mi = w_machine.findData(self._machine())
+        w_machine.setCurrentIndex(_mi if _mi >= 0 else 0)
+        w_machine.setToolTip(
+            "Под какой станок писать программы.\n"
+            "AEC GVM — .anc (как раньше).\n"
+            "DCM 920 — .npg для стойки HCFA: те же проходы и лиды, "
+            "формат поста DCM_Engraving_V1_23.")
+        form.insertRow(0, "Станок:", w_machine)
 
         # Пятка тонкой фрезы T3 — сохраняется между запусками (v1.7.68).
         # Без этого поле в панели сбрасывалось на 0.6 при каждом старте.
@@ -3148,6 +3222,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
         self._set_defaults({
+            "machine": w_machine.currentData(),
             "angle": w_angle.currentText(),
             "tip": w_tip.currentText(),
             "corner_tip_diameter": w_corner_tip.value(),

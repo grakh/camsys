@@ -181,6 +181,9 @@ class CuttingMacroParams:
     # больше этого металла (v1.7.82), мм. 2 мкм — «гуляние больше ±2 мкм
     # — брак».
     corner_residual_tol_mm: float = 0.002
+    # Станок, под который пишутся программы (v1.7.89): 'AEC_GVM' (.anc)
+    # или 'DCM_920' (.npg, перевод из .anc — camsys/post/dcm920.py).
+    machine: str = 'AEC_GVM'
     corner_tip_diameter: float = 0.6         # пятка тонкой фрезы T3, мм
 
     # ── Лиды угловых проходов (v1.7.30) ──

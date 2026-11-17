@@ -487,7 +487,8 @@ class CamSession:
         import shutil
         from pathlib import Path
         nc_dir = Path(nc_dir)
-        existing = sorted(p for p in nc_dir.glob("*.anc") if p.is_file())
+        existing = sorted(p for p in list(nc_dir.glob("*.anc"))
+                          + list(nc_dir.glob("*.npg")) if p.is_file())
         if not existing:
             return None
         n = 0
@@ -1133,6 +1134,14 @@ class CamSession:
             name: _transform_anc_text(content, transform)
             for name, content in files.items()
         }
+        # Станок DCM 920 — перевод ПОСЛЕ сдвига координат (v1.7.89).
+        # Проверка «X, Y > 0» ниже идёт по .anc (по меткам строк ножа).
+        from ..post.dcm920 import convert_files as _conv_machine
+        _machine = getattr(self.cutting_params, 'machine', 'AEC_GVM')
+        _conv = _conv_machine(files_pos, _machine)   # порядок сохраняется
+        _names_out = list(_conv.keys())
+        _anc_by_out = dict(zip(_names_out, files_pos.values()))
+        files_pos = _conv
 
         # 4. Пишем в подпапку POSITION/ с архивом старого содержимого.
         if nc_dir_override:
@@ -1159,7 +1168,7 @@ class CamSession:
             # Проверка «X, Y > 0» на моторных строках ножа
             bad_x, bad_y = 0, 0
             min_x, min_y = float('inf'), float('inf')
-            for line in content.splitlines():
+            for line in _anc_by_out.get(name, content).splitlines():
                 if not _knife_tag.search(line):
                     continue
                 m = _xy_re.search(line)

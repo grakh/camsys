@@ -393,6 +393,11 @@ class PackageExporter:
             raise RuntimeError(
                 "Нет файлов для записи. Проверьте, что есть активные ножи "
                 "(галки) и включены типы программ.")
+        # Станок DCM 920 (v1.7.89): те же программы, переведённые в формат
+        # его поста. Геометрия, лиды и порядок — от AEC без изменений.
+        from .dcm920 import convert_files
+        files = convert_files(files,
+                              getattr(self.params, 'machine', 'AEC_GVM'))
         written = []
         for filename, content in files.items():
             path = out / filename
