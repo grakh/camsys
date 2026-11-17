@@ -472,6 +472,7 @@ class PackageExporter:
         # поэтому картинка и программа расходились.
         import math as _m_ce
         _c_tip = float(getattr(self.params, 'corner_tip_diameter', 0.6) or 0.6)
+        opts.extras['corner_tip_diameter'] = _c_tip
         opts.extras['corner_tool_equidistant'] = (
             _c_tip + 2.0 * float(self.params.bottom) * _m_ce.tan(
                 _m_ce.radians(float(self.params.knife_angle) / 2.0)))

@@ -169,6 +169,21 @@ class MtxAndersonGVM(PostProcessor):
             ]
             if len(corner_3d_ops) == len(project.operations):
                 is_3d_program = True
+
+        # ── ИНСТРУМЕНТ ПРОГРАММЫ УГЛОВ 2D — T3 (v1.8.2) ──
+        # Программу `_corner` режет тонкая фреза T3, и в её шапке должны
+        # стоять ЕЁ данные: так у альфы (127821_90_1_corner.anc:
+        # `ProgToolEquidistant = 1.1/2`, `Geo.Rad = 0.6/2`). CAMSYS писал
+        # туда основную фрезу (1.7/2 при пятке 1.2) — если стойка берёт
+        # смещение G42 отсюда, T3 шла бы на 0.85 от линии вместо 0.55.
+        if (not is_3d_program and project.operations and all(
+                op.kind == OperationKind.CORNER_REWORK
+                for op in project.operations)):
+            _ct = options.extras.get('corner_tip_diameter')
+            _ce = options.extras.get('corner_tool_equidistant')
+            if _ct and _ce:
+                tool_diameter = float(_ct)
+                tool_eq = float(_ce)
         
         # ── 1. Шапка-комментарий (1:1 с эталоном) ──
         w("1 #DRYRUN%=0")

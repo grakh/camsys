@@ -184,3 +184,27 @@ def test_break_t3_drawn_without_corner_checkbox():
         show_filter={'blade': True, 'corner_2d': False, 'corner_3d': False})
     ids = {getattr(i, 'op_id', None) for i in items}
     assert any(o.id in ids for o in gaps), 'T3 разрыва не нарисована'
+
+
+def test_corner_program_header_is_t3():
+    """v1.8.2: в шапке `_corner.anc` — данные T3, как у альфы
+    (127821_90_1_corner.anc: ProgToolEquidistant = 1.1/2, Geo.Rad =
+    0.6/2). Раньше там стояла основная фреза."""
+    import math
+    import re
+    import camsys.post.mtx_anderson  # noqa: F401
+    from camsys.post.package_export import PackageExporter
+    p = _params()
+    p.generate_corner = True
+    files = PackageExporter(_two_rects(1.2), p).generate()
+    corner = next(t for n, t in files.items() if n.endswith('_corner.anc'))
+    main = next(t for n, t in files.items() if n.endswith('_1_M.anc'))
+    w3 = p.corner_tip_diameter + 2 * p.bottom * math.tan(
+        math.radians(p.knife_angle / 2))
+    e = p.tip_diameter + 2 * p.bottom * math.tan(
+        math.radians(p.knife_angle / 2))
+    eq_c = float(re.search(r'ProgToolEquidistant = ([\d.]+)/2', corner).group(1))
+    rad_c = float(re.search(r'Geo\.Rad = ([\d.]+)/2', corner).group(1))
+    eq_m = float(re.search(r'ProgToolEquidistant = ([\d.]+)/2', main).group(1))
+    assert abs(eq_c - w3) < 1e-6 and abs(rad_c - p.corner_tip_diameter) < 1e-9
+    assert abs(eq_m - e) < 1e-6
