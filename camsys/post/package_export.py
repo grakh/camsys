@@ -379,6 +379,16 @@ class PackageExporter:
         # Микро-кадры < 10 мкм, шумные прямые, микро-изломы, малые дуги,
         # внутренние для обратного прохода, общая геометрия прямого и
         # обратного проходов — тем же кодом, что кнопка «⚒ Fix G-code».
+        # CLN(DLAn) — по фактическому числу кадров контура, всегда (v1.8.4):
+        # и после Fix (кадров меньше), и без него (CAMSYS считал DLA по
+        # сегментам до вывода — расходилось на 1–6).
+        def _dla_final(fs):
+            from .ncfix import recount_dla_files
+            fs2, _lg = recount_dla_files(fs)
+            rep_ = getattr(self, 'machinability_report', None)
+            if rep_ is not None and _lg:
+                rep_.append("CLN(DLA): " + "; ".join(_lg)[:2000])
+            return fs2
         if getattr(self.params, 'ncfix_enabled', True):
             try:
                 from .ncfix import fix_package
@@ -393,6 +403,7 @@ class PackageExporter:
                 if rep is not None:
                     rep.append(f"FIX G-CODE: не выполнен ({_e}) — программы "
                                f"как есть, прогоните Fix в Anctor")
+        files = _dla_final(files)
         
         return files
     

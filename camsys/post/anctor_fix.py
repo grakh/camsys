@@ -1,4 +1,4 @@
-"""Fix G-code из Anctor (V8.4, программа пользователя) — без изменений.
+"""Fix G-code из Anctor (V8.8, программа пользователя) — без изменений.
 
 Скопировано из anctor.pyw (функции разбора и правки .anc, без окна) —
 чтобы программы CAMSYS выходили уже в том виде, в каком их оставляет
@@ -15,7 +15,7 @@ import json
 import hashlib
 from collections import defaultdict
 
-ver = 'Anctor V8.4'
+ver = 'Anctor V8.8'
 
 
 def get_arc_center_from_r(x0, y0, x1, y1, r_val, is_cw):
@@ -1377,6 +1377,62 @@ def nc_move_entries(text, min_line=2.0, targets=None):
     return ('\r\n' if crlf else '\n').join(out), log, moved
 
 
+def nc_update_dla(text):
+    """Пересчитать CLN(DLAn) у каждого контура после правок.
+    CAM ставит для контура DLA = (кадров между G12 и G13) - 2, но не больше общего CLN(DLA..) в шапке.
+    Если Fix уменьшил число кадров, а DLA остался старым, окно контроля столкновений (CollErr0)
+    захватывает замыкание контура и ЧПУ без ошибки выбрасывает весь контур - он не фрезеруется."""
+    nl = '\r\n' if '\r\n' in text else '\n'
+    L = text.split(nl)
+    cap = None
+    for l in L:
+        if re.search(r'\.COL\d+', l.split(';')[0]):
+            break
+        m = re.search(r'CLN\(DLA(\d+)\)', l)
+        if m:
+            cap = int(m.group(1))
+    if cap is None:
+        return text, 0
+    counts, cur, n, inc = {}, None, 0, False
+    for l in L:
+        c = l.split(';')[0]
+        m = re.search(r'\.COL(\d+)\b', c)
+        if m:
+            cur, n, inc = m.group(1), 0, False
+            continue
+        if cur is None:
+            continue
+        # маркер G12/G13 ищем во всей строке: новый постпроцессор пишет дугу
+        # входа/выхода настоящей G2/G3, а G12/G13 оставляет в комментарии
+        # (`G2 X.. Y.. R1.3 ;50,10 G12`) - иначе границ контура не видно (V8.8)
+        if re.search(r'\bG12\b', l):
+            inc, n = True, 0
+            continue
+        if re.search(r'\bG13\b', l):
+            if inc:
+                counts[cur] = n
+            inc = False
+            continue
+        if inc and re.search(r'[XY]-?\d', c):
+            n += 1
+    changed, part = 0, None
+    for i, l in enumerate(L):
+        c = l.split(';')[0]
+        m = re.search(r'\.PART(\d+)\b', c)
+        if m:
+            part = m.group(1)
+            continue
+        m = re.search(r'CLN\(DLA(\d+)\)', c)
+        if m and part is not None:
+            if part in counts and counts[part] >= 3:
+                want = min(cap, counts[part] - 2)
+                if want != int(m.group(1)):
+                    L[i] = l[:m.start(1)] + str(want) + l[m.end(1):]
+                    changed += 1
+            part = None
+    return (nl.join(L), changed) if changed else (text, 0)
+
+
 def nc_is_meas_line(line):
     """Строка блока измерения щупом (постпроцессор AlphaCAM/Anderson):
     ;***** Altitude measurement and compensation MP(n) *****
@@ -1707,7 +1763,13 @@ def nc_fix_text(text, dtip=0.15, ang_max=90, safety=0.03, min_len=NF_MIN_LEN, mi
             q -= 1
         prv = blocks[q] if q >= 0 else None
         dev = None
-        if prv is not None and plain(prv) and not _prot(b['x0'], b['y0']):
+        # кадр короче 1 мкм: оба его конца - практически одна точка, защищённая вершина
+        # (точка входа обратного прохода) остаётся, какой бы конец ни ушёл
+        tiny = L < 0.001
+
+        def free(px, py, ox, oy):
+            return not _prot(px, py) or (tiny and _prot(ox, oy))
+        if prv is not None and plain(prv) and free(b['x0'], b['y0'], b['x1'], b['y1']):
             pts = prv.setdefault('absorbed', []) + [(prv['x1'], prv['y1'])]
             dev = elem_dev(prv, b['x1'], b['y1'], pts)
         nxt = blocks[k + 1] if k + 1 < len(blocks) else None
@@ -1715,7 +1777,7 @@ def nc_fix_text(text, dtip=0.15, ang_max=90, safety=0.03, min_len=NF_MIN_LEN, mi
         if dev is None or dev > max_dev:
             # назад нельзя (например, сразу после входа G12) - пробуем отдать следующему кадру:
             # его начало переносится в начало микро-кадра, текст кадра не меняется
-            if nxt is not None and plain(nxt) and nxt['i'] not in delete and not _prot(b['x1'], b['y1']) \
+            if nxt is not None and plain(nxt) and nxt['i'] not in delete and free(b['x1'], b['y1'], b['x0'], b['y0']) \
                     and abs(nxt['x0'] - b['x1']) < 1e-9 and abs(nxt['y0'] - b['y1']) < 1e-9:
                 pts_n = nxt.setdefault('absorbed', []) + [(b['x1'], b['y1'])]
                 dev_n = elem_dev(nxt, nxt['x1'], nxt['y1'], pts_n, b['x0'], b['y0'])

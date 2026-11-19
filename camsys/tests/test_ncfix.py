@@ -54,3 +54,29 @@ def test_fix_keeps_leads_clean():
             parts, eq = F.parse_anc_parts(pth)
             assert not F.find_lead_gouges(parts, eq or 0.65)
             assert not F.find_contour_collisions(parts, eq or 0.65)
+
+
+def test_dla_matches_frame_count_after_fix():
+    """CLN(DLAn) каждого контура = кадров между дугой захода (G12) и
+    выхода (G13) − 2, не больше общего DLA (v1.8.4). Маркер G12 у нового
+    поста — в комментарии (`;50,10 G12`), nc_update_dla Anctor его не
+    видит; recount_dla видит. После Fix DLA не должен остаться больше
+    допустимого (127821 PART3: был 61 при 59 — стойка выбросила бы контур).
+    """
+    if not os.path.exists(AI):
+        print('  SKIP — нет 124173_test.ai')
+        return
+    import re
+    from camsys.post.ncfix import recount_dla
+    files, _ = _programs(True)
+    for n, t in files.items():
+        _, k = recount_dla(t)
+        assert k == 0, (n, k)
+    # всем контурам DLA = общему (80) — пересчёт возвращает как было
+    t = next(t for n, t in files.items() if n.endswith('_all_R.anc'))
+    cap = int(re.search(r'CLN\(DLA(\d+)\)', t).group(1))
+    spoiled = re.sub(r'CLN\(DLA(\d+)\) ;25\.1',
+                     lambda m: 'CLN(DLA%d) ;25.1' % cap, t)
+    assert spoiled != t
+    back, k = recount_dla(spoiled)
+    assert k > 0 and back == t

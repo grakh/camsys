@@ -5,7 +5,7 @@ v1.8.3. Пользователь: «столкновений нет, фикс н
 «Split» уже на 7 мкм), шумные прямые из мелких дуг/отрезков, микро-
 изломы до 6 мкм и приводил прямой/обратный проходы одного ножа к общей
 геометрии. Теперь CAMSYS делает то же сам, тем же кодом
-(camsys/post/anctor_fix.py — копия функций Anctor V8.4), в том же
+(camsys/post/anctor_fix.py — копия функций Anctor V8.8), в том же
 порядке, что `ErrAnc._fix_gcode`:
 
 1. группы: основные / угловые (по маске имени, 'corner') / 3D
@@ -15,7 +15,8 @@ v1.8.3. Пользователь: «столкновений нет, фикс н
 3. пары «прямой + обратный проход одной геометрии» по всем программам;
 4. `nc_fix_text` для каждой программы;
 5. обратные проходы строятся точным обращением исправленных прямых;
-6. `nc_explicit_leads` — явные G2/G3 в дугах захода/выхода.
+6. `nc_explicit_leads` — явные G2/G3 в дугах захода/выхода;
+7. `nc_update_dla` — CLN(DLAn) под новое число кадров (V8.8).
 
 Перенос входа на прямую (`fix_move_entry`) у Anctor по умолчанию
 выключен — здесь тоже не делается.
@@ -136,6 +137,14 @@ def _fix_once(files: Dict[str, str], rmin: float, corner_mask: str,
         nt, lg, _ = results[nm]
         if nt is not None:
             nt = F.nc_explicit_leads(nt, files[nm])
+            # CLN(DLAn) контура = число кадров контура − 2 (не больше общего
+            # DLA в шапке). Fix убирает кадры; если DLA останется старым,
+            # окно CollErr0 захватит замыкание контура, и стойка без ошибки
+            # выбросит весь контур (Anctor V8.8).
+            nt, n_dla = F.nc_update_dla(nt)
+            if n_dla:
+                lg.append('  CLN(DLA) пересчитан под новое число кадров: '
+                          '%d контуров' % n_dla)
             out[nm] = nt
         body = [l for l in lg if l.strip()]
         if nt is not None and nt != files[nm]:
@@ -144,4 +153,80 @@ def _fix_once(files: Dict[str, str], rmin: float, corner_mask: str,
         elif any('!' in l for l in body):
             log.append(f"{nm}:")
             log.extend(l for l in body if '!' in l)
+    return out, log
+
+
+def recount_dla(text: str) -> Tuple[str, int]:
+    """CLN(DLAn) каждого контура = (кадров между дугой захода G12 и дугой
+    выхода G13) − 2, не больше общего CLN(DLA..) в шапке (как CAM и Anctor
+    nc_update_dla). v1.8.4.
+
+    Отличие от nc_update_dla: маркеры G12/G13 ищутся во ВСЕЙ строке.
+    Новый пост пишет дугу захода настоящей дугой с маркером в комментарии
+    (`G2 X.. Y.. R1.3 ;50,10 G12`), и nc_update_dla границ контура не
+    видит — DLA не пересчитывался. А CAMSYS считал DLA до Fix: после
+    удаления кадров у части контуров он оставался БОЛЬШЕ допустимого
+    (127821 PART3: 61 при 59) — окно CollErr0 захватывает замыкание, и
+    стойка молча выбрасывает контур.
+    """
+    import re
+    nl = '\r\n' if '\r\n' in text else '\n'
+    L = text.split(nl)
+    cap = None
+    for l in L:
+        if re.search(r'\.COL\d+', l.split(';')[0]):
+            break
+        m = re.search(r'CLN\(DLA(\d+)\)', l)
+        if m:
+            cap = int(m.group(1))
+    if cap is None:
+        return text, 0
+    counts, cur, n, inc = {}, None, 0, False
+    for l in L:
+        c = l.split(';')[0]
+        m = re.search(r'\.COL(\d+)\b', c)
+        if m:
+            cur, n, inc = m.group(1), 0, False
+            continue
+        if cur is None:
+            continue
+        if re.search(r'\bG12\b', l):
+            inc, n = True, 0
+            continue
+        if re.search(r'\bG13\b', l):
+            if inc:
+                counts[cur] = n
+            inc = False
+            continue
+        if inc and re.search(r'[XY]-?\d', c):
+            n += 1
+    changed, part = 0, None
+    for i, l in enumerate(L):
+        c = l.split(';')[0]
+        m = re.search(r'\.PART(\d+)\b', c)
+        if m:
+            part = m.group(1)
+            continue
+        m = re.search(r'CLN\(DLA(\d+)\)', c)
+        if m and part is not None:
+            if part in counts:
+                want = max(1, min(cap, counts[part] - 2))
+                if want != int(m.group(1)):
+                    L[i] = l[:m.start(1)] + str(want) + l[m.end(1):]
+                    changed += 1
+            part = None
+    return (nl.join(L), changed) if changed else (text, 0)
+
+
+def recount_dla_files(files: Dict[str, str]) -> Tuple[Dict[str, str], List[str]]:
+    """recount_dla по всем .anc набора."""
+    out, log = dict(files), []
+    for nm, tx in files.items():
+        if not nm.lower().endswith('.anc'):
+            continue
+        nt, k = recount_dla(tx)
+        if k:
+            out[nm] = nt
+            log.append(f"{nm}: CLN(DLA) пересчитан под число кадров: "
+                       f"{k} контуров")
     return out, log
