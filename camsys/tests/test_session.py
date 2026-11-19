@@ -434,30 +434,38 @@ def test_corner_threshold_default_is_tool():
     assert s.cutting_params.corner_radius_threshold_mm == 0.75
 
 
-def test_archive_moves_anctor_backup_to_old():
-    """v1.8.5: `_orig_fix` Anctor уходит в oldN вместе со старыми
-    программами — иначе Anctor поправил бы «оригинал» старой программы
-    поверх новой с тем же именем."""
+def test_archive_moves_everything_but_old_in_nc_folder():
+    """v1.8.6: в папке программ (…-NC, POSITION) в oldN уходит всё, кроме
+    прежних old*: программы, `_orig_fix` Anctor, POSITION, любые другие
+    файлы и папки. В посторонней папке — только .anc/.npg и `_orig_fix`."""
     import tempfile
     from pathlib import Path
     from camsys.core.session import CamSession
     s = CamSession()
-    with tempfile.TemporaryDirectory() as d:
-        d = Path(d)
+    with tempfile.TemporaryDirectory() as root:
+        d = Path(root) / '127821-NC'
+        d.mkdir()
         (d / 'A_90_1_M.anc').write_text('old')
+        (d / 'note.txt').write_text('x')
         (d / '_orig_fix').mkdir()
         (d / '_orig_fix' / 'A_90_1_M.anc').write_text('orig')
         (d / '_orig_fix' / 'fix_manifest.json').write_text('{}')
-        (d / 'other').mkdir()                       # чужое — не трогаем
+        (d / 'POSITION').mkdir()
+        (d / 'POSITION' / 'A_90_1_M.anc').write_text('pos')
+        (d / 'old0').mkdir()                         # прежний архив
         old = Path(s._archive_old_anc(d))
-        assert old.name == 'old0'
-        assert not (d / '_orig_fix').exists() and not (d / 'A_90_1_M.anc').exists()
-        assert (old / 'A_90_1_M.anc').read_text() == 'old'
-        assert (old / '_orig_fix' / 'A_90_1_M.anc').read_text() == 'orig'
+        assert old.name == 'old1'
+        assert sorted(p.name for p in d.iterdir()) == ['old0', 'old1']
         assert (old / '_orig_fix' / 'fix_manifest.json').exists()
-        assert (d / 'other').is_dir()
-        # только _orig_fix без программ — тоже уходит (old1)
-        (d / '_orig_fix').mkdir()
-        old1 = Path(s._archive_old_anc(d))
-        assert old1.name == 'old1' and (old1 / '_orig_fix').is_dir()
-        assert s._archive_old_anc(d) is None        # пусто — ничего
+        assert (old / 'POSITION' / 'A_90_1_M.anc').read_text() == 'pos'
+        assert (old / 'note.txt').exists() and (old / 'A_90_1_M.anc').exists()
+        assert s._archive_old_anc(d) is None         # только old* — нечего
+        # посторонняя папка — осторожно
+        o = Path(root) / 'some'
+        o.mkdir()
+        (o / 'B.anc').write_text('b')
+        (o / 'keep.txt').write_text('k')
+        (o / '_orig_fix').mkdir()
+        old = Path(s._archive_old_anc(o))
+        assert (old / 'B.anc').exists() and (old / '_orig_fix').is_dir()
+        assert (o / 'keep.txt').exists()

@@ -485,22 +485,38 @@ class CamSession:
     ANCTOR_BACKUP_DIR = "_orig_fix"
 
     def _archive_old_anc(self, nc_dir: "Path") -> Optional[str]:
-        """Если в папке NC уже есть .anc / .npg — переносит их в новую
-        подпапку old0/old1/... Возвращает путь созданной папки или None.
+        """Перед записью новых программ переносит старое в новую подпапку
+        old0/old1/... Возвращает путь созданной папки или None.
 
-        Вместе с ними уходит и `_orig_fix` Anctor (v1.8.5): там оригиналы
-        СТАРЫХ программ и манифест. Оставь её — Anctor при Fix новой
-        программы с тем же именем взял бы «оригинал» оттуда и поправил
-        старую программу поверх новой.
+        v1.8.6: в папке программ (имя оканчивается на NC / -NC / _NC или
+        это POSITION) в oldN уходит ВСЁ, кроме прежних old*: программы,
+        `_orig_fix` Anctor, подпапка POSITION (её экспорт идёт следом и
+        создаёт заново), и всё, что там появится в будущем («если что-то
+        будет добавляться — уже будет»).
+
+        В любой другой папке (экспорт направлен вручную) — осторожно, как
+        раньше: только .anc / .npg и `_orig_fix`.
         """
+        import re as _re_
         import shutil
         from pathlib import Path
         nc_dir = Path(nc_dir)
-        existing = sorted(p for p in list(nc_dir.glob("*.anc"))
-                          + list(nc_dir.glob("*.npg")) if p.is_file())
-        backup = nc_dir / self.ANCTOR_BACKUP_DIR
-        has_backup = backup.is_dir()
-        if not existing and not has_backup:
+        if not nc_dir.is_dir():
+            return None
+        name = nc_dir.name.upper()
+        dedicated = name.endswith('NC') or name == 'POSITION'
+        if dedicated:
+            existing = sorted(
+                p for p in nc_dir.iterdir()
+                if not (p.is_dir() and _re_.fullmatch(r'old\d+', p.name,
+                                                      _re_.IGNORECASE)))
+        else:
+            existing = sorted(p for p in list(nc_dir.glob("*.anc"))
+                              + list(nc_dir.glob("*.npg")) if p.is_file())
+            backup = nc_dir / self.ANCTOR_BACKUP_DIR
+            if backup.is_dir():
+                existing.append(backup)
+        if not existing:
             return None
         n = 0
         while (nc_dir / f"old{n}").exists():
@@ -509,8 +525,6 @@ class CamSession:
         old_dir.mkdir()
         for p in existing:
             shutil.move(str(p), str(old_dir / p.name))
-        if has_backup:
-            shutil.move(str(backup), str(old_dir / self.ANCTOR_BACKUP_DIR))
         return str(old_dir)
 
     def export_package_auto(self, nc_dir_override: Optional[str] = None,
