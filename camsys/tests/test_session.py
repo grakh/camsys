@@ -432,3 +432,32 @@ def test_corner_threshold_default_is_tool():
     assert s.cutting_params.corner_radius_threshold_mm == 0.0
     s.set_cutting_params_from_dict({'corner_radius_threshold_mm': 0.75})
     assert s.cutting_params.corner_radius_threshold_mm == 0.75
+
+
+def test_archive_moves_anctor_backup_to_old():
+    """v1.8.5: `_orig_fix` Anctor уходит в oldN вместе со старыми
+    программами — иначе Anctor поправил бы «оригинал» старой программы
+    поверх новой с тем же именем."""
+    import tempfile
+    from pathlib import Path
+    from camsys.core.session import CamSession
+    s = CamSession()
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        (d / 'A_90_1_M.anc').write_text('old')
+        (d / '_orig_fix').mkdir()
+        (d / '_orig_fix' / 'A_90_1_M.anc').write_text('orig')
+        (d / '_orig_fix' / 'fix_manifest.json').write_text('{}')
+        (d / 'other').mkdir()                       # чужое — не трогаем
+        old = Path(s._archive_old_anc(d))
+        assert old.name == 'old0'
+        assert not (d / '_orig_fix').exists() and not (d / 'A_90_1_M.anc').exists()
+        assert (old / 'A_90_1_M.anc').read_text() == 'old'
+        assert (old / '_orig_fix' / 'A_90_1_M.anc').read_text() == 'orig'
+        assert (old / '_orig_fix' / 'fix_manifest.json').exists()
+        assert (d / 'other').is_dir()
+        # только _orig_fix без программ — тоже уходит (old1)
+        (d / '_orig_fix').mkdir()
+        old1 = Path(s._archive_old_anc(d))
+        assert old1.name == 'old1' and (old1 / '_orig_fix').is_dir()
+        assert s._archive_old_anc(d) is None        # пусто — ничего
